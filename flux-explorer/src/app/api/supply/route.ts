@@ -14,8 +14,8 @@ export async function GET() {
       headers: {
         "Accept": "application/json",
       },
-      // Cache for 2 minutes
-      next: { revalidate: 120 },
+      // Cache for 15 seconds to catch blocks faster than the 30s average
+      next: { revalidate: 15 },
     });
 
     if (!response.ok) {

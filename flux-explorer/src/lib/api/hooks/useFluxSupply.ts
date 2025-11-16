@@ -37,7 +37,7 @@ export function useFluxSupply() {
         maxSupply: parseFloat(data.maxSupply),
       };
     },
-    staleTime: 5 * 60 * 1000, // 5 minutes
-    refetchInterval: 5 * 60 * 1000, // Refetch every 5 minutes
+    staleTime: 15 * 1000, // 15 seconds
+    refetchInterval: 15 * 1000, // Refetch every 15 seconds to catch blocks faster than 30s average
   });
 }
