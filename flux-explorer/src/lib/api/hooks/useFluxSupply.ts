@@ -3,15 +3,40 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { CoinMarketCapAPI } from "../coinmarketcap-client";
+
+interface SupplyStats {
+  blockHeight: number;
+  transparentSupply: string;
+  shieldedPool: string;
+  circulatingSupply: string;
+  totalSupply: string;
+  maxSupply: string;
+  lastUpdate: string;
+  timestamp: string;
+}
 
 /**
- * Hook to fetch Flux supply statistics from CoinMarketCap
+ * Hook to fetch Flux supply statistics from the indexer API
  */
 export function useFluxSupply() {
   return useQuery({
     queryKey: ["flux-supply"],
-    queryFn: () => CoinMarketCapAPI.getFluxSupplyStats(),
+    queryFn: async (): Promise<{
+      circulatingSupply: number;
+      totalSupply: number;
+      maxSupply: number;
+    }> => {
+      const response = await fetch("/api/supply");
+      if (!response.ok) {
+        throw new Error("Failed to fetch supply stats");
+      }
+      const data: SupplyStats = await response.json();
+      return {
+        circulatingSupply: parseFloat(data.circulatingSupply),
+        totalSupply: parseFloat(data.totalSupply),
+        maxSupply: parseFloat(data.maxSupply),
+      };
+    },
     staleTime: 5 * 60 * 1000, // 5 minutes
     refetchInterval: 5 * 60 * 1000, // Refetch every 5 minutes
   });

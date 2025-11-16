@@ -41,6 +41,7 @@ interface RichListResponse {
   totalSupply: number;
   transparentSupply?: number;
   shieldedPool?: number;
+  circulatingSupply?: number;
   totalAddresses: number;
   addresses: RichListAddress[];
 }
@@ -70,23 +71,34 @@ export function RichListTable() {
     setError(null);
 
     try {
-      const response = await fetch(
-        `/api/rich-list?page=1&pageSize=${TOP_ADDRESS_COUNT}`
-      );
+      // Fetch both rich list and supply data
+      const [richListResponse, supplyResponse] = await Promise.all([
+        fetch(`/api/rich-list?page=1&pageSize=${TOP_ADDRESS_COUNT}`),
+        fetch('/api/supply')
+      ]);
 
-      if (!response.ok) {
-        const errorData = await response.json();
+      if (!richListResponse.ok) {
+        const errorData = await richListResponse.json();
         throw new Error(errorData.message || "Failed to fetch rich list");
       }
 
-      const richListData: RichListApiResponse = await response.json();
+      const richListData: RichListApiResponse = await richListResponse.json();
       const annotated = annotateAddresses(richListData);
+
+      // Parse supply data if available
+      let circulatingSupply: number | undefined;
+      if (supplyResponse.ok) {
+        const supplyData = await supplyResponse.json();
+        circulatingSupply = parseFloat(supplyData.circulatingSupply);
+      }
+
       setMetadata({
         lastUpdate: richListData.lastUpdate,
         lastBlockHeight: richListData.lastBlockHeight,
         totalSupply: richListData.totalSupply,
         transparentSupply: richListData.transparentSupply,
         shieldedPool: richListData.shieldedPool,
+        circulatingSupply,
         totalAddresses: richListData.totalAddresses,
         addresses: annotated,
       });
@@ -184,6 +196,7 @@ export function RichListTable() {
         totalSupply={metadata.totalSupply}
         transparentSupply={metadata.transparentSupply}
         shieldedPool={metadata.shieldedPool}
+        circulatingSupply={metadata.circulatingSupply}
         top10Share={top10Share}
         top100Share={top100Share}
         breakdown={breakdown}
@@ -203,10 +216,16 @@ export function RichListTable() {
 
         <div className="border rounded-lg p-4 bg-card">
           <div className="text-sm text-muted-foreground mb-1">
-            Total Supply
+            Circulating Supply
           </div>
           <p className="text-2xl font-bold">
-            {formatBalance(metadata.totalSupply)} FLUX
+            {metadata.circulatingSupply
+              ? formatBalance(metadata.circulatingSupply)
+              : formatBalance(metadata.totalSupply)}{" "}
+            FLUX
+          </p>
+          <p className="text-xs text-muted-foreground mt-1">
+            Excludes unmined parallel assets
           </p>
         </div>
 
@@ -433,6 +452,7 @@ interface DistributionProps {
   totalSupply: number;
   transparentSupply?: number;
   shieldedPool?: number;
+  circulatingSupply?: number;
   top10Share: number;
   top100Share: number;
   breakdown: Array<{
@@ -449,6 +469,7 @@ function RichListDistribution({
   totalSupply,
   transparentSupply,
   shieldedPool,
+  circulatingSupply,
   top10Share,
   top100Share,
   breakdown,
@@ -514,6 +535,24 @@ function RichListDistribution({
         </div>
 
         <div className="space-y-3">
+          {circulatingSupply !== undefined && (
+            <div className="p-3 rounded-lg bg-muted/50 border">
+              <div className="text-xs uppercase text-muted-foreground">
+                Circulating Supply
+              </div>
+              <div className="text-xl font-semibold">
+                {circulatingSupply.toLocaleString(undefined, {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2,
+                })}{" "}
+                FLUX
+              </div>
+              <p className="text-xs text-muted-foreground mt-1">
+                Excludes unmined parallel assets
+              </p>
+            </div>
+          )}
+
           <div className="p-3 rounded-lg bg-muted/50 border">
             <div className="text-xs uppercase text-muted-foreground">
               Total Supply
@@ -525,13 +564,16 @@ function RichListDistribution({
               })}{" "}
               FLUX
             </div>
+            <p className="text-xs text-muted-foreground mt-1">
+              Includes unmined parallel assets
+            </p>
           </div>
 
           {/* Transparent vs Shielded Breakdown */}
           {transparentSupply !== undefined && shieldedPool !== undefined && (
             <div className="p-3 rounded-lg bg-muted/50 border space-y-2">
               <div className="text-xs uppercase text-muted-foreground">
-                Supply Breakdown
+                Total Supply Breakdown
               </div>
               <div className="space-y-1">
                 <div className="flex items-center justify-between text-sm">

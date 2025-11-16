@@ -233,16 +233,17 @@ async function fetchRichListData(minBalance: number): Promise<RichListData> {
   const supplyStats = await supplyStatsPromise;
 
   // Use supply stats if available, otherwise fall back to rich list total
+  // Note: Supply endpoint now returns FLUX values (not zatoshis), so no conversion needed
   const totalSupplyFlux = supplyStats
-    ? Number(supplyStats.totalSupply || "0") / 1e8
+    ? Number(supplyStats.totalSupply || "0")
     : Number(metadata.totalSupply || "0") / 1e8;
 
   const transparentSupplyFlux = supplyStats
-    ? Number(supplyStats.transparentSupply || "0") / 1e8
+    ? Number(supplyStats.transparentSupply || "0")
     : totalSupplyFlux;
 
   const shieldedPoolFlux = supplyStats
-    ? Number(supplyStats.shieldedPool || "0") / 1e8
+    ? Number(supplyStats.shieldedPool || "0")
     : 0;
 
   return {

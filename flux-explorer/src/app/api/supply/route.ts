@@ -1,38 +1,32 @@
 /**
  * API Route for Flux Supply Statistics
  *
- * This server-side API route proxies requests to CoinMarketCap
- * to avoid CORS issues when calling from the browser
+ * This server-side API route proxies requests to the FluxIndexer API
+ * to get accurate supply statistics from the blockchain
  */
 
 import { NextResponse } from "next/server";
 
 export async function GET() {
   try {
-    const response = await fetch(
-      "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug=zel",
-      {
-        headers: {
-          "Accept": "application/json",
-        },
-        // Cache for 5 minutes
-        next: { revalidate: 300 },
-      }
-    );
+    const indexerUrl = process.env.SERVER_API_URL || process.env.NEXT_PUBLIC_SERVER_API_URL || "http://localhost:3002";
+    const response = await fetch(`${indexerUrl}/api/v1/supply`, {
+      headers: {
+        "Accept": "application/json",
+      },
+      // Cache for 2 minutes
+      next: { revalidate: 120 },
+    });
 
     if (!response.ok) {
-      throw new Error(`CoinMarketCap API returned ${response.status}`);
+      throw new Error(`FluxIndexer API returned ${response.status}`);
     }
 
     const data = await response.json();
-    const stats = data.data.statistics;
 
-    return NextResponse.json({
-      circulatingSupply: stats.circulatingSupply,
-      maxSupply: 560_000_000, // Hardcoded max supply: 560M FLUX
-    });
+    return NextResponse.json(data);
   } catch (error) {
-    console.error("Failed to fetch supply from CoinMarketCap:", error);
+    console.error("Failed to fetch supply from FluxIndexer:", error);
     return NextResponse.json(
       { error: "Failed to fetch supply data" },
       { status: 500 }
