@@ -761,7 +761,7 @@ export class FluxIndexerAPI {
    */
   static async getAddressTransactions(
     addresses: string[],
-    params?: { from?: number; to?: number; fromBlock?: number; toBlock?: number }
+    params?: { from?: number; to?: number; fromBlock?: number; toBlock?: number; fromTimestamp?: number; toTimestamp?: number }
   ): Promise<AddressTransactionsPage> {
     try {
       // FluxIndexer API uses single address with pagination
@@ -783,6 +783,12 @@ export class FluxIndexerAPI {
       }
       if (params?.toBlock !== undefined) {
         searchParams.toBlock = params.toBlock.toString();
+      }
+      if (params?.fromTimestamp !== undefined) {
+        searchParams.fromTimestamp = params.fromTimestamp.toString();
+      }
+      if (params?.toTimestamp !== undefined) {
+        searchParams.toTimestamp = params.toTimestamp.toString();
       }
 
       const response = await apiClient

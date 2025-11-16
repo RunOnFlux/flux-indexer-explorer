@@ -71,7 +71,7 @@
     },
     {
       "name": "explorer",
-      "description": "Flux Explorer web interface - Next.js frontend with auto-detect API URL",
+      "description": "Flux Explorer web interface - Next.js frontend with auto-detect API URL. Persists SQLite price cache (~50MB).",
       "repotag": "littlestache/flux-explorer:latest",
       "ports": [42069],
       "containerPorts": [42069],
@@ -85,7 +85,7 @@
         "SERVER_API_URL=http://fluxindexer_fluxexplorer:42067"
       ],
       "commands": [],
-      "containerData": "/appdata",
+      "containerData": "/app/data",
       "cpu": 1.0,
       "ram": 2048,
       "hdd": 20,

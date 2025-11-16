@@ -3,12 +3,14 @@
 import { useState } from "react";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { Download, FileJson } from "lucide-react";
 import { AddressTransactionSummary } from "@/types/flux-api";
 import { FluxAPI } from "@/lib/api/client";
 import { batchGetFluxPrices } from "@/lib/api/price-history-client";
+import { DateRange } from "react-day-picker";
+import { DateRangePicker } from "@/components/ui/date-range-picker";
+import { addDays, startOfYear, startOfDay, endOfDay } from "date-fns";
 
 interface TransactionExportDialogProps {
   open: boolean;
@@ -19,12 +21,16 @@ interface TransactionExportDialogProps {
 
 type ExportFormat = "csv" | "json";
 
-const PRESET_COUNTS = [
-  { label: "Last 100", value: 100 },
-  { label: "Last 500", value: 500 },
-  { label: "Last 1,000", value: 1000 },
-  { label: "Last 5,000", value: 5000 },
-  { label: "All", value: -1 },
+// Flux blockchain genesis block timestamp (approximate)
+const FLUX_GENESIS_DATE = new Date("2018-06-01");
+
+const PRESET_RANGES = [
+  { label: "Last 30 days", days: 30 },
+  { label: "Last 90 days", days: 90 },
+  { label: "Last 6 months", days: 180 },
+  { label: "Last year", days: 365 },
+  { label: "This year", value: "year" as const },
+  { label: "All time", value: "all" as const },
 ];
 
 export function TransactionExportDialog({
@@ -33,40 +39,85 @@ export function TransactionExportDialog({
   address,
   totalTransactions,
 }: TransactionExportDialogProps) {
-  const [selectedCount, setSelectedCount] = useState<number>(-1);
-  const [customCount, setCustomCount] = useState("");
+  const [dateRange, setDateRange] = useState<DateRange | undefined>();
   const [isExporting, setIsExporting] = useState(false);
   const [progress, setProgress] = useState(0);
   const [fetchedCount, setFetchedCount] = useState(0);
   const [targetCount, setTargetCount] = useState(0);
   const [currentStatus, setCurrentStatus] = useState("");
 
+  const handlePresetClick = (preset: typeof PRESET_RANGES[number]) => {
+    const today = new Date();
+    const endDate = endOfDay(today);
+    let startDate: Date;
+
+    if (preset.value === "all") {
+      startDate = FLUX_GENESIS_DATE;
+    } else if (preset.value === "year") {
+      startDate = startOfYear(today);
+    } else {
+      startDate = startOfDay(addDays(today, -preset.days!));
+    }
+
+    setDateRange({ from: startDate, to: endDate });
+  };
+
+  const handleDateRangeChange = (range: DateRange | undefined) => {
+    if (!range) {
+      setDateRange(undefined);
+      return;
+    }
+
+    // Normalize dates to UTC midnight/end of day
+    // Blockchain timestamps are in UTC, so we need to work in UTC
+    const normalizedRange: DateRange = {
+      from: range.from ? getUTCStartOfDay(range.from) : undefined,
+      to: range.to ? getUTCEndOfDay(range.to) : range.from ? getUTCEndOfDay(range.from) : undefined,
+    };
+
+    setDateRange(normalizedRange);
+  };
+
+  // Helper: Get UTC start of day (00:00:00 UTC)
+  const getUTCStartOfDay = (date: Date): Date => {
+    return new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0));
+  };
+
+  // Helper: Get UTC end of day (23:59:59 UTC)
+  const getUTCEndOfDay = (date: Date): Date => {
+    return new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 59, 999));
+  };
+
   const handleExport = async (format: ExportFormat) => {
-    const count = selectedCount === -1
-      ? totalTransactions
-      : selectedCount > 0
-        ? selectedCount
-        : parseInt(customCount) || 100;
+    if (!dateRange?.from || !dateRange?.to) {
+      alert("Please select a date range");
+      return;
+    }
 
     setIsExporting(true);
     setProgress(0);
     setFetchedCount(0);
-    setTargetCount(count);
+    setTargetCount(0);
     setCurrentStatus("Fetching transactions...");
 
     try {
-      const batchSize = 1000; // Fetch 1000 transactions at a time
+      // Convert dates to Unix timestamps (seconds)
+      const fromTimestamp = Math.floor(dateRange.from.getTime() / 1000);
+      const toTimestamp = Math.floor(dateRange.to.getTime() / 1000);
+
+      const batchSize = 10000; // Fetch up to 10000 transactions per batch for faster exports
       let allTransactions: AddressTransactionSummary[] = [];
       let offset = 0;
+      let hasMore = true;
 
-      // Step 1: Fetch all transactions
-      while (allTransactions.length < count) {
-        const limit = Math.min(batchSize, count - allTransactions.length);
-
+      // Step 1: Fetch all transactions in the date range
+      while (hasMore) {
         // Fetch batch from API using FluxAPI client
         const data = await FluxAPI.getAddressTransactions([address], {
           from: offset,
-          to: offset + limit,
+          to: offset + batchSize,
+          fromTimestamp,
+          toTimestamp,
         });
 
         const items = data.items || [];
@@ -74,21 +125,47 @@ export function TransactionExportDialog({
 
         offset += items.length; // Increment by actual items received
         setFetchedCount(allTransactions.length);
-        setProgress((allTransactions.length / count) * 50); // First 50% is fetching transactions
+
+        // Update target count based on filteredTotal from first response
+        if (targetCount === 0 && data.filteredTotal) {
+          setTargetCount(data.filteredTotal);
+        }
+
+        // Calculate progress (first 50% is fetching transactions)
+        const estimatedTotal = data.filteredTotal || allTransactions.length;
+        setProgress((allTransactions.length / Math.max(estimatedTotal, 1)) * 50);
 
         // Break if we've received fewer transactions than requested (end of data)
-        if (items.length === 0 || items.length < limit) {
-          break;
+        if (items.length === 0 || items.length < batchSize || allTransactions.length >= (data.filteredTotal || 0)) {
+          hasMore = false;
         }
+      }
+
+      if (allTransactions.length === 0) {
+        alert("No transactions found in the selected date range");
+        setIsExporting(false);
+        return;
       }
 
       // Step 2: Fetch price data for all transactions (second 50% of progress)
       setCurrentStatus("Fetching price data...");
       const timestamps = allTransactions.map(tx => tx.timestamp).filter(ts => ts > 0);
-      const priceMap = await batchGetFluxPrices(timestamps);
 
-      // Update progress as we process price data
-      setProgress(75);
+      // Batch price fetching with progress updates (chunks of 1000 timestamps)
+      const priceMap = new Map<number, number | null>();
+      const priceChunkSize = 1000;
+
+      for (let i = 0; i < timestamps.length; i += priceChunkSize) {
+        const chunk = timestamps.slice(i, i + priceChunkSize);
+        const chunkResults = await batchGetFluxPrices(chunk);
+
+        // Merge results into main map
+        chunkResults.forEach((price, timestamp) => priceMap.set(timestamp, price));
+
+        // Update progress (50% to 75% range)
+        const chunkProgress = Math.min(i + priceChunkSize, timestamps.length);
+        setProgress(50 + (chunkProgress / timestamps.length) * 25);
+      }
 
       // Step 3: Split into multiple files if needed (100K transactions per file)
       const MAX_TRANSACTIONS_PER_FILE = 100000;
@@ -221,32 +298,15 @@ export function TransactionExportDialog({
     return header + rows.join("\n");
   };
 
-  const handlePresetClick = (value: number) => {
-    setSelectedCount(value);
-    setCustomCount("");
-  };
-
-  const handleCustomCountChange = (value: string) => {
-    setCustomCount(value);
-    const parsed = parseInt(value);
-    if (!isNaN(parsed) && parsed > 0) {
-      setSelectedCount(parsed);
-    }
-  };
-
-  const displayCount = selectedCount === -1
-    ? totalTransactions
-    : selectedCount > 0
-      ? selectedCount
-      : parseInt(customCount) || 0;
+  const isValidRange = dateRange?.from && dateRange?.to;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-[600px]">
         <DialogHeader>
-          <DialogTitle>Transaction History</DialogTitle>
+          <DialogTitle>Export Transaction History</DialogTitle>
           <DialogDescription>
-            {totalTransactions.toLocaleString()} total transactions
+            Select a date range to export transactions. {totalTransactions.toLocaleString()} total transactions available.
           </DialogDescription>
         </DialogHeader>
 
@@ -255,7 +315,7 @@ export function TransactionExportDialog({
             <div className="text-sm font-medium text-center">
               {currentStatus}
             </div>
-            {progress < 50 && (
+            {progress < 50 && targetCount > 0 && (
               <div className="text-sm text-muted-foreground text-center">
                 {fetchedCount.toLocaleString()} / {targetCount.toLocaleString()} transactions
               </div>
@@ -272,46 +332,52 @@ export function TransactionExportDialog({
           </div>
         ) : (
           <div className="space-y-6 py-4">
-            {/* Transaction count selection */}
+            {/* Date range selection */}
             <div className="space-y-3">
               <label className="text-sm font-medium">
-                Number of transactions to export
+                Select date range
               </label>
 
-              {/* Preset buttons */}
+              {/* Preset range buttons */}
               <div className="flex flex-wrap gap-2">
-                {PRESET_COUNTS.map((preset) => (
+                {PRESET_RANGES.map((preset) => (
                   <Button
                     key={preset.label}
-                    variant={selectedCount === preset.value ? "default" : "outline"}
+                    variant="outline"
                     size="sm"
-                    onClick={() => handlePresetClick(preset.value)}
-                    disabled={preset.value > totalTransactions && preset.value !== -1}
+                    onClick={() => handlePresetClick(preset)}
                   >
                     {preset.label}
                   </Button>
                 ))}
               </div>
 
-              {/* Custom count input */}
-              <div className="space-y-2">
-                <label className="text-xs text-muted-foreground">
-                  Or enter exact amount:
-                </label>
-                <Input
-                  type="number"
-                  min="1"
-                  max={totalTransactions}
-                  value={customCount}
-                  onChange={(e) => handleCustomCountChange(e.target.value)}
-                  placeholder="All"
-                  className="w-full"
+              {/* Date range picker */}
+              <div className="flex gap-2">
+                <DateRangePicker
+                  value={dateRange}
+                  onChange={handleDateRangeChange}
+                  placeholder="Select custom date range"
+                  minDate={FLUX_GENESIS_DATE}
+                  maxDate={new Date()}
+                  className="flex-1"
                 />
+                {dateRange && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setDateRange(undefined)}
+                    className="px-3"
+                    title="Clear date range"
+                  >
+                    Clear
+                  </Button>
+                )}
               </div>
 
-              {displayCount > 0 && (
-                <div className="text-xs text-muted-foreground text-right">
-                  Will export {displayCount > totalTransactions ? totalTransactions : displayCount} of {totalTransactions.toLocaleString()} transactions
+              {isValidRange && dateRange.from && dateRange.to && (
+                <div className="text-xs text-muted-foreground">
+                  Transactions from {dateRange.from.toLocaleDateString()} to {dateRange.to.toLocaleDateString()}
                 </div>
               )}
             </div>
@@ -320,7 +386,7 @@ export function TransactionExportDialog({
             <div className="flex gap-2">
               <Button
                 onClick={() => handleExport("csv")}
-                disabled={displayCount === 0}
+                disabled={!isValidRange}
                 className="flex-1"
                 variant="default"
               >
@@ -329,7 +395,7 @@ export function TransactionExportDialog({
               </Button>
               <Button
                 onClick={() => handleExport("json")}
-                disabled={displayCount === 0}
+                disabled={!isValidRange}
                 className="flex-1"
                 variant="outline"
               >

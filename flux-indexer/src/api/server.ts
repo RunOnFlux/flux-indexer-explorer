@@ -1292,7 +1292,13 @@ export class APIServer {
   private async getAddressTransactions(req: Request, res: Response): Promise<void> {
     try {
       const { address } = req.params;
-      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 20));
+      const fromTimestamp = req.query.fromTimestamp ? parseInt(req.query.fromTimestamp as string) : undefined;
+      const toTimestamp = req.query.toTimestamp ? parseInt(req.query.toTimestamp as string) : undefined;
+
+      // For date range exports, allow larger batch sizes (up to 10000)
+      // Otherwise cap at 100 for standard pagination
+      const maxLimit = (fromTimestamp !== undefined || toTimestamp !== undefined) ? 10000 : 100;
+      const limit = Math.min(maxLimit, Math.max(1, parseInt(req.query.limit as string) || 20));
       const offset = Math.max(0, parseInt(req.query.offset as string) || 0);
 
       // TEMPORARY: Disable transaction history during initial sync to prevent blocking
@@ -1331,6 +1337,23 @@ export class APIServer {
       // ULTRA-OPTIMIZED: Use materialized address_transactions table (migration 007)
       // This eliminates expensive UNION and LATERAL JOIN queries entirely
       // Falls back to old query if table doesn't exist yet
+      // Support timestamp filtering for date range exports
+      const whereConditions = ['at.address = $1'];
+      const queryParams: any[] = [address];
+      let paramIndex = 2;
+
+      if (fromTimestamp !== undefined) {
+        whereConditions.push(`at.timestamp >= $${paramIndex}`);
+        queryParams.push(fromTimestamp);
+        paramIndex++;
+      }
+
+      if (toTimestamp !== undefined) {
+        whereConditions.push(`at.timestamp <= $${paramIndex}`);
+        queryParams.push(toTimestamp);
+        paramIndex++;
+      }
+
       const txQuery = `
         SELECT
           at.txid,
@@ -1344,12 +1367,26 @@ export class APIServer {
           COALESCE(t.fee, 0)::bigint AS fee_value
         FROM address_transactions at
         LEFT JOIN transactions t ON t.txid = at.txid
-        WHERE at.address = $1
+        WHERE ${whereConditions.join(' AND ')}
         ORDER BY at.block_height DESC, at.txid DESC
-        LIMIT $2 OFFSET $3
+        LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
       `;
 
-      const transactions = await this.db.query(txQuery, [address, limit, offset]);
+      queryParams.push(limit, offset);
+      const transactions = await this.db.query(txQuery, queryParams);
+
+      // Get filtered count if timestamp filters are applied
+      let filteredTotal = totalTxs;
+      if (fromTimestamp !== undefined || toTimestamp !== undefined) {
+        const countQueryFiltered = `
+          SELECT COUNT(*) as filtered_count
+          FROM address_transactions at
+          WHERE ${whereConditions.join(' AND ')}
+        `;
+        const countParams = queryParams.slice(0, -2); // Remove limit and offset
+        const filteredCountResult = await this.db.query(countQueryFiltered, countParams);
+        filteredTotal = parseInt(filteredCountResult.rows[0]?.filtered_count || '0', 10);
+      }
 
       const currentHeightResult = await this.db.query('SELECT MAX(height) as max_height FROM blocks');
       const currentHeight = currentHeightResult.rows[0]?.max_height || 0;
@@ -1504,7 +1541,7 @@ export class APIServer {
           };
         }),
         total: totalTxs,
-        filteredTotal: totalTxs, // Use pre-computed count from address_summary
+        filteredTotal: filteredTotal, // Filtered count (respects timestamp range)
         limit,
         offset,
       });

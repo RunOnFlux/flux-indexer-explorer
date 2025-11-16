@@ -181,7 +181,7 @@ export class FluxAPI {
    */
   static async getAddressTransactions(
     addresses: string[],
-    params?: { from?: number; to?: number; fromBlock?: number; toBlock?: number }
+    params?: { from?: number; to?: number; fromBlock?: number; toBlock?: number; fromTimestamp?: number; toTimestamp?: number }
   ): Promise<AddressTransactionsPage> {
     return FluxIndexerAPI.getAddressTransactions(addresses, params);
   }

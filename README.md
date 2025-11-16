@@ -305,6 +305,8 @@ docker compose -f docker-compose.production.yml logs -f explorer
 docker compose -f docker-compose.production.yml down
 ```
 
+**Important**: The production docker-compose file includes a `price-cache-data` volume for the explorer service. This persists the SQLite price cache database (~50MB with 35,000+ historical price points) across container rebuilds. Without this volume, the price data would need to be re-downloaded on every deployment (5-10 minute process).
+
 ### Individual Component Management
 
 ```bash
