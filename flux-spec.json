@@ -32,7 +32,7 @@
       ],
       "containerData": "/var/lib/postgresql/data",
       "cpu": 2.0,
-      "ram": 20480,
+      "ram": 16384,
       "hdd": 400,
       "shm": 1024,
       "tiered": false
@@ -65,8 +65,8 @@
       "commands": [],
       "containerData": "/home/flux/.flux",
       "cpu": 4.0,
-      "ram": 4096,
-      "hdd": 200,
+      "ram": 6144,
+      "hdd": 150,
       "tiered": false
     },
     {
@@ -86,8 +86,8 @@
       "commands": [],
       "containerData": "/app/data",
       "cpu": 1.0,
-      "ram": 2048,
-      "hdd": 20,
+      "ram": 1024,
+      "hdd": 5,
       "tiered": false
     }
   ]

@@ -352,18 +352,18 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 **PostgreSQL Database:**
 - CPU: 2 cores
-- RAM: 20 GB
+- RAM: 16 GB (actual usage: ~12GB)
 - Storage: 400 GB (~260GB current, grows over time)
 
 **FluxIndexer (with Fluxd):**
 - CPU: 4 cores
-- RAM: 4 GB
-- Storage: 200 GB (~45GB blockchain + params)
+- RAM: 6 GB (actual usage: ~2GB, includes bootstrap overhead)
+- Storage: 150 GB (~45GB blockchain + params, ~115GB peak during bootstrap)
 
 **Explorer Frontend:**
 - CPU: 1 core
-- RAM: 2 GB
-- Storage: 20 GB
+- RAM: 1 GB (actual usage: ~60MB)
+- Storage: 5 GB (price cache ~50MB)
 
 ### System Performance
 - **Indexer Performance**: Optimized blockchain synchronization
