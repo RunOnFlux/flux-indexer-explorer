@@ -295,6 +295,8 @@ export interface QueryParams {
   to?: number;
   limit?: number;
   offset?: number;
+  cursorHeight?: number;
+  cursorTxid?: string;
 }
 
 export interface AddressTransactionSummary {
@@ -331,4 +333,8 @@ export interface AddressTransactionsPage extends PaginatedResponse<AddressTransa
   to: number;
   limit: number;
   offset: number;
+  nextCursor?: {
+    height: number;
+    txid: string;
+  };
 }

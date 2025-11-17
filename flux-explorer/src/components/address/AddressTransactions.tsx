@@ -48,6 +48,13 @@ export function AddressTransactions({
   const [pageInput, setPageInput] = useState("");
   const [expandedRows, setExpandedRows] = useState<Set<string>>(() => new Set());
   const [showExportDialog, setShowExportDialog] = useState(false);
+
+  // Cursor-based pagination state: track cursor for each page
+  const [cursorStack, setCursorStack] = useState<Array<{ height: number; txid: string } | null>>([null]);
+
+  // Get cursor for current page
+  const currentCursor = cursorStack[currentPage - 1] || null;
+
   const from = (currentPage - 1) * ITEMS_PER_PAGE;
   const to = from + ITEMS_PER_PAGE;
 
@@ -62,7 +69,7 @@ export function AddressTransactions({
 
   const { data: txPage, isLoading, refetch } = useAddressTransactions(
     [addressInfo.addrStr],
-    { from, to },
+    currentCursor ? { cursorHeight: currentCursor.height, cursorTxid: currentCursor.txid, to: ITEMS_PER_PAGE } : { from, to },
     {
       staleTime: 0,
       placeholderData: keepPreviousData,
@@ -85,6 +92,20 @@ export function AddressTransactions({
 
     return () => clearInterval(intervalId);
   }, [pollingToken, pollingActive, pollingInterval, refetch]);
+
+  // Update cursor stack when we receive new data with nextCursor
+  useEffect(() => {
+    if (txPage?.nextCursor) {
+      setCursorStack((prev) => {
+        const newStack = [...prev];
+        // Store the cursor for the next page
+        if (newStack.length === currentPage) {
+          newStack.push(txPage.nextCursor || null);
+        }
+        return newStack;
+      });
+    }
+  }, [txPage, currentPage]);
 
   const transactions = txPage?.items ?? [];
   const totalItems = txPage?.filteredTotal ?? txPage?.totalItems ?? addressInfo.txApperances ?? 0;

@@ -201,7 +201,11 @@ interface FluxIndexerAddressTransactionsResponse {
   total: number;
   filteredTotal?: number;
   limit: number;
-  offset: number;
+  offset?: number;
+  nextCursor?: {
+    height: number;
+    txid: string;
+  };
 }
 
 interface FluxIndexerUtxoResponse {
@@ -764,22 +768,44 @@ export class FluxIndexerAPI {
    */
   static async getAddressTransactions(
     addresses: string[],
-    params?: { from?: number; to?: number; fromBlock?: number; toBlock?: number; fromTimestamp?: number; toTimestamp?: number }
+    params?: {
+      from?: number;
+      to?: number;
+      fromBlock?: number;
+      toBlock?: number;
+      fromTimestamp?: number;
+      toTimestamp?: number;
+      cursorHeight?: number;
+      cursorTxid?: string;
+    }
   ): Promise<AddressTransactionsPage> {
     try {
       // FluxIndexer API uses single address with pagination
       const address = addresses[0]; // Take first address
 
-      // Calculate page from params
+      // Calculate page size from params
       const from = params?.from || 0;
       const to = params?.to || 25;
       const pageSize = Math.max(1, to - from);
 
-      // Build search params for new API format
+      // Build search params - prefer cursor-based pagination when available
       const searchParams: Record<string, string> = {
         limit: pageSize.toString(),
-        offset: from.toString(),
       };
+
+      // Use cursor-based pagination if cursor is provided
+      if (params?.cursorHeight !== undefined && params?.cursorTxid) {
+        searchParams.cursorHeight = params.cursorHeight.toString();
+        searchParams.cursorTxid = params.cursorTxid;
+      }
+      // Fall back to offset-based for CSV exports with timestamp filters
+      else if (params?.fromTimestamp !== undefined || params?.toTimestamp !== undefined) {
+        searchParams.offset = from.toString();
+      }
+      // For regular pagination without cursor, use offset (will be slower for large offsets)
+      else {
+        searchParams.offset = from.toString();
+      }
 
       if (params?.fromBlock !== undefined) {
         searchParams.fromBlock = params.fromBlock.toString();
@@ -799,6 +825,7 @@ export class FluxIndexerAPI {
         .json<FluxIndexerAddressTransactionsResponse>();
 
       const filteredTotal = response.filteredTotal ?? response.total ?? 0;
+      const nextCursor = response.nextCursor;
 
       const items: AddressTransactionSummary[] = (response.transactions || []).map((tx) => {
         const valueSat = tx.value ?? '0';
@@ -846,6 +873,7 @@ export class FluxIndexerAPI {
         offset: from,
         pagesTotal: pageSize > 0 ? Math.max(1, Math.ceil(filteredTotal / pageSize)) : 1,
         items,
+        nextCursor,
       };
     } catch (error) {
       throw new FluxIndexerAPIError(
