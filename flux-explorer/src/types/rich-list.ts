@@ -12,6 +12,9 @@ export interface RichListAddress {
   balance: number;
   percentage: number;
   txCount: number;
+  cumulusCount?: number;
+  nimbusCount?: number;
+  stratusCount?: number;
   label?: string;
   category?: RichListCategory;
   note?: string;

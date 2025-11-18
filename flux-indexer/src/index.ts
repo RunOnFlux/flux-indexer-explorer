@@ -12,12 +12,14 @@ import { APIServer } from './api/server';
 import { runMigration } from './database/migrate';
 import { logger } from './utils/logger';
 import { BootstrapImporter } from './bootstrap/importer';
+import { FluxNodeSyncService } from './services/fluxnode-sync';
 
 class FluxIndexer {
   private rpc!: FluxRPCClient;
   private db!: DatabaseConnection;
   private syncEngine!: SyncEngine;
   private apiServer!: APIServer;
+  private fluxNodeSync!: FluxNodeSyncService;
   private isShuttingDown = false;
 
   /**
@@ -66,6 +68,10 @@ class FluxIndexer {
     });
     logger.info('Sync engine initialized');
 
+    // Initialize FluxNode sync service
+    this.fluxNodeSync = new FluxNodeSyncService(this.db.getPool(), this.rpc);
+    logger.info('FluxNode sync service initialized');
+
     // Initialize API server
     this.apiServer = new APIServer(this.db, this.rpc, this.syncEngine, config.api.port);
     logger.info('API server initialized');
@@ -87,6 +93,10 @@ class FluxIndexer {
     await this.syncEngine.start();
     logger.info('Sync engine started');
 
+    // Start FluxNode sync service
+    this.fluxNodeSync.start();
+    logger.info('FluxNode sync service started');
+
     logger.info('FluxIndexer is running');
     logger.info(`API available at http://${config.api.host}:${config.api.port}/api/v1`);
   }
@@ -101,6 +111,12 @@ class FluxIndexer {
 
     this.isShuttingDown = true;
     logger.info('Stopping FluxIndexer...');
+
+    // Stop FluxNode sync service
+    if (this.fluxNodeSync) {
+      this.fluxNodeSync.stop();
+      logger.info('FluxNode sync service stopped');
+    }
 
     // Stop sync engine
     if (this.syncEngine) {

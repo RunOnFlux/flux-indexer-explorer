@@ -1790,7 +1790,10 @@ export class APIServer {
           sent_total,
           unspent_count,
           first_seen,
-          last_activity
+          last_activity,
+          cumulus_count,
+          nimbus_count,
+          stratus_count
         FROM address_summary
         WHERE balance >= $1
         ORDER BY balance DESC
@@ -1807,6 +1810,9 @@ export class APIServer {
         address: row.address,
         balance: row.balance ? row.balance.toString() : '0',
         txCount: row.tx_count,
+        cumulusCount: row.cumulus_count || 0,
+        nimbusCount: row.nimbus_count || 0,
+        stratusCount: row.stratus_count || 0,
         receivedTotal: row.received_total ? row.received_total.toString() : '0',
         sentTotal: row.sent_total ? row.sent_total.toString() : '0',
         unspentCount: row.unspent_count,

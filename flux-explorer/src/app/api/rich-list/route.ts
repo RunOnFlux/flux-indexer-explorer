@@ -71,6 +71,9 @@ interface IndexerRichListResponse {
     address: string;
     balance: string;
     txCount: number;
+    cumulusCount?: number;
+    nimbusCount?: number;
+    stratusCount?: number;
   }>;
 }
 
@@ -244,6 +247,9 @@ async function fetchRichListData(minBalance: number): Promise<RichListData> {
         balance: balanceFlux,
         percentage,
         txCount: address.txCount,
+        cumulusCount: address.cumulusCount,
+        nimbusCount: address.nimbusCount,
+        stratusCount: address.stratusCount,
       });
     });
 

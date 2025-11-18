@@ -8,7 +8,7 @@
 
 import { useState, useEffect, useMemo } from "react";
 import Link from "next/link";
-import { Loader2, AlertCircle, TrendingUp, Lock } from "lucide-react";
+import { Loader2, AlertCircle, TrendingUp, Lock, Server } from "lucide-react";
 import {
   Table,
   TableBody,
@@ -244,68 +244,123 @@ export function RichListTable() {
 
       {/* Table */}
       <div className="border rounded-lg overflow-hidden">
-        <div className="overflow-x-auto">
+        <div className="overflow-x-auto overflow-y-visible">
           <Table>
-            <TableHeader>
-              <TableRow className="bg-muted/50">
-                <TableHead className="w-[80px] text-center">Rank</TableHead>
-                <TableHead>Address</TableHead>
-                <TableHead className="text-right">Balance (FLUX)</TableHead>
-                <TableHead className="text-right">% of Supply</TableHead>
-                <TableHead className="text-right hidden sm:table-cell">
-                  Transactions
-                </TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {paginatedAddresses.map((address) => (
-                <TableRow key={address.address} className="hover:bg-muted/30">
-                  <TableCell className="text-center font-medium">
-                    #{address.rank}
-                  </TableCell>
-                  <TableCell>
-                    <Link
-                      href={`/address/${address.address}`}
-                      className="font-mono text-sm hover:text-primary transition-colors"
-                    >
-                      <span className="hidden lg:inline">{address.address}</span>
-                      <span className="lg:hidden">
-                        {formatAddress(address.address)}
-                      </span>
-                    </Link>
-                    {address.label && (
-                      <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground mt-1">
-                        <Badge variant="outline" className="border-transparent" style={{ backgroundColor: `${richListCategoryColors[address.category ?? "Unknown"]}1A`, color: richListCategoryColors[address.category ?? "Unknown"] }}>
-                          {address.category ?? "Unknown"}
-                        </Badge>
-                        <span className="font-medium text-foreground">{address.label}</span>
-                        {address.locked && (
-                          <span className="inline-flex items-center gap-1 text-xs text-amber-500">
-                            <Lock className="h-3 w-3" />
-                            Locked
-                          </span>
-                        )}
-                        {address.note && (
-                          <span className="text-muted-foreground">{address.note}</span>
-                        )}
-                      </div>
-                    )}
-                  </TableCell>
-                  <TableCell className="text-right font-mono">
-                    {formatBalance(address.balance)}
-                  </TableCell>
-                  <TableCell className="text-right font-mono text-sm text-muted-foreground">
-                    {formatPercentage(address.percentage)}
-                  </TableCell>
-                  <TableCell className="text-right hidden sm:table-cell">
-                    {address.txCount.toLocaleString()}
-                  </TableCell>
+              <TableHeader>
+                <TableRow className="bg-muted/50">
+                  <TableHead className="w-[80px] text-center">Rank</TableHead>
+                  <TableHead>Address</TableHead>
+                  <TableHead className="text-right">Balance (FLUX)</TableHead>
+                  <TableHead className="text-right">% of Supply</TableHead>
+                  <TableHead className="text-right hidden sm:table-cell">
+                    Transactions
+                  </TableHead>
                 </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+              </TableHeader>
+              <TableBody>
+                {paginatedAddresses.map((address) => {
+                  const totalNodes = (address.cumulusCount || 0) + (address.nimbusCount || 0) + (address.stratusCount || 0);
+                  const hasFluxNodes = totalNodes > 0;
+
+                  return (
+                    <TableRow key={address.address} className="hover:bg-muted/30">
+                      <TableCell className="text-center font-medium">
+                        #{address.rank}
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-2">
+                          <Link
+                            href={`/address/${address.address}`}
+                            className="font-mono text-sm hover:text-primary transition-colors"
+                          >
+                            <span className="hidden lg:inline">{address.address}</span>
+                            <span className="lg:hidden">
+                              {formatAddress(address.address)}
+                            </span>
+                          </Link>
+                          {hasFluxNodes && (
+                            <div className="relative group">
+                              <Badge
+                                variant="outline"
+                                className="cursor-help bg-blue-500/10 border-blue-500/30 text-blue-600 dark:text-blue-400 hover:bg-blue-500/20 flex items-center gap-1 px-2 py-0.5"
+                              >
+                                <Server className="h-3 w-3" />
+                                <span className="text-xs font-semibold">{totalNodes}</span>
+                              </Badge>
+                              {/* Hover tooltip */}
+                              <div className="absolute left-0 bottom-full mb-2 p-3 bg-card border rounded-md shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50 min-w-[160px]">
+                                <div className="space-y-1.5">
+                                  <div className="font-semibold text-xs text-muted-foreground mb-1.5 border-b border-border pb-1">
+                                    FluxNodes
+                                  </div>
+                                  {(address.cumulusCount ?? 0) > 0 && (
+                                    <div className="flex items-center justify-between gap-3">
+                                      <span className="text-pink-500 font-medium flex items-center gap-1.5 text-xs">
+                                        <span className="w-2 h-2 rounded-full bg-pink-500"></span>
+                                        Cumulus
+                                      </span>
+                                      <span className="font-mono font-bold text-xs text-pink-500">{address.cumulusCount}</span>
+                                    </div>
+                                  )}
+                                  {(address.nimbusCount ?? 0) > 0 && (
+                                    <div className="flex items-center justify-between gap-3">
+                                      <span className="text-purple-500 font-medium flex items-center gap-1.5 text-xs">
+                                        <span className="w-2 h-2 rounded-full bg-purple-500"></span>
+                                        Nimbus
+                                      </span>
+                                      <span className="font-mono font-bold text-xs text-purple-500">{address.nimbusCount}</span>
+                                    </div>
+                                  )}
+                                  {(address.stratusCount ?? 0) > 0 && (
+                                    <div className="flex items-center justify-between gap-3">
+                                      <span className="text-blue-500 font-medium flex items-center gap-1.5 text-xs">
+                                        <span className="w-2 h-2 rounded-full bg-blue-500"></span>
+                                        Stratus
+                                      </span>
+                                      <span className="font-mono font-bold text-xs text-blue-500">{address.stratusCount}</span>
+                                    </div>
+                                  )}
+                                </div>
+                                {/* Arrow pointing down */}
+                                <div className="absolute left-4 bottom-[-6px] w-3 h-3 bg-card border-r border-b rotate-45"></div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                        {address.label && (
+                          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground mt-1">
+                            <Badge variant="outline" className="border-transparent" style={{ backgroundColor: `${richListCategoryColors[address.category ?? "Unknown"]}1A`, color: richListCategoryColors[address.category ?? "Unknown"] }}>
+                              {address.category ?? "Unknown"}
+                            </Badge>
+                            <span className="font-medium text-foreground">{address.label}</span>
+                            {address.locked && (
+                              <span className="inline-flex items-center gap-1 text-xs text-amber-500">
+                                <Lock className="h-3 w-3" />
+                                Locked
+                              </span>
+                            )}
+                            {address.note && (
+                              <span className="text-muted-foreground">{address.note}</span>
+                            )}
+                          </div>
+                        )}
+                      </TableCell>
+                      <TableCell className="text-right font-mono">
+                        {formatBalance(address.balance)}
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-sm text-muted-foreground">
+                        {formatPercentage(address.percentage)}
+                      </TableCell>
+                      <TableCell className="text-right hidden sm:table-cell">
+                        {address.txCount.toLocaleString()}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </div>
         </div>
-      </div>
 
       {/* Pagination */}
       <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
@@ -367,6 +422,9 @@ function annotateAddresses(response: RichListApiResponse): RichListAddress[] {
       balance: balanceFlux,
       percentage,
       txCount: entry.txCount,
+      cumulusCount: entry.cumulusCount,
+      nimbusCount: entry.nimbusCount,
+      stratusCount: entry.stratusCount,
       label: mapping?.label,
       category: mapping?.category,
       note: mapping?.note,
