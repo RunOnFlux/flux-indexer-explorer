@@ -102,3 +102,33 @@ export function useTransactions(txids: string[]): UseQueryResult<Transaction, Er
     })),
   });
 }
+
+/**
+ * Hook to fetch multiple transactions in a single batch request
+ *
+ * More efficient than useTransactions when fetching many transactions,
+ * especially when all transactions are from the same block.
+ *
+ * @param txids - Array of transaction IDs
+ * @param blockHeight - Optional block height (optimization hint)
+ * @returns Query result with array of transactions
+ *
+ * @example
+ * ```tsx
+ * const { data: transactions, isLoading } = useTransactionsBatch(txids, block.height);
+ * ```
+ */
+export function useTransactionsBatch(
+  txids: string[],
+  blockHeight?: number
+): UseQueryResult<Transaction[], Error> {
+  // Create a stable key from txids
+  const txidsKey = txids.sort().join(',');
+
+  return useQuery<Transaction[], Error>({
+    queryKey: [...transactionKeys.all, "batch", txidsKey, blockHeight],
+    queryFn: () => FluxAPI.getTransactionsBatch(txids, blockHeight),
+    enabled: txids.length > 0 && txids.every(txid => txid.length === 64),
+    staleTime: 5 * 60 * 1000, // 5 minutes - confirmed transactions don't change
+  });
+}

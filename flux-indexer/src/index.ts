@@ -10,7 +10,7 @@ import { DatabaseConnection } from './database/connection';
 import { SyncEngine } from './indexer/sync-engine';
 import { APIServer } from './api/server';
 import { runMigration } from './database/migrate';
-import { logger } from './utils/logger';
+import { logger, printStartupBanner } from './utils/logger';
 import { BootstrapImporter } from './bootstrap/importer';
 import { FluxNodeSyncService } from './services/fluxnode-sync';
 
@@ -140,6 +140,63 @@ class FluxIndexer {
   }
 
   /**
+   * Find missing blocks (gaps in block height sequence)
+   */
+  async findMissingBlocks(): Promise<number[]> {
+    const pool = this.db.getPool();
+
+    // Check if we have any blocks first
+    const countResult = await pool.query('SELECT COUNT(*) as count FROM blocks');
+    if (parseInt(countResult.rows[0].count) === 0) {
+      return []; // Empty database, no gaps
+    }
+
+    // Find all missing blocks
+    const result = await pool.query(`
+      WITH block_range AS (
+        SELECT generate_series(0, (SELECT MAX(height) FROM blocks)) as expected_height
+      ),
+      actual_blocks AS (
+        SELECT height FROM blocks
+      )
+      SELECT array_agg(expected_height ORDER BY expected_height) as missing_heights
+      FROM block_range br
+      LEFT JOIN actual_blocks ab ON br.expected_height = ab.height
+      WHERE ab.height IS NULL;
+    `);
+
+    return result.rows[0]?.missing_heights || [];
+  }
+
+  /**
+   * Backfill missing blocks
+   */
+  async backfillMissingBlocks(): Promise<number> {
+    const missingHeights = await this.findMissingBlocks();
+
+    if (missingHeights.length === 0) {
+      logger.info('No missing blocks found');
+      return 0;
+    }
+
+    logger.info(`Found ${missingHeights.length} missing blocks: ${missingHeights.join(', ')}`);
+
+    // Index each missing block
+    const blockIndexer = this.syncEngine.getBlockIndexer();
+    for (const height of missingHeights) {
+      try {
+        logger.info(`Backfilling block ${height}...`);
+        await blockIndexer.indexBlock(height);
+        logger.info(`Successfully backfilled block ${height}`);
+      } catch (error: any) {
+        logger.error(`Failed to backfill block ${height}`, { error: error.message });
+      }
+    }
+
+    return missingHeights.length;
+  }
+
+  /**
    * Get status
    */
   async getStatus(): Promise<any> {
@@ -172,6 +229,9 @@ class FluxIndexer {
 
 // Main execution
 async function main() {
+  // Show the awesome startup banner
+  printStartupBanner();
+
   const indexer = new FluxIndexer();
 
   // Handle shutdown signals
@@ -197,15 +257,39 @@ async function main() {
 
   try {
     await indexer.initialize();
+
+    // ALWAYS check for block gaps on startup
+    // Gaps indicate data corruption - cumulative stats like supply_stats will be wrong
+    logger.info('Checking for block gaps...');
+    const gaps = await indexer.findMissingBlocks();
+    if (gaps.length > 0) {
+      logger.error(`❌ BLOCK GAPS DETECTED: ${gaps.slice(0, 10).join(', ')}${gaps.length > 10 ? ` (and ${gaps.length - 10} more)` : ''}`);
+      logger.error('Cumulative stats (supply_stats) are likely corrupted.');
+      logger.error('Options:');
+      logger.error('  1. Run with BACKFILL_GAPS=true to attempt repair (WARNING: may not fix cumulative stats)');
+      logger.error('  2. Truncate database and resync from block 0 (RECOMMENDED for data integrity)');
+
+      if (process.env.BACKFILL_GAPS === 'true') {
+        logger.warn('BACKFILL_GAPS=true - Attempting to backfill gaps...');
+        const backfilled = await indexer.backfillMissingBlocks();
+        logger.warn(`Backfilled ${backfilled} blocks. ⚠️  WARNING: supply_stats is likely still incorrect!`);
+      } else {
+        logger.error('Refusing to start with block gaps. Set BACKFILL_GAPS=true to override (not recommended).');
+        process.exit(1);
+      }
+    }
+
     await indexer.start();
 
-    // Log status periodically
+    // Log status periodically (less frequently during heavy sync)
     setInterval(async () => {
       try {
         const status = await indexer.getStatus();
         logger.info('Status', status);
-      } catch (error) {
-        logger.error('Failed to get status', { error });
+      } catch (error: any) {
+        // During heavy sync, RPC might be too busy - log as debug, not error
+        // This prevents noisy logs when parallel fetcher is overwhelming the daemon
+        logger.debug('Status check failed (daemon busy during sync)', { error: error.message });
       }
     }, 60000); // Every minute
   } catch (error: any) {

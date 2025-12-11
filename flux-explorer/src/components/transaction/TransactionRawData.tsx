@@ -15,8 +15,17 @@ interface TransactionRawDataProps {
 }
 
 export function TransactionRawData({ txid, transaction }: TransactionRawDataProps) {
-  const { data: rawData } = useRawTransaction(txid);
   const [activeTab, setActiveTab] = useState("json");
+  // Only fetch raw hex when user clicks on Hex tab (expensive RPC call)
+  const [hexRequested, setHexRequested] = useState(false);
+  const { data: rawData, isLoading: isLoadingHex } = useRawTransaction(txid, { enabled: hexRequested });
+
+  const handleTabChange = (tab: string) => {
+    setActiveTab(tab);
+    if (tab === "hex" && !hexRequested) {
+      setHexRequested(true);
+    }
+  };
 
   const handleDownloadJson = () => {
     const jsonStr = JSON.stringify(transaction, null, 2);
@@ -80,7 +89,7 @@ export function TransactionRawData({ txid, transaction }: TransactionRawDataProp
         </div>
       </CardHeader>
       <CardContent>
-        <Tabs value={activeTab} onValueChange={setActiveTab}>
+        <Tabs value={activeTab} onValueChange={handleTabChange}>
           <TabsList className="grid w-full grid-cols-2">
             <TabsTrigger value="json" className="gap-2">
               <FileJson className="h-4 w-4" />
@@ -120,7 +129,7 @@ export function TransactionRawData({ txid, transaction }: TransactionRawDataProp
             ) : (
               <div className="p-8 text-center text-muted-foreground">
                 <Code className="h-12 w-12 mx-auto mb-3 opacity-50" />
-                <p>Loading raw transaction data...</p>
+                <p>{isLoadingHex ? "Loading raw transaction data..." : "Click to load raw hex data"}</p>
               </div>
             )}
           </TabsContent>

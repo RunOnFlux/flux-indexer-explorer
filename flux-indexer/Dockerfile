@@ -108,10 +108,6 @@ RUN npm ci --only=production
 COPY --from=indexer-builder /app/dist ./dist
 COPY --from=indexer-builder /app/src/database/schema.sql ./dist/database/
 
-# Copy migrations directory for automatic migration on startup
-COPY migrations/ ./migrations/
-
-# Copy built frontend from frontend-builder
 # Copy built frontend from frontend-builder (static export)
 COPY --from=frontend-builder /app/frontend/out ./frontend
 

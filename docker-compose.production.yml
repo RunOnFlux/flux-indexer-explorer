@@ -115,7 +115,8 @@ services:
       context: ./flux-explorer
       dockerfile: Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: http://localhost:42067
+        # AUTO = use /api/indexer proxy route (works on any domain/IP)
+        NEXT_PUBLIC_API_URL: AUTO
     image: yourusername/flux-explorer:latest  # Replace 'yourusername' with your Docker Hub username
     container_name: flux-explorer-prod
     depends_on:
@@ -127,8 +128,8 @@ services:
       HOSTNAME: 0.0.0.0
       PORT: 42069
 
-      # Client-side API URL (for browser requests)
-      NEXT_PUBLIC_API_URL: http://localhost:42067
+      # Client-side API URL: AUTO = use /api/indexer proxy route (works on any domain/IP)
+      NEXT_PUBLIC_API_URL: AUTO
 
       # Server-side API URL (for Next.js API routes inside container)
       SERVER_API_URL: http://indexer:42067

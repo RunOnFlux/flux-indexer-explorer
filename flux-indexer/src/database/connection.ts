@@ -31,6 +31,8 @@ export class DatabaseConnection {
       max: config.max || 20,
       idleTimeoutMillis: config.idleTimeoutMillis || 30000,
       connectionTimeoutMillis: config.connectionTimeoutMillis || 10000,
+      // Explicitly set client encoding to UTF-8 to avoid encoding issues
+      application_name: 'fluxindexer',
     });
 
     // Handle pool errors

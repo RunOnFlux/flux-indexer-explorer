@@ -2,8 +2,8 @@
 
 import { useState, useMemo, useEffect } from "react";
 import Link from "next/link";
-import { Block, BlockTransactionDetail } from "@/types/flux-api";
-import { useTransactions } from "@/lib/api/hooks/useTransactions";
+import { Block, BlockTransactionDetail, Transaction } from "@/types/flux-api";
+import { useTransactionsBatch } from "@/lib/api/hooks/useTransactions";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -105,9 +105,20 @@ export function BlockTransactions({ block }: BlockTransactionsProps) {
     }
   }, [totalPages, currentPage]);
 
-  const transactionQueries = useTransactions(currentDetails.map((detail) => detail.txid));
-  const transactions = transactionQueries.map((query) => query.data);
-  const isLoading = transactionQueries.some((query) => query.isLoading);
+  // Use batch endpoint - single HTTP request for all transactions on the page
+  const txids = currentDetails.map((detail) => detail.txid);
+  const { data: batchTransactions, isLoading } = useTransactionsBatch(txids, block.height);
+
+  // Create a map for quick lookup by txid
+  const transactionMap = useMemo(() => {
+    const map = new Map<string, Transaction>();
+    if (batchTransactions) {
+      batchTransactions.forEach((tx) => {
+        if (tx.txid) map.set(tx.txid, tx);
+      });
+    }
+    return map;
+  }, [batchTransactions]);
 
   const counts = useMemo(() => summarizeCounts(block), [block]);
 
@@ -167,8 +178,8 @@ export function BlockTransactions({ block }: BlockTransactionsProps) {
           ))
         ) : (
           currentDetails.map((detail, index) => {
-            const query = transactionQueries[index];
-            const tx = transactions[index];
+            // Get transaction from batch map (single request loaded all at once)
+            const tx = transactionMap.get(detail.txid);
             const globalIndex = startIndex + index;
             const detailSize = detail.size && detail.size > 0 ? detail.size : null;
             const txSize = tx && tx.size && tx.size > 0 ? tx.size : null;
@@ -301,7 +312,7 @@ export function BlockTransactions({ block }: BlockTransactionsProps) {
                     {badge()}
                   </div>
                   <div className="text-xs text-muted-foreground" aria-live="polite">
-                    {query.isLoading ? <Skeleton className="h-3 w-40" /> : description()}
+                    {isLoading && !tx ? <Skeleton className="h-3 w-40" /> : description()}
                   </div>
                 </div>
                 <div className="flex items-center gap-1 flex-shrink-0">

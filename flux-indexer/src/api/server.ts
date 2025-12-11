@@ -12,6 +12,7 @@ import { DatabaseConnection } from '../database/connection';
 import { FluxRPCClient } from '../rpc/flux-rpc-client';
 import { SyncEngine } from '../indexer/sync-engine';
 import { logger } from '../utils/logger';
+import { getScriptPubkey } from '../utils/script-utils';
 import { Transaction } from '../types';
 import { extractTransactionFromBlock } from '../parsers/block-parser';
 
@@ -180,9 +181,11 @@ export class APIServer {
     // Block endpoints
     this.app.get('/api/v1/blocks', this.getBlocks.bind(this));
     this.app.get('/api/v1/blocks/latest', this.getLatestBlocks.bind(this));
+    this.app.get('/api/v1/blocks/range', this.getBlocksRange.bind(this));
     this.app.get('/api/v1/blocks/:heightOrHash', this.getBlock.bind(this));
 
     // Transaction endpoints
+    this.app.post('/api/v1/transactions/batch', this.getTransactionsBatch.bind(this));
     this.app.get('/api/v1/transactions/:txid', this.getTransaction.bind(this));
 
     // Address endpoints
@@ -278,12 +281,13 @@ export class APIServer {
            WHERE timestamp >= $1`,
           [nowSeconds - 86400]
         ),
+        // PHASE 3: encode txid as hex for JSON response (txid is now BYTEA)
         this.db.query(`
           SELECT
             b.height,
             b.hash,
             b.timestamp,
-            t.txid,
+            encode(t.txid, 'hex') as txid,
             t.output_total
           FROM blocks b
           JOIN transactions t
@@ -668,6 +672,132 @@ export class APIServer {
     }
   }
 
+  /**
+   * GET /api/v1/blocks/range - Get blocks in a height range (for bulk data fetching)
+   * Query params:
+   *   - from: starting block height (required)
+   *   - to: ending block height (required)
+   *   - fields: comma-separated list of fields to return (optional, defaults to essential fields)
+   *
+   * Max range: 10,000 blocks per request
+   * Example: /api/v1/blocks/range?from=2000000&to=2010000&fields=height,timestamp,difficulty
+   */
+  private async getBlocksRange(req: Request, res: Response): Promise<void> {
+    try {
+      const fromHeight = parseInt(req.query.from as string);
+      const toHeight = parseInt(req.query.to as string);
+      const fieldsParam = req.query.fields as string;
+
+      // Validate required parameters
+      if (isNaN(fromHeight) || isNaN(toHeight)) {
+        res.status(400).json({
+          error: 'Missing required parameters: from and to (block heights)',
+          example: '/api/v1/blocks/range?from=2000000&to=2010000'
+        });
+        return;
+      }
+
+      // Validate range
+      if (fromHeight > toHeight) {
+        res.status(400).json({ error: 'from must be less than or equal to to' });
+        return;
+      }
+
+      const maxRange = 10000;
+      if (toHeight - fromHeight > maxRange) {
+        res.status(400).json({
+          error: `Range too large. Maximum ${maxRange} blocks per request.`,
+          requested: toHeight - fromHeight + 1,
+          max: maxRange
+        });
+        return;
+      }
+
+      // Define allowed fields and their SQL column names
+      const allowedFields: Record<string, string> = {
+        height: 'height',
+        hash: 'hash',
+        timestamp: 'timestamp',
+        time: 'timestamp', // alias
+        difficulty: 'difficulty',
+        size: 'size',
+        tx_count: 'tx_count',
+        txCount: 'tx_count', // alias
+        producer: 'producer',
+        producer_reward: 'producer_reward',
+        chainwork: 'chainwork',
+        bits: 'bits',
+        nonce: 'nonce',
+        version: 'version',
+        merkle_root: 'merkle_root',
+        prev_hash: 'prev_hash',
+      };
+
+      // Parse requested fields or use defaults
+      let selectedFields: string[];
+      if (fieldsParam) {
+        const requestedFields = fieldsParam.split(',').map(f => f.trim().toLowerCase());
+        const invalidFields = requestedFields.filter(f => !allowedFields[f]);
+        if (invalidFields.length > 0) {
+          res.status(400).json({
+            error: `Invalid fields: ${invalidFields.join(', ')}`,
+            allowedFields: Object.keys(allowedFields)
+          });
+          return;
+        }
+        selectedFields = requestedFields.map(f => allowedFields[f]);
+      } else {
+        // Default lightweight fields
+        selectedFields = ['height', 'timestamp', 'difficulty', 'hash', 'tx_count', 'size'];
+      }
+
+      // Ensure unique fields (in case of aliases)
+      selectedFields = [...new Set(selectedFields)];
+
+      const query = `
+        SELECT ${selectedFields.join(', ')}
+        FROM blocks
+        WHERE height >= $1 AND height <= $2
+        ORDER BY height ASC
+      `;
+
+      const result = await this.db.query(query, [fromHeight, toHeight]);
+
+      // Transform rows to use consistent naming
+      const blocks = result.rows.map((row: any) => {
+        const block: any = {};
+        if (row.height !== undefined) block.height = row.height;
+        if (row.hash !== undefined) block.hash = row.hash;
+        if (row.timestamp !== undefined) block.time = row.timestamp;
+        if (row.difficulty !== undefined) block.difficulty = parseFloat(row.difficulty);
+        if (row.size !== undefined) block.size = row.size;
+        if (row.tx_count !== undefined) block.txCount = row.tx_count;
+        if (row.producer !== undefined) block.producer = row.producer;
+        if (row.producer_reward !== undefined) block.producerReward = row.producer_reward;
+        if (row.chainwork !== undefined) block.chainwork = row.chainwork;
+        if (row.bits !== undefined) block.bits = row.bits;
+        if (row.nonce !== undefined) block.nonce = row.nonce;
+        if (row.version !== undefined) block.version = row.version;
+        if (row.merkle_root !== undefined) block.merkleRoot = row.merkle_root;
+        if (row.prev_hash !== undefined) block.prevHash = row.prev_hash;
+        return block;
+      });
+
+      res.json({
+        blocks,
+        meta: {
+          from: fromHeight,
+          to: toHeight,
+          count: blocks.length,
+          fields: selectedFields
+        }
+      });
+    } catch (error: any) {
+      logger.error('Failed to get blocks range', { error: error.message });
+      res.status(500).json({ error: error.message });
+    }
+  }
+
   private latestBlocksCache: {
     data: any | null;
     timestamp: number;
@@ -732,8 +862,8 @@ export class APIServer {
       const heightResult = await this.db.query('SELECT MAX(height) as max_height FROM blocks');
       const currentHeight = heightResult.rows[0]?.max_height || 0;
 
-      // OPTIMIZED: Simplified query - only count total FluxNode txs, no tier breakdown needed
-      // Replaces slow LATERAL JOIN with simple GROUP BY + IN clause
+      // OPTIMIZED: Use explicit block_height bounds for TimescaleDB chunk exclusion
+      // The block_range CTE provides min/max heights that allow chunk pruning
       const query = `
         WITH latest_blocks AS (
           SELECT height, hash, timestamp, tx_count, size
@@ -741,12 +871,16 @@ export class APIServer {
           ORDER BY height DESC
           LIMIT $1
         ),
+        block_range AS (
+          SELECT MIN(height) as min_h, MAX(height) as max_h FROM latest_blocks
+        ),
         fluxnode_counts AS (
           SELECT
             fn.block_height,
             COUNT(*) AS node_count
           FROM fluxnode_transactions fn
-          WHERE fn.block_height IN (SELECT height FROM latest_blocks)
+          WHERE fn.block_height >= (SELECT min_h FROM block_range)
+            AND fn.block_height <= (SELECT max_h FROM block_range)
           GROUP BY fn.block_height
         )
         SELECT
@@ -838,9 +972,10 @@ export class APIServer {
         }
       }
 
+      // PHASE 3: encode txid as hex for JSON response (txid is now BYTEA)
       const txResult = await this.db.query(`
         SELECT
-          t.txid,
+          encode(t.txid, 'hex') as txid,
           t.is_coinbase,
           t.output_total,
           t.fee,
@@ -852,7 +987,7 @@ export class APIServer {
           fn.public_key,
           fn.signature
         FROM transactions t
-        LEFT JOIN fluxnode_transactions fn ON fn.txid = t.txid
+        LEFT JOIN fluxnode_transactions fn ON fn.txid = t.txid AND fn.block_height = t.block_height
         WHERE t.block_height = $1
         ORDER BY
           CASE
@@ -1039,13 +1174,45 @@ export class APIServer {
 
   /**
    * GET /api/v1/transactions/:txid - Get transaction
+   * Query params:
+   *   - includeHex: boolean (default: false) - Include raw transaction hex (requires RPC fetch if not cached)
    */
   private async getTransaction(req: Request, res: Response): Promise<void> {
     try {
       const { txid } = req.params;
+      const includeHex = req.query.includeHex === 'true';
 
-      // Get transaction
-      const tx = await this.db.query('SELECT * FROM transactions WHERE txid = $1', [txid]);
+      // First, try to get block_height from tx_lookup for fast TimescaleDB chunk exclusion
+      // This avoids scanning all compressed chunks when looking up by txid
+      // txid stored as BYTEA, so decode the hex string for lookup
+      const lookup = await this.db.query('SELECT block_height FROM tx_lookup WHERE txid = decode($1, \'hex\')', [txid]);
+
+      let tx;
+      if (lookup.rows.length > 0) {
+        // Found in lookup - use both txid and block_height for efficient query
+        // OPTIMIZED: JOIN to blocks to get block_hash since column was removed from transactions
+        // PHASE 3: txid is BYTEA - decode hex input for comparison
+        const blockHeight = lookup.rows[0].block_height;
+        tx = await this.db.query(
+          `SELECT t.*, b.hash as block_hash
+           FROM transactions t
+           JOIN blocks b ON t.block_height = b.height
+           WHERE t.txid = decode($1, 'hex') AND t.block_height = $2`,
+          [txid, blockHeight]
+        );
+      } else {
+        // Not in lookup (probably recent transaction) - query directly
+        // Recent data is in uncompressed chunks so this is still fast
+        // OPTIMIZED: JOIN to blocks to get block_hash
+        // PHASE 3: txid is BYTEA - decode hex input for comparison
+        tx = await this.db.query(
+          `SELECT t.*, b.hash as block_hash
+           FROM transactions t
+           JOIN blocks b ON t.block_height = b.height
+           WHERE t.txid = decode($1, 'hex')`,
+          [txid]
+        );
+      }
 
       if (tx.rows.length === 0) {
         res.status(404).json({ error: 'Transaction not found' });
@@ -1059,17 +1226,20 @@ export class APIServer {
       const currentHeight = currentHeightResult.rows[0]?.max_height || 0;
       const confirmations = txData.block_height ? Math.max(0, currentHeight - txData.block_height + 1) : 0;
 
-      // Get inputs
+      // Get inputs - query utxos_spent directly since only spent UTXOs have spent_txid
+      // PHASE 3: spent_txid is BYTEA, JOIN addresses for address lookup, encode txid for response
       const inputs = await this.db.query(
-        `SELECT u.*, t.block_height
-         FROM utxos u
-         JOIN transactions t ON t.txid = u.spent_txid
-         WHERE u.spent_txid = $1
+        `SELECT encode(u.txid, 'hex') as txid, u.vout, a.address, u.value,
+                u.script_pubkey, u.script_type, u.block_height,
+                encode(u.spent_txid, 'hex') as spent_txid, u.spent_block_height
+         FROM utxos_spent u
+         JOIN addresses a ON u.address_id = a.id
+         WHERE u.spent_txid = decode($1, 'hex')
          ORDER BY u.vout`,
         [txid]
       );
 
-      // Get outputs
+      // Get outputs - use VIEW to get both spent and unspent UTXOs for this transaction
       const outputs = await this.db.query(
         'SELECT * FROM utxos WHERE txid = $1 ORDER BY vout',
         [txid]
@@ -1085,11 +1255,16 @@ export class APIServer {
 
       if (!hexValue || hexValue.length === 0) {
         hexValue = null;
-      } else if (sizeBytes === 0) {
-        sizeBytes = Math.floor(hexValue.length / 2);
+      } else if (sizeBytes === 0 || vsizeBytes === 0) {
+        // Compute size from stored hex - no need to fetch from daemon
+        const computedSize = Math.floor(hexValue.length / 2);
+        if (sizeBytes === 0) sizeBytes = computedSize;
+        if (vsizeBytes === 0) vsizeBytes = computedSize;
       }
 
-      if (sizeBytes === 0 || vsizeBytes === 0 || !hexValue) {
+      // Only fetch hex from daemon if explicitly requested via ?includeHex=true
+      // This avoids slow RPC calls for normal transaction viewing
+      if (!hexValue && includeHex) {
         try {
           // Flux daemon doesn't support blockhash parameter, requires txindex=1
           const rawTx = await this.rpc.getRawTransaction(txid, false);
@@ -1108,6 +1283,7 @@ export class APIServer {
           const updateHex = fetchedHex && fetchedHex.length > 0 ? fetchedHex : null;
 
           if (updateSize !== null || updateVSize !== null || updateHex !== null) {
+            // PHASE 3: txid is BYTEA - decode hex input for comparison
             await this.db.query(
               `
                 UPDATE transactions
@@ -1115,7 +1291,7 @@ export class APIServer {
                   size = COALESCE($1, size),
                   vsize = COALESCE($2, vsize),
                   hex = COALESCE($3, hex)
-                WHERE txid = $4
+                WHERE txid = decode($4, 'hex')
               `,
               [updateSize, updateVSize, updateHex, txid]
             );
@@ -1135,8 +1311,9 @@ export class APIServer {
               if (txHex && txHex.length > 0) {
                 const fetchedSize = Math.floor(txHex.length / 2);
 
+                // PHASE 3: txid is BYTEA - decode hex input for comparison
                 await this.db.query(
-                  `UPDATE transactions SET size = $1, vsize = $2, hex = $3 WHERE txid = $4`,
+                  `UPDATE transactions SET size = $1, vsize = $2, hex = $3 WHERE txid = decode($4, 'hex')`,
                   [fetchedSize, fetchedSize, txHex, txid]
                 );
 
@@ -1186,8 +1363,9 @@ export class APIServer {
         feeZatoshis = txData.fee ? BigInt(txData.fee) : BigInt(0);
       }
 
+      // PHASE 3: Use original txid param (hex string) instead of txData.txid (now BYTEA Buffer)
       res.json({
-        txid: txData.txid,
+        txid: txid,
         version: txData.version,
         locktime: txData.locktime,
         vin: inputs.rows.map(row => ({
@@ -1201,13 +1379,15 @@ export class APIServer {
         vout: outputs.rows.map(row => {
           const scriptType = row.script_type || 'unknown';
           const normalizedAddress = row.address === 'SHIELDED_OR_NONSTANDARD' ? null : row.address;
-          const opReturn = scriptType === 'nulldata' ? decodeOpReturnData(row.script_pubkey) : null;
+          // Reconstruct script_pubkey if not stored (standard types skip storage)
+          const scriptHex = getScriptPubkey(row.script_pubkey, scriptType, row.address) || '';
+          const opReturn = scriptType === 'nulldata' ? decodeOpReturnData(scriptHex) : null;
 
           return {
             value: row.value ? row.value.toString() : '0',
             n: row.vout,
             scriptPubKey: {
-              hex: row.script_pubkey || '',
+              hex: scriptHex,
               asm: '',
               addresses: normalizedAddress ? [normalizedAddress] : [],
               type: scriptType,
@@ -1231,6 +1411,215 @@ export class APIServer {
       });
     } catch (error: any) {
       logger.error('Failed to get transaction', { error: error.message });
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * POST /api/v1/transactions/batch - Get multiple transactions in a single request
+   *
+   * Optimized for fetching multiple transactions efficiently, especially when
+   * blockHeight is known (e.g., block transaction list page).
+   *
+   * Request body:
+   *   - txids: string[] (required) - Array of transaction IDs (max 50)
+   *   - blockHeight: number (optional) - If all txs are from same block, provide for efficiency
+   */
+  private async getTransactionsBatch(req: Request, res: Response): Promise<void> {
+    try {
+      const { txids, blockHeight } = req.body as { txids: string[]; blockHeight?: number };
+
+      if (!Array.isArray(txids) || txids.length === 0) {
+        res.status(400).json({ error: 'txids array is required' });
+        return;
+      }
+
+      if (txids.length > 50) {
+        res.status(400).json({ error: 'Maximum 50 transactions per batch' });
+        return;
+      }
+
+      // Validate txid format
+      const validTxids = txids.filter(txid => typeof txid === 'string' && /^[a-fA-F0-9]{64}$/.test(txid));
+      if (validTxids.length === 0) {
+        res.status(400).json({ error: 'No valid transaction IDs provided' });
+        return;
+      }
+
+      // Get current block height for confirmations calculation
+      const currentHeightResult = await this.db.query('SELECT MAX(height) as max_height FROM blocks');
+      const currentHeight = currentHeightResult.rows[0]?.max_height || 0;
+
+      // Build the txid bytea array for SQL
+      const txidParams = validTxids.map((_, i) => `decode($${i + 1}, 'hex')`).join(', ');
+
+      let txQuery: string;
+      let txParams: any[];
+
+      if (blockHeight !== undefined) {
+        // Optimized path: blockHeight known - single chunk access
+        txQuery = `
+          SELECT t.*, b.hash as block_hash, encode(t.txid, 'hex') as txid_hex
+          FROM transactions t
+          JOIN blocks b ON t.block_height = b.height
+          WHERE t.txid IN (${txidParams}) AND t.block_height = $${validTxids.length + 1}
+        `;
+        txParams = [...validTxids, blockHeight];
+      } else {
+        // General path: use tx_lookup for efficient chunk access
+        // First get block_heights from tx_lookup
+        const lookupQuery = `
+          SELECT encode(txid, 'hex') as txid_hex, block_height
+          FROM tx_lookup
+          WHERE txid IN (${txidParams})
+        `;
+        const lookupResult = await this.db.query(lookupQuery, validTxids);
+
+        // Create a map of txid -> block_height
+        const heightMap = new Map<string, number>();
+        for (const row of lookupResult.rows) {
+          heightMap.set(row.txid_hex, row.block_height);
+        }
+
+        // Build optimized query with block_height hints for each txid
+        // This enables TimescaleDB chunk exclusion
+        const conditions = validTxids.map((txid, i) => {
+          const height = heightMap.get(txid);
+          if (height !== undefined) {
+            return `(t.txid = decode($${i + 1}, 'hex') AND t.block_height = ${height})`;
+          }
+          return `t.txid = decode($${i + 1}, 'hex')`;
+        }).join(' OR ');
+
+        txQuery = `
+          SELECT t.*, b.hash as block_hash, encode(t.txid, 'hex') as txid_hex
+          FROM transactions t
+          JOIN blocks b ON t.block_height = b.height
+          WHERE ${conditions}
+        `;
+        txParams = validTxids;
+      }
+
+      // Fetch all transactions
+      const txResult = await this.db.query(txQuery, txParams);
+
+      // Create map for quick lookup
+      const txMap = new Map<string, any>();
+      for (const row of txResult.rows) {
+        txMap.set(row.txid_hex, row);
+      }
+
+      // Batch fetch all inputs
+      const inputsQuery = `
+        SELECT encode(u.spent_txid, 'hex') as spent_txid_hex,
+               encode(u.txid, 'hex') as txid, u.vout, a.address, u.value,
+               u.script_pubkey, u.script_type, u.block_height
+        FROM utxos_spent u
+        JOIN addresses a ON u.address_id = a.id
+        WHERE u.spent_txid IN (${txidParams})
+        ORDER BY u.spent_txid, u.vout
+      `;
+      const inputsResult = await this.db.query(inputsQuery, validTxids);
+
+      // Group inputs by txid
+      const inputsMap = new Map<string, any[]>();
+      for (const row of inputsResult.rows) {
+        const txid = row.spent_txid_hex;
+        if (!inputsMap.has(txid)) {
+          inputsMap.set(txid, []);
+        }
+        inputsMap.get(txid)!.push(row);
+      }
+
+      // Batch fetch all outputs using the utxos view
+      const outputsQuery = `
+        SELECT * FROM utxos WHERE txid = ANY($1) ORDER BY txid, vout
+      `;
+      const outputsResult = await this.db.query(outputsQuery, [validTxids]);
+
+      // Group outputs by txid
+      const outputsMap = new Map<string, any[]>();
+      for (const row of outputsResult.rows) {
+        const txid = row.txid;
+        if (!outputsMap.has(txid)) {
+          outputsMap.set(txid, []);
+        }
+        outputsMap.get(txid)!.push(row);
+      }
+
+      // Build response array in same order as input txids
+      const transactions = validTxids.map(txid => {
+        const txData = txMap.get(txid);
+        if (!txData) {
+          return { txid, error: 'not_found' };
+        }
+
+        const inputs = inputsMap.get(txid) || [];
+        const outputs = outputsMap.get(txid) || [];
+        const confirmations = txData.block_height ? Math.max(0, currentHeight - txData.block_height + 1) : 0;
+
+        // Calculate fee
+        const isCoinbase = inputs.length === 0;
+        let feeZatoshis: bigint;
+
+        if (isCoinbase && txData.block_height) {
+          const expectedReward = this.getExpectedBlockReward(txData.block_height);
+          const expectedRewardZatoshis = BigInt(Math.floor(expectedReward * 100000000));
+          const outputTotal = BigInt(txData.output_total || 0);
+          const calculatedFee = outputTotal - expectedRewardZatoshis;
+          feeZatoshis = calculatedFee > BigInt(0) ? calculatedFee : BigInt(0);
+        } else {
+          feeZatoshis = txData.fee ? BigInt(txData.fee) : BigInt(0);
+        }
+
+        return {
+          txid: txid,
+          version: txData.version,
+          locktime: txData.locktime,
+          vin: inputs.map(row => ({
+            txid: row.txid,
+            vout: row.vout,
+            sequence: 0,
+            n: row.vout,
+            addresses: row.address && row.address !== 'SHIELDED_OR_NONSTANDARD' ? [row.address] : [],
+            value: row.value ? row.value.toString() : '0',
+          })),
+          vout: outputs.map(row => {
+            const scriptType = row.script_type || 'unknown';
+            const normalizedAddress = row.address === 'SHIELDED_OR_NONSTANDARD' ? null : row.address;
+            const scriptHex = getScriptPubkey(row.script_pubkey, scriptType, row.address) || '';
+            const opReturn = scriptType === 'nulldata' ? decodeOpReturnData(scriptHex) : null;
+
+            return {
+              value: row.value ? row.value.toString() : '0',
+              n: row.vout,
+              scriptPubKey: {
+                hex: scriptHex,
+                asm: '',
+                addresses: normalizedAddress ? [normalizedAddress] : [],
+                type: scriptType,
+                opReturnHex: opReturn?.hex ?? null,
+                opReturnText: opReturn?.text ?? null,
+              },
+              spentTxId: row.spent_txid || undefined,
+              spentHeight: row.spent_block_height || undefined,
+            };
+          }),
+          blockHash: txData.block_hash,
+          blockHeight: txData.block_height,
+          confirmations,
+          blockTime: txData.timestamp,
+          size: txData.size ? Number(txData.size) : 0,
+          vsize: txData.vsize ? Number(txData.vsize) : 0,
+          value: txData.output_total ? txData.output_total.toString() : '0',
+          valueIn: txData.input_total ? txData.input_total.toString() : '0',
+          fees: feeZatoshis.toString(),
+        };
+      });
+
+      res.json({ transactions });
+    } catch (error: any) {
+      logger.error('Failed to get transactions batch', { error: error.message });
       res.status(500).json({ error: error.message });
     }
   }
@@ -1262,11 +1651,15 @@ export class APIServer {
       // Get transactions using optimized address_transactions materialized table
       // This is 5-10x faster than joining transactions + utxos tables
       // Uses idx_address_tx_pagination index for optimal performance
+      // OPTIMIZED: JOIN to blocks to get block_hash since column was removed
+      // PHASE 3: JOIN addresses table for address lookup, encode txid for response
       const txQuery = `
-        SELECT txid, block_height, timestamp, block_hash
-        FROM address_transactions
-        WHERE address = $1
-        ORDER BY block_height DESC, txid DESC
+        SELECT encode(at.txid, 'hex') as txid, at.block_height, at.timestamp, b.hash as block_hash
+        FROM address_transactions at
+        JOIN addresses addr ON at.address_id = addr.id
+        JOIN blocks b ON at.block_height = b.height
+        WHERE addr.address = $1
+        ORDER BY at.block_height DESC, at.txid DESC
         LIMIT $2 OFFSET $3
       `;
 
@@ -1357,7 +1750,8 @@ export class APIServer {
       // This eliminates expensive UNION and LATERAL JOIN queries entirely
       // Falls back to old query if table doesn't exist yet
       // Support timestamp filtering for date range exports
-      const whereConditions = ['at.address = $1'];
+      // PHASE 3: JOIN addresses table for address lookup (address_id replaces address)
+      const whereConditions = ['addr.address = $1'];
       const queryParams: any[] = [address];
       let paramIndex = 2;
 
@@ -1375,25 +1769,30 @@ export class APIServer {
 
       // Cursor-based pagination: Use composite key (block_height, txid) for efficient seeks
       // This replaces OFFSET which becomes extremely slow with large datasets
+      // PHASE 3: txid is BYTEA - decode cursor txid for comparison
       if (cursorHeight !== undefined && cursorTxid) {
-        whereConditions.push(`(at.block_height, at.txid) < ($${paramIndex}, $${paramIndex + 1})`);
+        whereConditions.push(`(at.block_height, at.txid) < ($${paramIndex}, decode($${paramIndex + 1}, 'hex'))`);
         queryParams.push(cursorHeight, cursorTxid);
         paramIndex += 2;
       }
 
+      // OPTIMIZED: JOIN to blocks to get block_hash since column was removed from address_transactions
+      // PHASE 3: JOIN addresses table, encode txid for response
       const txQuery = `
         SELECT
-          at.txid,
+          encode(at.txid, 'hex') as txid,
           at.block_height,
           at.timestamp,
-          at.block_hash,
+          b.hash AS block_hash,
           at.direction,
           at.received_value,
           at.sent_value,
           COALESCE(t.is_coinbase, FALSE) AS is_coinbase,
           COALESCE(t.fee, 0)::bigint AS fee_value
         FROM address_transactions at
-        LEFT JOIN transactions t ON t.txid = at.txid
+        JOIN addresses addr ON at.address_id = addr.id
+        JOIN blocks b ON at.block_height = b.height
+        LEFT JOIN transactions t ON t.txid = at.txid AND t.block_height = at.block_height
         WHERE ${whereConditions.join(' AND ')}
         ORDER BY at.block_height DESC, at.txid DESC
         LIMIT $${paramIndex}${cursorHeight === undefined && offset > 0 ? ` OFFSET $${paramIndex + 1}` : ''}
@@ -1412,7 +1811,8 @@ export class APIServer {
       let filteredTotal = totalTxs;
       if (fromTimestamp !== undefined || toTimestamp !== undefined) {
         // Build count query with WHERE conditions excluding cursor (cursor is for pagination, not filtering)
-        const countWhereConditions = ['at.address = $1'];
+        // PHASE 3: JOIN addresses table for address lookup
+        const countWhereConditions = ['addr.address = $1'];
         const countParams: any[] = [address];
         let countParamIndex = 2;
 
@@ -1428,9 +1828,11 @@ export class APIServer {
           countParamIndex++;
         }
 
+        // PHASE 3: JOIN addresses table for address lookup
         const countQueryFiltered = `
           SELECT COUNT(*) as filtered_count
           FROM address_transactions at
+          JOIN addresses addr ON at.address_id = addr.id
           WHERE ${countWhereConditions.join(' AND ')}
         `;
         const filteredCountResult = await this.db.query(countQueryFiltered, countParams);
@@ -1443,97 +1845,68 @@ export class APIServer {
       const txids = transactions.rows.map((row: any) => row.txid);
       const participantsMap = new Map<string, { inputs: string[]; outputs: string[]; inputCount: number; outputCount: number }>();
 
+      // Get transaction participants from utxos tables (input/output addresses)
       if (txids.length > 0) {
-        try {
-          const participantResult = await this.db.query(
-            `
+        // Inputs come from spent UTXOs (spent_txid only exists in utxos_spent)
+        // PHASE 3: JOIN addresses table for address lookup, decode hex txids for BYTEA comparison
+        const inputResult = await this.db.query(
+          `
+            SELECT
+              encode(u.spent_txid, 'hex') AS txid,
+              ARRAY_AGG(DISTINCT a.address) FILTER (
+                WHERE a.address IS NOT NULL AND a.address <> 'SHIELDED_OR_NONSTANDARD'
+              ) AS input_addresses
+            FROM utxos_spent u
+            JOIN addresses a ON u.address_id = a.id
+            WHERE u.spent_txid = ANY(
+              SELECT decode(unnest($1::text[]), 'hex')
+            )
+            GROUP BY u.spent_txid
+          `,
+          [txids]
+        );
+
+        for (const row of inputResult.rows) {
+          const addresses: string[] = Array.isArray(row.input_addresses)
+            ? row.input_addresses.filter((addr: string | null) => !!addr)
+            : [];
+          participantsMap.set(row.txid, {
+            inputs: addresses,
+            outputs: [],
+            inputCount: addresses.length,
+            outputCount: 0,
+          });
+        }
+
+        // Outputs can be in either table, use VIEW for completeness
+        // VIEW already handles addresses JOIN and txid encoding
+        const outputResult = await this.db.query(
+          `
             SELECT
               txid,
-              input_addresses,
-              input_count,
-              output_addresses,
-              output_count
-              FROM transaction_participants
-              WHERE txid = ANY($1)
-            `,
-            [txids]
-          );
+              ARRAY_AGG(DISTINCT address) FILTER (
+                WHERE address IS NOT NULL AND address <> 'SHIELDED_OR_NONSTANDARD'
+              ) AS output_addresses
+            FROM utxos
+            WHERE txid = ANY($1)
+            GROUP BY txid
+          `,
+          [txids]
+        );
 
-          for (const row of participantResult.rows) {
-            const inputs: string[] = Array.isArray(row.input_addresses)
-              ? row.input_addresses.filter((addr: string | null) => !!addr)
-              : [];
-            const outputs: string[] = Array.isArray(row.output_addresses)
-              ? row.output_addresses.filter((addr: string | null) => !!addr)
-              : [];
-            const inputCount = typeof row.input_count === 'number'
-              ? row.input_count
-              : inputs.length;
-            const outputCount = typeof row.output_count === 'number'
-              ? row.output_count
-              : outputs.length;
-            participantsMap.set(row.txid, { inputs, outputs, inputCount, outputCount });
-          }
-        } catch (error: any) {
-          // Fallback for deployments that have not run migration 010 yet.
-          if (error.code !== '42P01') {
-            throw error;
-          }
-
-          const inputResult = await this.db.query(
-            `
-              SELECT
-                spent_txid AS txid,
-                ARRAY_AGG(DISTINCT address) FILTER (
-                  WHERE address IS NOT NULL AND address <> 'SHIELDED_OR_NONSTANDARD'
-                ) AS input_addresses
-              FROM utxos
-              WHERE spent_txid = ANY($1)
-              GROUP BY spent_txid
-            `,
-            [txids]
-          );
-
-          for (const row of inputResult.rows) {
-            const addresses: string[] = Array.isArray(row.input_addresses)
-              ? row.input_addresses.filter((addr: string | null) => !!addr)
-              : [];
-            participantsMap.set(row.txid, {
-              inputs: addresses,
-              outputs: [],
-              inputCount: addresses.length,
-              outputCount: 0,
-            });
-          }
-
-          const outputResult = await this.db.query(
-            `
-              SELECT
-                txid,
-                ARRAY_AGG(DISTINCT address) FILTER (
-                  WHERE address IS NOT NULL AND address <> 'SHIELDED_OR_NONSTANDARD'
-                ) AS output_addresses
-              FROM utxos
-              WHERE txid = ANY($1)
-              GROUP BY txid
-            `,
-            [txids]
-          );
-
-          for (const row of outputResult.rows) {
-            const addresses: string[] = Array.isArray(row.output_addresses)
-              ? row.output_addresses.filter((addr: string | null) => !!addr)
-              : [];
-            const existing = participantsMap.get(row.txid) || {
-              inputs: [],
-              outputs: [],
-              inputCount: 0,
-              outputCount: 0,
-            };
-            existing.outputs = addresses;
-            existing.outputCount = addresses.length;
-            participantsMap.set(row.txid, existing);
-          }
+        for (const row of outputResult.rows) {
+          const addresses: string[] = Array.isArray(row.output_addresses)
+            ? row.output_addresses.filter((addr: string | null) => !!addr)
+            : [];
+          const existing = participantsMap.get(row.txid) || {
+            inputs: [],
+            outputs: [],
+            inputCount: 0,
+            outputCount: 0,
+          };
+          existing.outputs = addresses;
+          existing.outputCount = addresses.length;
+          participantsMap.set(row.txid, existing);
         }
       }
 
@@ -1625,10 +1998,14 @@ export class APIServer {
     try {
       const { address } = req.params;
 
+      // Use utxos_unspent with addresses JOIN for better performance
+      // PHASE 3: JOIN addresses table for address lookup, encode txid for response
       const utxos = await this.db.query(
-        `SELECT * FROM utxos
-         WHERE address = $1 AND spent = false
-         ORDER BY block_height DESC, vout`,
+        `SELECT encode(u.txid, 'hex') as txid, u.vout, u.value, u.block_height
+         FROM utxos_unspent u
+         JOIN addresses a ON u.address_id = a.id
+         WHERE a.address = $1
+         ORDER BY u.block_height DESC, u.vout`,
         [address]
       );
 

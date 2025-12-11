@@ -9,8 +9,35 @@ import { FluxRPCClient } from '../rpc/flux-rpc-client';
 import { DatabaseConnection } from '../database/connection';
 import { BlockIndexer } from './block-indexer';
 import { DatabaseOptimizer } from '../database/optimizer';
+import { ParallelBlockFetcher } from './parallel-fetcher';
 import { logger } from '../utils/logger';
-import { SyncError } from '../types';
+import { SyncError, Block } from '../types';
+
+// Memory profiling helper - logs heap usage at key points
+let lastMemLog = 0;
+let baselineHeap = 0;
+function logMemory(label: string, force = false): void {
+  const now = Date.now();
+  // Only log every 10 seconds unless forced
+  if (!force && now - lastMemLog < 10000) return;
+  lastMemLog = now;
+
+  const mem = process.memoryUsage();
+  const heapMB = Math.round(mem.heapUsed / 1024 / 1024);
+  const rssMB = Math.round(mem.rss / 1024 / 1024);
+  const externalMB = Math.round(mem.external / 1024 / 1024);
+
+  if (baselineHeap === 0) baselineHeap = heapMB;
+  const delta = heapMB - baselineHeap;
+
+  logger.info('Memory snapshot', {
+    label,
+    heapMB,
+    rssMB,
+    externalMB,
+    deltaHeapMB: delta,
+  });
+}
 
 export interface SyncConfig {
   batchSize: number;
@@ -27,7 +54,6 @@ export class SyncEngine {
   private lastSyncTime = Date.now();
   private blocksIndexed = 0;
   private syncInProgress = false;
-  private lastOptimizationCheck = 0;
   private consecutiveErrors = 0;
   private daemonReady = false;
 
@@ -65,10 +91,6 @@ export class SyncEngine {
       try {
         await this.sync();
         this.consecutiveErrors = 0; // Reset on success
-        if (!this.daemonReady) {
-          this.daemonReady = true;
-          logger.info('Daemon is ready and responding');
-        }
       } catch (error: any) {
         this.consecutiveErrors++;
         // During daemon warmup, log minimally at debug level
@@ -92,8 +114,9 @@ export class SyncEngine {
     logger.info('Waiting for Flux daemon to be ready...');
 
     // Try initial sync in background (don't block startup)
+    // Use debug level since failures are expected during daemon warmup
     this.sync().catch(error => {
-      logger.warn('Initial sync failed, will retry', { error: error.message });
+      logger.debug('Initial sync attempt failed (daemon warmup)', { error: error.message });
     });
   }
 
@@ -135,12 +158,15 @@ export class SyncEngine {
       const chainInfo = await this.rpc.getBlockchainInfo();
       const chainHeight = chainInfo.headers;
 
+      // Mark daemon as ready on first successful RPC call
+      if (!this.daemonReady) {
+        this.daemonReady = true;
+        logger.info('✅ Flux daemon is ready and responding to RPC calls');
+      }
+
       // Get current indexed height from database
       const syncState = await this.blockIndexer.getSyncState();
       let currentHeight = syncState.currentHeight;
-
-      // Ensure block indexer respects current optimization mode
-      this.blockIndexer.setSkipAddressSummary(this.optimizer.isFastSyncEnabled());
 
       // Use start height from config if specified and higher
       if (this.config.startHeight !== undefined && currentHeight < this.config.startHeight) {
@@ -167,71 +193,151 @@ export class SyncEngine {
         return;
       }
 
-      // Check if we need to enable/disable Fast Sync Mode before starting batch
-      await this.optimizer.autoOptimize(currentHeight, chainHeight);
-      this.blockIndexer.setSkipAddressSummary(this.optimizer.isFastSyncEnabled());
-
       // Calculate blocks to sync (to buffered target, not latest chain tip)
       const blocksToSync = indexingTarget - currentHeight;
       const batchSize = Math.min(this.config.batchSize, blocksToSync);
 
-      logger.info(`Syncing blocks ${currentHeight + 1} to ${currentHeight + batchSize}`, {
-        blocksToSync,
-        batchSize,
-        progress: `${currentHeight}/${indexingTarget} (buffer: ${safetyBuffer} blocks)`,
-        actualChainHeight: chainHeight,
-      });
-
-      // Index blocks in batch
-      const heightsToFetch: number[] = [];
-      for (let height = currentHeight + 1; height <= currentHeight + batchSize; height++) {
-        heightsToFetch.push(height);
-      }
+      // Threshold: use simple sequential fetch for small catches (tip-following)
+      // Use parallel fetcher only for bulk sync (> 10 blocks)
+      const PARALLEL_FETCH_THRESHOLD = 10;
 
       const startTime = Date.now();
-      const blocks = await this.rpc.batchGetBlocks(heightsToFetch);
+      let lastHeight = currentHeight;
+      let processedThisBatch = 0;
 
-      if (blocks.length !== heightsToFetch.length) {
-        logger.warn('Mismatch in fetched block count', {
-          requested: heightsToFetch.length,
-          received: blocks.length,
+      if (blocksToSync <= PARALLEL_FETCH_THRESHOLD) {
+        // ===== SIMPLE TIP-FOLLOWING MODE =====
+        // For small catches (1-10 blocks), use simple sequential fetch
+        // This avoids the overhead of starting/stopping the parallel fetcher
+        logger.debug('Tip-following mode', {
+          blocksToSync,
+          startBlock: currentHeight + 1,
+          endBlock: currentHeight + batchSize,
         });
-      }
 
-      const lastHeight = heightsToFetch[heightsToFetch.length - 1] || currentHeight;
-
-      for (let i = 0; i < heightsToFetch.length; i++) {
-        const height = heightsToFetch[i];
-        const block = blocks[i];
-
-        if (!block) {
-          logger.warn('Missing block from batch fetch, refetching individually', { height });
-          await this.blockIndexer.indexBlock(height);
-        } else {
-          await this.blockIndexer.indexBlockData(block, height);
-        }
-
-        this.blocksIndexed++;
-
-        if (height % 100 === 0) {
-          const elapsed = (Date.now() - startTime) / 1000;
-          const processed = height - currentHeight;
-          const blocksPerSecond = processed > 0 && elapsed > 0 ? processed / elapsed : 0;
-          const remaining = chainHeight - height;
-          const eta = blocksPerSecond > 0 ? remaining / blocksPerSecond : Infinity;
-
-          logger.info(`Progress: ${height}/${chainHeight}`, {
-            blocksPerSecond: blocksPerSecond.toFixed(2),
-            eta: Number.isFinite(eta) ? `${Math.floor(eta / 60)}m ${Math.floor(eta % 60)}s` : 'unknown',
-          });
-
-          // Verify supply accuracy every 10000 blocks
-          if (height % 10000 === 0) {
-            await this.verifySupplyAccuracy(height);
+        for (let height = currentHeight + 1; height <= currentHeight + batchSize; height++) {
+          try {
+            await this.blockIndexer.indexBlock(height);
+            lastHeight = height;
+            processedThisBatch++;
+            this.blocksIndexed++;
+          } catch (error: any) {
+            logger.error('Failed to index block in tip-following mode', { height, error: error.message });
+            throw error;
           }
+        }
+      } else {
+        // ===== BULK SYNC MODE =====
+        // For large syncs (> 10 blocks), use parallel fetcher for speed
+        logger.info('Batch starting', {
+          startBlock: currentHeight + 1,
+          endBlock: currentHeight + batchSize,
+          blocksToSync,
+          batchSize,
+          currentHeight,
+          chainHeight,
+        });
 
-          await this.optimizer.autoOptimize(height, chainHeight);
-          this.blockIndexer.setSkipAddressSummary(this.optimizer.isFastSyncEnabled());
+        const batchStartHeight = currentHeight + 1;
+        const batchEndHeight = currentHeight + batchSize;
+        // Aggressive settings for high-performance server (32GB RAM, memory leak fixed)
+        const fetchBatchSize = 200;   // 200 blocks per RPC batch (2x faster fetching)
+        const prefetchBatches = 10;   // 10 batches in flight = 2000 blocks max in memory
+        const parallelWorkers = 8;    // 8 concurrent fetch workers
+
+        logger.debug('Using pipelined block fetcher', {
+          batchStartHeight,
+          batchEndHeight,
+          fetchBatchSize,
+          prefetchBatches,
+          parallelWorkers,
+          targetBatchSize: batchSize,
+        });
+
+        const fetcher = new ParallelBlockFetcher(this.rpc, {
+          batchSize: fetchBatchSize,
+          prefetchBatches,
+          parallelWorkers,
+        });
+
+        await fetcher.start(batchStartHeight, batchEndHeight);
+        logMemory('batch-start', true);
+
+        try {
+          while (true) {
+            const fetchedBlocks = await fetcher.getNextBatch();
+            if (!fetchedBlocks || fetchedBlocks.length === 0) {
+              break;
+            }
+            logMemory(`fetched-${fetchedBlocks.length}-blocks`);
+
+            // Separate valid blocks from missing ones
+            const validBlocks: Block[] = [];
+            const missingHeights: number[] = [];
+
+            for (let i = 0; i < fetchedBlocks.length; i++) {
+              const height = lastHeight + 1 + i;
+              if (fetchedBlocks[i]) {
+                validBlocks.push(fetchedBlocks[i]!);
+              } else {
+                missingHeights.push(height);
+              }
+            }
+
+            // Process valid blocks in batch (MUCH faster - single DB transaction, batchUtxoMap)
+            if (validBlocks.length > 0) {
+              const batchStartHeight = lastHeight + 1;
+              const blocksProcessed = await this.blockIndexer.indexBlocksBatch(validBlocks, batchStartHeight);
+              lastHeight += blocksProcessed;
+              processedThisBatch += blocksProcessed;
+              this.blocksIndexed += blocksProcessed;
+            }
+
+            // Handle any missing blocks individually (should be rare)
+            for (const height of missingHeights) {
+              logger.warn('Missing block from pipelined fetch, refetching individually', { height });
+              await this.blockIndexer.indexBlock(height);
+              lastHeight = height;
+              processedThisBatch++;
+              this.blocksIndexed++;
+            }
+
+            // Clear batch array to allow V8 to reclaim memory between fetches
+            fetchedBlocks.length = 0;
+            validBlocks.length = 0;
+
+            // Trigger FULL GC after each batch to properly reclaim memory
+            if (typeof global.gc === 'function') {
+              global.gc(true);
+            }
+            logMemory('post-batch-gc', true);
+
+            // Log progress after each batch
+            const elapsed = (Date.now() - startTime) / 1000;
+            const processed = lastHeight - currentHeight;
+            const blocksPerSecond = processed > 0 && elapsed > 0 ? processed / elapsed : 0;
+            const remaining = chainHeight - lastHeight;
+            const eta = blocksPerSecond > 0 ? remaining / blocksPerSecond : Infinity;
+
+            const etaStr = Number.isFinite(eta) ? `${Math.floor(eta / 60)}m ${Math.floor(eta % 60)}s` : 'unknown';
+            logger.info(`Bulk sync progress ${lastHeight}/${chainHeight}`, {
+              height: lastHeight,
+              chainHeight,
+              blocksPerSecond: blocksPerSecond.toFixed(1),
+              eta: etaStr,
+              remaining,
+            });
+
+            // Verify supply accuracy every 10000 blocks
+            if (lastHeight % 10000 < fetchedBlocks.length) {
+              const checkHeight = Math.floor(lastHeight / 10000) * 10000;
+              if (checkHeight > 0) {
+                await this.verifySupplyAccuracy(checkHeight);
+              }
+            }
+          }
+        } finally {
+          fetcher.stop();
         }
       }
 
@@ -241,23 +347,36 @@ export class SyncEngine {
       }
 
       const syncTime = Date.now() - startTime;
-      logger.info(`Batch sync complete`, {
-        blocksIndexed: batchSize,
-        timeMs: syncTime,
-        blocksPerSecond: (batchSize / (syncTime / 1000)).toFixed(2),
+      const batchBlocksPerSec = processedThisBatch > 0 && syncTime > 0
+        ? processedThisBatch / (syncTime / 1000)
+        : 0;
+      logger.info('Batch complete', {
+        blocks: processedThisBatch,
+        time: `${(syncTime / 1000).toFixed(1)}s`,
+        blocksPerSecond: batchBlocksPerSec.toFixed(1),
       });
+
+      // Force FULL GC after every batch to prevent long-term heap drift
+      logMemory('batch-end-pre-gc', true);
+      if (typeof global.gc === 'function') {
+        global.gc(true); // true = full GC, not just incremental
+      }
+      logMemory('batch-end-post-gc', true);
 
       await this.blockIndexer.setSyncingStatus(false, chainHeight);
 
       // Update metrics
       this.lastSyncTime = Date.now();
-      this.blockIndexer.setSkipAddressSummary(this.optimizer.isFastSyncEnabled());
 
-      // If still far behind, immediately continue syncing (don't wait for polling interval)
+      // If still far behind, schedule next sync batch
       const stillBehind = chainHeight - lastHeight > safetyBuffer;
       if (stillBehind) {
-        this.syncInProgress = false; // Allow next sync
-        setImmediate(() => this.sync().catch(err => logger.warn('Continuous sync error', { error: err.message })));
+        // Use setImmediate to allow event loop to breathe between batches
+        setImmediate(() => {
+          this.sync().catch(err => {
+            logger.warn('Continuous sync error', { error: err.message });
+          });
+        });
       }
 
     } catch (error: any) {
@@ -357,9 +476,15 @@ export class SyncEngine {
     });
 
     await this.db.transaction(async (client) => {
+      // Get affected addresses from both unspent and spent tables
+      // PHASE 3: JOIN addresses table since address_id replaces address column
       const affectedAddressRows = await client.query(
-        `SELECT DISTINCT address FROM utxos
-         WHERE block_height > $1 OR spent_block_height > $1`,
+        `SELECT DISTINCT a.address FROM (
+           SELECT address_id FROM utxos_unspent WHERE block_height > $1
+           UNION
+           SELECT address_id FROM utxos_spent WHERE block_height > $1 OR spent_block_height > $1
+         ) combined
+         JOIN addresses a ON combined.address_id = a.id`,
         [commonAncestor]
       );
 
@@ -377,20 +502,27 @@ export class SyncEngine {
         [currentHeight, commonAncestor, commonAncestor, oldHash, newHash, currentHeight - commonAncestor]
       );
 
-      // Unspend UTXOs that were spent in rolled-back blocks
+      // Move UTXOs that were spent in rolled-back blocks back to unspent table
+      // Step 1: Insert back into utxos_unspent from utxos_spent
+      // PHASE 3: Use address_id instead of address column
       await client.query(
-        `UPDATE utxos
-         SET spent = false,
-             spent_txid = NULL,
-             spent_block_height = NULL,
-             spent_at = NULL
-         WHERE spent_block_height > $1`,
+        `INSERT INTO utxos_unspent (txid, vout, address_id, value, script_pubkey, script_type, block_height, created_at)
+         SELECT txid, vout, address_id, value, script_pubkey, script_type, block_height, created_at
+         FROM utxos_spent
+         WHERE spent_block_height > $1
+         ON CONFLICT (txid, vout) DO NOTHING`,
         [commonAncestor]
       );
 
-      // Delete UTXOs from rolled-back blocks
+      // Step 2: Delete from utxos_spent
       await client.query(
-        'DELETE FROM utxos WHERE block_height > $1',
+        'DELETE FROM utxos_spent WHERE spent_block_height > $1',
+        [commonAncestor]
+      );
+
+      // Delete UTXOs created in rolled-back blocks from utxos_unspent
+      await client.query(
+        'DELETE FROM utxos_unspent WHERE block_height > $1',
         [commonAncestor]
       );
 
@@ -403,6 +535,12 @@ export class SyncEngine {
       // Delete rolled-back blocks
       await client.query(
         'DELETE FROM blocks WHERE height > $1',
+        [commonAncestor]
+      );
+
+      // Delete supply stats from rolled-back blocks
+      await client.query(
+        'DELETE FROM supply_stats WHERE block_height > $1',
         [commonAncestor]
       );
 
@@ -456,6 +594,13 @@ export class SyncEngine {
   }
 
   /**
+   * Get block indexer instance for backfill operations
+   */
+  getBlockIndexer(): BlockIndexer {
+    return this.blockIndexer;
+  }
+
+  /**
    * Force sync now (bypasses interval)
    */
   async syncNow(): Promise<void> {
@@ -483,13 +628,13 @@ export class SyncEngine {
         return;
       }
 
-      // Get indexer's calculated transparent supply
+      // Get indexer's calculated transparent supply from utxos_unspent table
       const result = await this.db.getPool().query(`
         SELECT
           SUM(value)::numeric / 100000000 as transparent_supply,
           COUNT(*) as utxo_count
-        FROM utxos
-        WHERE spent = false AND block_height <= $1
+        FROM utxos_unspent
+        WHERE block_height <= $1
       `, [height]);
 
       const indexerTransparent = parseFloat(result.rows[0]?.transparent_supply || '0');
@@ -510,14 +655,16 @@ export class SyncEngine {
 
       // Get shielded supply from supply_stats table (if exists)
       const shieldedResult = await this.db.getPool().query(`
-        SELECT sapling_pool + sprout_pool as shielded_supply
+        SELECT shielded_pool as shielded_supply
         FROM supply_stats
         WHERE block_height = (
           SELECT MAX(block_height) FROM supply_stats WHERE block_height <= $1
         )
       `, [height]).catch(() => ({ rows: [{ shielded_supply: null }] }));
 
-      const indexerShielded = parseFloat(shieldedResult.rows[0]?.shielded_supply || '0');
+      // Convert from satoshis to FLUX for comparison with daemon
+      const indexerShieldedSats = parseFloat(shieldedResult.rows[0]?.shielded_supply || '0');
+      const indexerShielded = indexerShieldedSats / 1e8;
       const shieldedDiff = indexerShielded - daemonShielded;
 
       // Log comparison

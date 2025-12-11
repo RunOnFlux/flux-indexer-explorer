@@ -373,8 +373,9 @@ export class FluxRPCClient {
   /**
    * Batch get blocks
    * @param heights - Array of block heights to fetch
+   * @param includeRawHex - If true, also fetch raw block hex and attach as rawHex property
    */
-  async batchGetBlocks(heights: number[]): Promise<Block[]> {
+  async batchGetBlocks(heights: number[], includeRawHex: boolean = false): Promise<Block[]> {
     if (heights.length === 0) {
       return [];
     }
@@ -383,11 +384,30 @@ export class FluxRPCClient {
     const hashRequests = heights.map((height) => ({ method: 'getblockhash', params: [height] }));
     const hashes = await this.batchCall<string>(hashRequests);
 
-    // Try to fetch all blocks with verbosity 2 (full transaction data)
+    // Fetch blocks with verbosity 2 (full transaction data)
     const blockRequests = hashes.map((hash) => ({ method: 'getblock', params: [hash, 2] }));
 
+    // Optionally also fetch raw hex (verbosity 0) for shielded transaction parsing
+    let rawHexPromise: Promise<string[]> | null = null;
+    if (includeRawHex) {
+      const hexRequests = hashes.map((hash) => ({ method: 'getblock', params: [hash, 0] }));
+      rawHexPromise = this.batchCall<string>(hexRequests);
+    }
+
     try {
-      return await this.batchCall<Block>(blockRequests);
+      const [blocks, rawHexes] = await Promise.all([
+        this.batchCall<Block>(blockRequests),
+        rawHexPromise || Promise.resolve([])
+      ]);
+
+      // Attach raw hex to blocks if requested
+      if (includeRawHex && rawHexes.length > 0) {
+        for (let i = 0; i < blocks.length; i++) {
+          (blocks[i] as any).rawHex = rawHexes[i];
+        }
+      }
+
+      return blocks;
     } catch (error: any) {
       // If batch call fails (e.g., HTTP 500 for FluxNode blocks), fetch individually
       // and fall back to verbosity 1 on error
@@ -404,6 +424,17 @@ export class FluxRPCClient {
         try {
           // Try verbosity 2 first
           const block = await this.call<Block>('getblock', [hash, 2]);
+
+          // Also fetch raw hex if requested
+          if (includeRawHex) {
+            try {
+              const rawHex = await this.call<string>('getblock', [hash, 0]);
+              (block as any).rawHex = rawHex;
+            } catch {
+              // Continue without raw hex
+            }
+          }
+
           blocks.push(block);
         } catch (error500: any) {
           // If HTTP 500 (daemon can't process FluxNode transactions), fall back to verbosity 1

@@ -101,6 +101,17 @@ export class FluxAPI {
   }
 
   /**
+   * Fetch multiple transactions in a single request (batch endpoint)
+   * More efficient than fetching each transaction individually.
+   * @param txids - Array of transaction IDs
+   * @param blockHeight - Optional block height hint for optimization
+   * @returns Array of transactions in same order as input txids
+   */
+  static async getTransactionsBatch(txids: string[], blockHeight?: number): Promise<Transaction[]> {
+    return FluxIndexerAPI.getTransactionsBatch(txids, blockHeight);
+  }
+
+  /**
    * Fetch raw transaction data
    * @param txid - Transaction ID
    * @returns Raw transaction hex string

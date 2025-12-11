@@ -41,9 +41,9 @@ export class FluxNodeSyncService {
 
     logger.info('Starting FluxNode sync service');
 
-    // Run immediately on start
+    // Run immediately on start (use debug level since daemon may not be ready)
     this.syncFluxNodes().catch((error) => {
-      logger.error('Initial FluxNode sync failed', { error: error.message });
+      logger.debug('Initial FluxNode sync failed (daemon may not be ready)', { error: error.message });
     });
 
     // Then run periodically

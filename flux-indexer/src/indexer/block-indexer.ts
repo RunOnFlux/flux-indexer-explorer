@@ -9,8 +9,62 @@ import { FluxRPCClient } from '../rpc/flux-rpc-client';
 import { DatabaseConnection } from '../database/connection';
 import { Block, Transaction, SyncError } from '../types';
 import { logger } from '../utils/logger';
+import { isReconstructableScriptType } from '../utils/script-utils';
 import { determineFluxNodeTier } from '../parsers/fluxnode-parser';
-import { extractFluxNodeTransaction, extractCoinbaseTransaction, extractTransactionFromBlock } from '../parsers/block-parser';
+import { extractFluxNodeTransaction, extractTransactionFromBlock, scanBlockTransactions } from '../parsers/block-parser';
+import {
+  bulkInsertBlocks,
+  bulkInsertTransactions,
+  bulkInsertFluxnodeTransactions,
+  bulkInsertUtxos,
+  bulkSpendUtxos,
+  bulkInsertAddressTransactions,
+  bulkCreateAddresses,
+  sanitizeUtf8,
+  sanitizeHex,
+} from '../database/bulk-loader';
+
+// Detailed memory profiling to find leak source
+let blockMemBaseline = 0;
+let blockCount = 0;
+let totalTxProcessed = 0;
+let totalUtxosCreated = 0;
+
+// Track object counts to identify what's accumulating
+interface MemoryProfile {
+  cacheSize: number;
+  cacheQueueSize: number;
+}
+
+function logDetailedMem(label: string, profile: MemoryProfile): void {
+  blockCount++;
+  // Only log every 100 blocks to reduce spam
+  if (blockCount % 100 !== 0) return;
+
+  const mem = process.memoryUsage();
+  const heapMB = Math.round(mem.heapUsed / 1024 / 1024);
+  const rssMB = Math.round(mem.rss / 1024 / 1024);
+  const extMB = Math.round(mem.external / 1024 / 1024);
+  const arrBufMB = Math.round(mem.arrayBuffers / 1024 / 1024);
+
+  if (blockMemBaseline === 0) blockMemBaseline = heapMB;
+  const delta = heapMB - blockMemBaseline;
+  const mbPerBlock = blockCount > 0 ? (delta / blockCount).toFixed(3) : '0';
+
+  logger.info('Memory details', {
+    label,
+    heapMB,
+    rssMB,
+    extMB,
+    arrBufMB,
+    deltaHeapMB: delta,
+    mbPerBlock,
+    cacheSize: profile.cacheSize,
+    cacheQueueSize: profile.cacheQueueSize,
+    blocks: blockCount,
+    txs: totalTxProcessed,
+  });
+}
 
 export class BlockIndexer {
   constructor(
@@ -18,8 +72,8 @@ export class BlockIndexer {
     private db: DatabaseConnection
   ) {}
 
-  private skipAddressSummary = false;
-  private readonly RAW_TX_CACHE_LIMIT = 5000;
+  // Lightweight cache for performance - memory leak is elsewhere
+  private readonly RAW_TX_CACHE_LIMIT = 100;
   private rawTransactionCache = new Map<string, Transaction>();
   private rawTransactionCacheQueue: string[] = [];
 
@@ -49,13 +103,6 @@ export class BlockIndexer {
     return value.toString();
   }
 
-  setSkipAddressSummary(skip: boolean): void {
-    if (this.skipAddressSummary !== skip) {
-      logger.debug(`Address summary updates ${skip ? 'disabled' : 'enabled'} for fast sync mode`);
-    }
-    this.skipAddressSummary = skip;
-  }
-
   /**
    * Index a single block
    */
@@ -82,6 +129,976 @@ export class BlockIndexer {
     }
   }
 
+  /**
+   * Index multiple blocks in a single transaction using COPY for bulk loading
+   * This is significantly faster than processing blocks individually
+   */
+  async indexBlocksBatch(blocks: Block[], startHeight: number): Promise<number> {
+    if (blocks.length === 0) return 0;
+
+    const startTime = Date.now();
+
+    // Import parsers for raw block parsing
+    const { extractTransactionFromBlock, parseTransactionShieldedData } = await import('../parsers/block-parser');
+    const { parseFluxNodeTransaction } = await import('../parsers/fluxnode-parser');
+
+    // Fetch raw block hex for ALL blocks to extract transaction hex
+    // getblock verbosity 2 does NOT include hex field or vjoinsplit data
+    // MEMORY FIX: Use let instead of const so we can null out AFTER DB writes to help GC
+    let blockRawHexMap: Map<string, string> | null = new Map<string, string>(); // block hash -> raw hex
+
+    // Collect all block hashes
+    const blockHashes: Array<{ hash: string; height: number }> = [];
+    let heightCheck = startHeight;
+    for (const block of blocks) {
+      if (block) {
+        blockHashes.push({ hash: block.hash, height: heightCheck });
+      }
+      heightCheck++;
+    }
+
+    // Fetch raw block hex in parallel batches with retry logic
+    const BATCH_SIZE = 10;
+    const MAX_RETRIES = 5;
+    const RETRY_BASE_DELAY = 1000; // 1 second base delay
+
+    const fetchRawHexWithRetry = async (b: { hash: string; height: number }): Promise<{ hash: string; height: number; rawHex: string | null }> => {
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          const rawHex = await this.rpc.getBlock(b.hash, 0) as unknown as string;
+          return { hash: b.hash, height: b.height, rawHex };
+        } catch (error) {
+          const delay = RETRY_BASE_DELAY * Math.pow(2, attempt - 1); // Exponential backoff: 1s, 2s, 4s, 8s, 16s
+          if (attempt < MAX_RETRIES) {
+            logger.warn('Failed to fetch raw block hex, retrying', {
+              height: b.height,
+              attempt,
+              maxRetries: MAX_RETRIES,
+              retryInMs: delay,
+              error: (error as Error).message
+            });
+            await new Promise(resolve => setTimeout(resolve, delay));
+          } else {
+            logger.error('Failed to fetch raw block hex after all retries - SUPPLY DATA WILL BE INACCURATE', {
+              height: b.height,
+              attempts: MAX_RETRIES,
+              error: (error as Error).message
+            });
+            return { hash: b.hash, height: b.height, rawHex: null };
+          }
+        }
+      }
+      return { hash: b.hash, height: b.height, rawHex: null };
+    };
+
+    for (let i = 0; i < blockHashes.length; i += BATCH_SIZE) {
+      const batch = blockHashes.slice(i, i + BATCH_SIZE);
+      const rawHexResults = await Promise.all(batch.map(fetchRawHexWithRetry));
+
+      for (const result of rawHexResults) {
+        if (result.rawHex) {
+          blockRawHexMap!.set(result.hash, result.rawHex);
+        }
+      }
+    }
+
+    // Maps for parsed data - use let for GC cleanup after DB writes
+    // txid -> hex string
+    let txHexMap: Map<string, string> | null = new Map<string, string>();
+    // txid -> shielded data { vjoinsplit, valueBalance }
+    let parsedShieldedData: Map<string, { vjoinsplit?: Array<{ vpub_old: bigint; vpub_new: bigint }>; valueBalance?: bigint }> | null = new Map();
+    // txid -> FluxNode data { type, collateralHash, collateralIndex, ip, publicKey, signature, tier }
+    let parsedFluxNodeData: Map<string, {
+      type: number;
+      collateralHash?: string;
+      collateralIndex?: number;
+      ip?: string;
+      publicKey?: string;
+      signature?: string;
+      tier?: string;
+      p2shAddress?: string;
+    }> | null = new Map();
+
+    // Parse all transactions from raw blocks using single-pass scan (OPTIMIZED)
+    heightCheck = startHeight;
+    for (const block of blocks) {
+      if (!block) {
+        heightCheck++;
+        continue;
+      }
+
+      const rawHex = blockRawHexMap!.get(block.hash);
+      if (!rawHex) {
+        heightCheck++;
+        continue;
+      }
+
+      const transactions = block.tx as Transaction[];
+      if (!transactions || transactions.length === 0) {
+        heightCheck++;
+        continue;
+      }
+
+      // OPTIMIZED: Scan block ONCE to extract all transactions (instead of O(n*m) per-tx lookups)
+      try {
+        const scannedTxs = scanBlockTransactions(rawHex, heightCheck);
+
+        // Build a quick lookup map from scanned results
+        const scannedTxMap = new Map<string, { hex: string; version: number; fluxNodeType?: number }>();
+        for (const scanned of scannedTxs) {
+          scannedTxMap.set(scanned.txid, {
+            hex: scanned.hex,
+            version: scanned.version,
+            fluxNodeType: scanned.fluxNodeType
+          });
+        }
+
+        // Verify we got all expected transactions before processing
+        const missingTxids: string[] = [];
+        for (const tx of transactions) {
+          if (!tx || !tx.txid) continue;
+          if (!scannedTxMap.has(tx.txid)) {
+            missingTxids.push(tx.txid);
+          }
+        }
+
+        // If any transactions are missing from scan, fall back to per-tx extraction for ALL
+        if (missingTxids.length > 0) {
+          logger.warn('Block scan missing transactions, using fallback extraction', {
+            height: heightCheck,
+            missing: missingTxids.length,
+            total: transactions.length,
+            missingTxids: missingTxids.slice(0, 5) // Log first 5 missing
+          });
+          throw new Error(`Scan missing ${missingTxids.length} transactions`);
+        }
+
+        // Process each transaction using the pre-built map
+        for (const tx of transactions) {
+          if (!tx || !tx.txid) continue;
+
+          const scanned = scannedTxMap.get(tx.txid)!; // Safe - we verified above
+          txHexMap!.set(tx.txid, scanned.hex);
+
+          // Parse shielded data for v2/v4 transactions
+          if (tx.version === 2 || tx.version === 4) {
+            const shieldedData = parseTransactionShieldedData(scanned.hex);
+            if (shieldedData.vjoinsplit || shieldedData.valueBalance !== undefined) {
+              parsedShieldedData!.set(tx.txid, shieldedData);
+            }
+          }
+
+          // Parse FluxNode data for v3/v5/v6 transactions (already parsed during scan)
+          if (scanned.fluxNodeType !== undefined) {
+            try {
+              const fluxNodeData = parseFluxNodeTransaction(scanned.hex);
+              if (fluxNodeData) {
+                parsedFluxNodeData!.set(tx.txid, {
+                  type: fluxNodeData.type,
+                  collateralHash: fluxNodeData.collateralHash,
+                  collateralIndex: fluxNodeData.collateralIndex,
+                  ip: fluxNodeData.ipAddress,
+                  publicKey: fluxNodeData.publicKey,
+                  signature: fluxNodeData.signature,
+                  tier: fluxNodeData.benchmarkTier,
+                  p2shAddress: fluxNodeData.p2shAddress,
+                });
+              }
+            } catch (fnError) {
+              logger.debug('Failed to parse FluxNode transaction', { txid: tx.txid, height: heightCheck, error: (fnError as Error).message });
+            }
+          }
+        }
+      } catch (error) {
+        logger.warn('Using per-tx extraction fallback', {
+          height: heightCheck,
+          error: (error as Error).message
+        });
+        // Fallback to old per-tx method - slower but reliable
+        for (const tx of transactions) {
+          if (!tx || !tx.txid) continue;
+          try {
+            const txHex = extractTransactionFromBlock(rawHex, tx.txid, heightCheck);
+            if (txHex) {
+              txHexMap!.set(tx.txid, txHex);
+              if (tx.version === 2 || tx.version === 4) {
+                const shieldedData = parseTransactionShieldedData(txHex);
+                if (shieldedData.vjoinsplit || shieldedData.valueBalance !== undefined) {
+                  parsedShieldedData!.set(tx.txid, shieldedData);
+                }
+              }
+              if (tx.version === 3 || tx.version === 5 || tx.version === 6) {
+                const vin = tx.vin || [];
+                const vout = tx.vout || [];
+                if (vin.length === 0 && vout.length === 0) {
+                  try {
+                    const fluxNodeData = parseFluxNodeTransaction(txHex);
+                    if (fluxNodeData) {
+                      parsedFluxNodeData!.set(tx.txid, {
+                        type: fluxNodeData.type,
+                        collateralHash: fluxNodeData.collateralHash,
+                        collateralIndex: fluxNodeData.collateralIndex,
+                        ip: fluxNodeData.ipAddress,
+                        publicKey: fluxNodeData.publicKey,
+                        signature: fluxNodeData.signature,
+                        tier: fluxNodeData.benchmarkTier,
+                        p2shAddress: fluxNodeData.p2shAddress,
+                      });
+                    }
+                  } catch (fnError) {
+                    logger.debug('Failed to parse FluxNode transaction', { txid: tx.txid, height: heightCheck, error: (fnError as Error).message });
+                  }
+                }
+              }
+            } else {
+              // CRITICAL: If we can't extract hex for a transaction, log error
+              logger.error('CRITICAL: Failed to extract transaction hex - supply may be inaccurate', {
+                height: heightCheck,
+                txid: tx.txid,
+                version: tx.version
+              });
+            }
+          } catch (err) {
+            logger.error('CRITICAL: Exception extracting tx hex - supply may be inaccurate', {
+              height: heightCheck,
+              txid: tx.txid,
+              error: (err as Error).message
+            });
+          }
+        }
+      }
+
+      heightCheck++;
+    }
+
+    logger.debug(`Extracted hex for ${txHexMap!.size} transactions, ${parsedShieldedData!.size} shielded, ${parsedFluxNodeData!.size} FluxNode`)
+
+    return await this.db.transaction(async (client) => {
+      // Collect all data from all blocks
+      const blockRecords: Array<{
+        height: number;
+        hash: string;
+        prevHash: string | null;
+        merkleRoot: string | null;
+        timestamp: number;
+        bits: string | null;
+        nonce: string | null;
+        version: number | null;
+        size: number | null;
+        txCount: number;
+        producer: string | null;
+        producerReward: string | null;
+        difficulty: number | null;
+        chainwork: string | null;
+      }> = [];
+      // OPTIMIZED: Removed blockHash - JOIN from blocks table when needed
+      const txRecords: Array<{
+        txid: string;
+        blockHeight: number;
+        timestamp: number;
+        version: number;
+        locktime: number;
+        size: number;
+        vsize: number;
+        inputCount: number;
+        outputCount: number;
+        inputTotal: string;
+        outputTotal: string;
+        fee: string;
+        isCoinbase: boolean;
+        hex: string | null;
+        isFluxnodeTx: boolean;
+        fluxnodeType: number | null;
+      }> = [];
+
+      // FluxNode transaction records for fluxnode_transactions table
+      // OPTIMIZED: Removed blockHash - JOIN from blocks table when needed
+      const fluxnodeRecords: Array<{
+        txid: string;
+        blockHeight: number;
+        blockTime: Date;
+        version: number;
+        type: number;
+        collateralHash: string | null;
+        collateralIndex: number | null;
+        ipAddress: string | null;
+        publicKey: string | null;
+        signature: string | null;
+        p2shAddress: string | null;
+        benchmarkTier: string | null;
+        extraData: string | null;
+      }> = [];
+      const utxoRecords: Array<{
+        txid: string;
+        vout: number;
+        address: string;
+        value: string;
+        scriptPubkey: string;
+        scriptType: string;
+        blockHeight: number;
+      }> = [];
+      const spendRecords: Array<{
+        txid: string;
+        vout: number;
+        spentTxid: string;
+        spentBlockHeight: number;
+      }> = [];
+
+      // Address transactions records (for address_transactions table)
+      // Key: `${address}:${txid}:${blockHeight}` -> { received, sent }
+      // OPTIMIZED: Removed blockHash - JOIN from blocks table when needed
+      const addressTxMap = new Map<string, {
+        address: string;
+        txid: string;
+        blockHeight: number;
+        timestamp: number;
+        received: bigint;
+        sent: bigint;
+      }>();
+
+      // Transaction participants map (for transaction_participants table)
+      // Key: txid -> { inputs: Set<address>, outputs: Set<address> }
+      const txParticipantsMap = new Map<string, {
+        inputs: Set<string>;
+        outputs: Set<string>;
+      }>();
+
+      // Map of outputs created in this batch (for same-batch UTXO lookups)
+      const batchUtxoMap = new Map<string, { value: bigint; address: string }>();
+
+      // Collect all input references that need UTXO lookups
+      // OPTIMIZED: Removed spentBlockHash - not needed for address_transactions
+      const inputRefs: Array<{
+        key: string;
+        txid: string;
+        vout: number;
+        spentByTxid: string;
+        spentBlockHeight: number;
+        spentTimestamp: number;
+      }> = [];
+
+      // Supply tracking per block (height -> { coinbase, shieldedChange })
+      const supplyChanges: Array<{ height: number; coinbaseReward: bigint; shieldedChange: bigint }> = [];
+
+      // Phase timing for performance analysis
+      const phaseTimings: Record<string, number> = {};
+      let phaseStart = Date.now();
+
+      // First pass: collect all data and create batch UTXO map
+      let currentHeight = startHeight;
+      for (const block of blocks) {
+        if (!block) {
+          currentHeight++;
+          continue;
+        }
+
+        // Get transactions - they should be full Transaction objects from verbose getblock
+        const transactions = block.tx as Transaction[];
+        if (!transactions || transactions.length === 0 || typeof transactions[0] === 'string') {
+          logger.warn('Block has no verbose transactions, skipping batch processing', { height: currentHeight });
+          currentHeight++;
+          continue;
+        }
+
+        blockRecords.push({
+          height: currentHeight,
+          hash: block.hash,
+          prevHash: block.previousblockhash || null,
+          merkleRoot: block.merkleroot || null,
+          timestamp: block.time,
+          bits: block.bits || null,
+          nonce: block.nonce?.toString() || null,
+          version: block.version ?? null,
+          size: block.size ?? null,
+          txCount: transactions.length,
+          producer: block.producer || null,
+          producerReward: block.producerReward ? BigInt(Math.round(block.producerReward * 1e8)).toString() : null,
+          difficulty: block.difficulty ?? null,
+          chainwork: block.chainwork || null,
+        });
+
+        // Track supply changes for this block
+        let blockCoinbaseReward = BigInt(0);
+        let blockShieldedChange = BigInt(0);
+
+        for (const tx of transactions) {
+          // Skip completely malformed transactions (no txid)
+          if (!tx || !tx.txid) {
+            logger.warn('Skipping malformed transaction without txid in batch', {
+              height: currentHeight,
+            });
+            continue;
+          }
+
+          // Handle shielded transactions: vin/vout may be undefined, null, or empty
+          // Flux is a Zcash fork - shielded transactions use vShieldedSpend/vShieldedOutput instead
+          const vin = tx.vin || [];
+          const vout = tx.vout || [];
+
+          const isCoinbase = vin.length > 0 && !!vin[0].coinbase;
+
+          // Collect outputs - add to batch map and utxo records
+          let outputTotal = BigInt(0);
+
+          // Initialize transaction participants for this tx
+          if (!txParticipantsMap.has(tx.txid)) {
+            txParticipantsMap.set(tx.txid, { inputs: new Set(), outputs: new Set() });
+          }
+          const txParticipants = txParticipantsMap.get(tx.txid)!;
+
+          for (let voutIdx = 0; voutIdx < vout.length; voutIdx++) {
+            const output = vout[voutIdx];
+            const valueSats = BigInt(Math.round(output.value * 100000000));
+            outputTotal += valueSats;
+
+            let address = 'SHIELDED_OR_NONSTANDARD';
+            if (output.scriptPubKey?.addresses && output.scriptPubKey.addresses.length > 0) {
+              address = output.scriptPubKey.addresses[0];
+            }
+
+            const scriptType = output.scriptPubKey?.type || 'unknown';
+            const scriptHex = output.scriptPubKey?.hex || '';
+
+            // OPTIMIZATION: Skip storing script_pubkey for standard types (P2PKH, P2SH)
+            // These can be reconstructed from address + type, saving ~12GB storage
+            // Only store script_pubkey for non-standard types (nulldata, nonstandard, etc.)
+            const scriptPubkeyToStore = isReconstructableScriptType(scriptType) ? '' : scriptHex;
+
+            // Add to batch map for same-batch lookups
+            const key = `${tx.txid}:${voutIdx}`;
+            batchUtxoMap.set(key, { value: valueSats, address });
+
+            utxoRecords.push({
+              txid: tx.txid,
+              vout: voutIdx,
+              address,
+              value: valueSats.toString(),
+              scriptPubkey: scriptPubkeyToStore,
+              scriptType,
+              blockHeight: currentHeight,
+            });
+
+            // Track output address for transaction_participants (skip non-standard)
+            if (address !== 'SHIELDED_OR_NONSTANDARD') {
+              txParticipants.outputs.add(address);
+
+              // Track address transaction (received)
+              const addrTxKey = `${address}:${tx.txid}:${currentHeight}`;
+              const existing = addressTxMap.get(addrTxKey);
+              if (existing) {
+                existing.received += valueSats;
+              } else {
+                addressTxMap.set(addrTxKey, {
+                  address,
+                  txid: tx.txid,
+                  blockHeight: currentHeight,
+                  timestamp: block.time,
+                  received: valueSats,
+                  sent: BigInt(0),
+                });
+              }
+            }
+          }
+
+          // Collect inputs
+          let inputTotal = BigInt(0);
+          for (const input of vin) {
+            if (input.coinbase || !input.txid) continue;
+
+            const key = `${input.txid}:${input.vout}`;
+
+            // Check batch map first (for UTXOs created in earlier blocks of this batch)
+            const batchUtxo = batchUtxoMap.get(key);
+            if (batchUtxo) {
+              inputTotal += batchUtxo.value;
+
+              // Track input address for transaction_participants (skip non-standard)
+              if (batchUtxo.address !== 'SHIELDED_OR_NONSTANDARD') {
+                txParticipants.inputs.add(batchUtxo.address);
+
+                // Track address transaction (sent)
+                const addrTxKey = `${batchUtxo.address}:${tx.txid}:${currentHeight}`;
+                const existing = addressTxMap.get(addrTxKey);
+                if (existing) {
+                  existing.sent += batchUtxo.value;
+                } else {
+                  addressTxMap.set(addrTxKey, {
+                    address: batchUtxo.address,
+                    txid: tx.txid,
+                    blockHeight: currentHeight,
+                    timestamp: block.time,
+                    received: BigInt(0),
+                    sent: batchUtxo.value,
+                  });
+                }
+              }
+            } else {
+              // Need to look up from database - store additional info for later processing
+              inputRefs.push({
+                key,
+                txid: input.txid,
+                vout: input.vout!,
+                spentByTxid: tx.txid,
+                spentBlockHeight: currentHeight,
+                spentTimestamp: block.time,
+              });
+            }
+
+            spendRecords.push({
+              txid: input.txid,
+              vout: input.vout!,
+              spentTxid: tx.txid,
+              spentBlockHeight: currentHeight,
+            });
+          }
+
+          // We'll calculate final inputTotal after UTXO lookups
+          // For now, store a placeholder
+
+          // Check if this is a FluxNode transaction
+          const fluxNodeData = parsedFluxNodeData!.get(tx.txid);
+          const isFluxnodeTx = !!fluxNodeData;
+          const fluxnodeType = fluxNodeData?.type ?? null;
+
+          // Get hex from txHexMap (extracted from raw block) - used for size calculation only
+          const txHexForSize = txHexMap!.get(tx.txid) || null;
+
+          // Calculate size from hex if RPC didn't provide it (common for FluxNode txs)
+          const computedSize = tx.size || (txHexForSize ? Math.floor(txHexForSize.length / 2) : 0);
+          const computedVSize = tx.vsize || computedSize;
+
+          txRecords.push({
+            txid: tx.txid,
+            blockHeight: currentHeight,
+            timestamp: block.time,
+            version: tx.version,
+            locktime: tx.locktime || 0,
+            size: computedSize,
+            vsize: computedVSize,
+            inputCount: vin.length,
+            outputCount: vout.length,
+            inputTotal: '0', // Will be updated after UTXO lookups
+            outputTotal: outputTotal.toString(),
+            fee: '0', // Will be calculated after UTXO lookups
+            isCoinbase,
+            hex: null, // Don't store hex during sync - fetched on-demand via API (saves ~30GB)
+            isFluxnodeTx,
+            fluxnodeType,
+          });
+
+          // Add to fluxnodeRecords if this is a FluxNode transaction
+          if (isFluxnodeTx && txHexForSize) {
+            // Build extra_data JSON to match normal sync
+            const extraData = JSON.stringify({
+              sigTime: (fluxNodeData as any)?.sigTime ?? null,
+              benchmarkSigTime: (fluxNodeData as any)?.benchmarkSigTime ?? null,
+              updateType: (fluxNodeData as any)?.updateType ?? null,
+              nFluxNodeTxVersion: (fluxNodeData as any)?.nFluxNodeTxVersion ?? null,
+            });
+
+            fluxnodeRecords.push({
+              txid: tx.txid,
+              blockHeight: currentHeight,
+              blockTime: new Date(block.time * 1000),
+              version: tx.version,
+              type: fluxnodeType!,
+              collateralHash: fluxNodeData!.collateralHash || null,
+              collateralIndex: fluxNodeData!.collateralIndex ?? null,
+              ipAddress: fluxNodeData!.ip || null,
+              publicKey: fluxNodeData!.publicKey || null,
+              signature: fluxNodeData!.signature || null,
+              p2shAddress: fluxNodeData!.p2shAddress || null,
+              benchmarkTier: fluxNodeData!.tier || null,
+              extraData,
+            });
+          }
+
+          // Track supply changes
+          if (isCoinbase) {
+            blockCoinbaseReward = outputTotal;
+          }
+
+          // Extract shielded pool changes from pre-parsed JoinSplit data
+          // RPC getblock verbosity 2 does NOT include vjoinsplit data, so we use parsed raw hex
+          const version = tx.version || 1;
+
+          if (version === 2 || version === 4) {
+            const shieldedData = parsedShieldedData!.get(tx.txid);
+            if (shieldedData) {
+              // Maximum reasonable value for sanity check (1 billion FLUX in satoshis)
+              const MAX_REASONABLE_VALUE = BigInt(1_000_000_000) * BigInt(100_000_000);
+              let hasInsaneValue = false;
+
+              // Process JoinSplits (Sprout) - values are already in satoshis from parser
+              if (shieldedData.vjoinsplit && shieldedData.vjoinsplit.length > 0) {
+                for (const js of shieldedData.vjoinsplit) {
+                  // vpub_old: value entering shielded pool (from transparent)
+                  // vpub_new: value exiting shielded pool (to transparent)
+                  const absVpubOld = js.vpub_old < BigInt(0) ? -js.vpub_old : js.vpub_old;
+                  const absVpubNew = js.vpub_new < BigInt(0) ? -js.vpub_new : js.vpub_new;
+                  if (absVpubOld > MAX_REASONABLE_VALUE || absVpubNew > MAX_REASONABLE_VALUE) {
+                    hasInsaneValue = true;
+                    logger.warn('Insane JoinSplit value detected, skipping', { txid: tx.txid, height: currentHeight });
+                    break;
+                  }
+                  blockShieldedChange += js.vpub_old - js.vpub_new;
+                }
+              }
+
+              // Process Sapling valueBalance (V4 only) - already in satoshis from parser
+              if (!hasInsaneValue && version === 4 && shieldedData.valueBalance !== undefined) {
+                const absValueBalance = shieldedData.valueBalance < BigInt(0) ? -shieldedData.valueBalance : shieldedData.valueBalance;
+                if (absValueBalance > MAX_REASONABLE_VALUE) {
+                  hasInsaneValue = true;
+                  logger.warn('Insane valueBalance detected, skipping', { txid: tx.txid, height: currentHeight });
+                } else {
+                  // Positive valueBalance = value leaving shielded pool (pool decreases)
+                  // Negative valueBalance = value entering shielded pool (pool increases)
+                  // So we SUBTRACT valueBalance from change
+                  blockShieldedChange -= shieldedData.valueBalance;
+                }
+              }
+            }
+          }
+        }
+
+        // Record supply changes for this block
+        supplyChanges.push({
+          height: currentHeight,
+          coinbaseReward: blockCoinbaseReward,
+          shieldedChange: blockShieldedChange,
+        });
+
+        currentHeight++;
+      }
+
+      phaseTimings.firstPass = Date.now() - phaseStart;
+      phaseStart = Date.now();
+
+      // Batch lookup UTXOs from database for inputs not in this batch
+      const utxoLookupMap = new Map<string, { value: bigint; address: string }>();
+      if (inputRefs.length > 0) {
+        // Deduplicate
+        const uniqueRefs = [...new Map(inputRefs.map(r => [r.key, r])).values()];
+
+        const chunkSize = 1000;
+        for (let i = 0; i < uniqueRefs.length; i += chunkSize) {
+          const chunk = uniqueRefs.slice(i, i + chunkSize);
+          if (chunk.length === 0) continue;
+
+          const params: Array<string | number> = [];
+          const placeholders = chunk.map((ref, idx) => {
+            params.push(ref.txid, ref.vout);
+            const base = idx * 2;
+            return `($${base + 1}, $${base + 2})`;
+          }).join(', ');
+
+          const result = await client.query(
+            `SELECT txid, vout, value, address FROM utxos WHERE (txid, vout) IN (${placeholders})`,
+            params
+          );
+
+          for (const row of result.rows) {
+            utxoLookupMap.set(`${row.txid}:${row.vout}`, {
+              value: BigInt(row.value),
+              address: row.address,
+            });
+          }
+        }
+      }
+
+      phaseTimings.utxoLookup = Date.now() - phaseStart;
+      phaseStart = Date.now();
+
+      // Now process inputRefs to update addressTxMap and txParticipantsMap with looked-up addresses
+      for (const ref of inputRefs) {
+        const utxo = utxoLookupMap.get(ref.key);
+        if (utxo && utxo.address !== 'SHIELDED_OR_NONSTANDARD') {
+          // Add to transaction participants
+          const participants = txParticipantsMap.get(ref.spentByTxid);
+          if (participants) {
+            participants.inputs.add(utxo.address);
+          }
+
+          // Add to address transactions (sent)
+          const addrTxKey = `${utxo.address}:${ref.spentByTxid}:${ref.spentBlockHeight}`;
+          const existing = addressTxMap.get(addrTxKey);
+          if (existing) {
+            existing.sent += utxo.value;
+          } else {
+            addressTxMap.set(addrTxKey, {
+              address: utxo.address,
+              txid: ref.spentByTxid,
+              blockHeight: ref.spentBlockHeight,
+              timestamp: ref.spentTimestamp,
+              received: BigInt(0),
+              sent: utxo.value,
+            });
+          }
+        }
+      }
+
+      // Update transaction inputTotal and fee based on UTXO lookups
+      let txIdx = 0;
+      currentHeight = startHeight;
+      for (const block of blocks) {
+        if (!block) {
+          currentHeight++;
+          continue;
+        }
+
+        const transactions = block.tx as Transaction[];
+        if (!transactions || transactions.length === 0 || typeof transactions[0] === 'string') {
+          currentHeight++;
+          continue;
+        }
+
+        for (const tx of transactions) {
+          // Skip transactions without txid - must match first loop's skip logic
+          if (!tx || !tx.txid) {
+            continue;
+          }
+          const txRecord = txRecords[txIdx];
+          // Defensive check in case txRecords is out of sync
+          if (!txRecord) {
+            logger.warn('txRecord undefined at index - skipping', { txIdx, txRecordsLength: txRecords.length, txid: tx.txid });
+            txIdx++;
+            continue;
+          }
+
+          // Handle shielded transactions: vin/vout may be undefined, null, or empty
+          const vin = tx.vin || [];
+          const isCoinbase = vin.length > 0 && !!vin[0].coinbase;
+
+          if (!isCoinbase) {
+            let inputTotal = BigInt(0);
+            for (const input of vin) {
+              if (input.coinbase || !input.txid) continue;
+              const key = `${input.txid}:${input.vout}`;
+              const utxo = batchUtxoMap.get(key) || utxoLookupMap.get(key);
+              if (utxo) {
+                inputTotal += utxo.value;
+              }
+            }
+            txRecord.inputTotal = inputTotal.toString();
+            const outputTotal = BigInt(txRecord.outputTotal);
+            txRecord.fee = (inputTotal - outputTotal).toString();
+          }
+
+          txIdx++;
+        }
+
+        // Clear block.tx array NOW - we've extracted all needed data
+        // This is the BIGGEST memory saver - tx arrays can be huge
+        (block as any).tx = null;
+
+        currentHeight++;
+      }
+
+      phaseTimings.secondPass = Date.now() - phaseStart;
+      phaseStart = Date.now();
+
+      // Now do bulk inserts using COPY - with timing to identify bottlenecks
+      const timings: Record<string, number> = {};
+      let t0 = Date.now();
+
+      // PHASE 3: Collect all unique addresses and get/create address IDs
+      // Include SHIELDED_OR_NONSTANDARD to satisfy FK constraint
+      const allAddresses = new Set<string>();
+      for (const u of utxoRecords) {
+        if (u.address) {
+          allAddresses.add(u.address);
+        }
+      }
+      for (const r of addressTxMap.values()) {
+        if (r.address) {
+          allAddresses.add(r.address);
+        }
+      }
+
+      // Create/get address IDs in bulk (much faster than individual lookups)
+      const addressIdMap = await bulkCreateAddresses(client, Array.from(allAddresses), startHeight);
+      timings.addresses = Date.now() - t0; t0 = Date.now();
+
+      await bulkInsertBlocks(client, blockRecords);
+      timings.blocks = Date.now() - t0; t0 = Date.now();
+
+      await bulkInsertTransactions(client, txRecords);
+      timings.txs = Date.now() - t0; t0 = Date.now();
+
+      await bulkInsertFluxnodeTransactions(client, fluxnodeRecords);
+      timings.fluxnode = Date.now() - t0; t0 = Date.now();
+
+      // PHASE 3: Transform utxoRecords to use addressId instead of address
+      const utxoRecordsWithIds = utxoRecords.map(u => ({
+        txid: u.txid,
+        vout: u.vout,
+        addressId: addressIdMap.get(u.address) || 0,  // 0 for SHIELDED_OR_NONSTANDARD
+        value: u.value,
+        scriptPubkey: u.scriptPubkey,
+        scriptType: u.scriptType,
+        blockHeight: u.blockHeight
+      }));
+      await bulkInsertUtxos(client, utxoRecordsWithIds);
+      timings.utxos = Date.now() - t0; t0 = Date.now();
+
+      await bulkSpendUtxos(client, spendRecords);
+      timings.spends = Date.now() - t0; t0 = Date.now();
+
+      // Bulk insert address_transactions (cache table for address history)
+      // PHASE 3: Transform to use addressId instead of address
+      if (addressTxMap.size > 0) {
+        const addressTxRecords = Array.from(addressTxMap.values()).map(r => ({
+          addressId: addressIdMap.get(r.address) || 0,
+          txid: r.txid,
+          blockHeight: r.blockHeight,
+          timestamp: r.timestamp,
+          received: r.received.toString(),
+          sent: r.sent.toString()
+        }));
+        await bulkInsertAddressTransactions(client, addressTxRecords);
+        timings.addrTx = Date.now() - t0; t0 = Date.now();
+      }
+
+      // Bulk update address_summary (incremental updates during sync)
+      if (addressTxMap.size > 0) {
+        // Collect unique addresses and their aggregated changes
+        const addressChanges = new Map<string, {
+          received: bigint;
+          sent: bigint;
+          txCount: number;
+          minHeight: number;
+          maxHeight: number;
+        }>();
+
+        for (const record of addressTxMap.values()) {
+          const existing = addressChanges.get(record.address);
+          if (existing) {
+            existing.received += record.received;
+            existing.sent += record.sent;
+            existing.txCount++;
+            existing.minHeight = Math.min(existing.minHeight, record.blockHeight);
+            existing.maxHeight = Math.max(existing.maxHeight, record.blockHeight);
+          } else {
+            addressChanges.set(record.address, {
+              received: record.received,
+              sent: record.sent,
+              txCount: 1,
+              minHeight: record.blockHeight,
+              maxHeight: record.blockHeight
+            });
+          }
+        }
+
+        // Build VALUES clause for bulk upsert
+        const addressValues: string[] = [];
+        for (const [address, changes] of addressChanges) {
+          const balance = changes.received - changes.sent;
+          addressValues.push(`('${address}', ${balance.toString()}, ${changes.txCount}, ${changes.received.toString()}, ${changes.sent.toString()}, 0, ${changes.minHeight}, ${changes.maxHeight}, NOW())`);
+        }
+
+        if (addressValues.length > 0) {
+          await client.query(`
+            INSERT INTO address_summary (address, balance, tx_count, received_total, sent_total, unspent_count, first_seen, last_activity, updated_at)
+            VALUES ${addressValues.join(', ')}
+            ON CONFLICT (address) DO UPDATE SET
+              balance = address_summary.balance + EXCLUDED.balance,
+              tx_count = address_summary.tx_count + EXCLUDED.tx_count,
+              received_total = address_summary.received_total + EXCLUDED.received_total,
+              sent_total = address_summary.sent_total + EXCLUDED.sent_total,
+              first_seen = LEAST(address_summary.first_seen, EXCLUDED.first_seen),
+              last_activity = GREATEST(address_summary.last_activity, EXCLUDED.last_activity),
+              updated_at = NOW()
+          `);
+        }
+        timings.addrSummary = Date.now() - t0; t0 = Date.now();
+      }
+
+      // Bulk update supply stats
+      if (supplyChanges.length > 0) {
+        // Get previous supply state
+        const prevStats = await client.query(
+          'SELECT transparent_supply, shielded_pool FROM supply_stats ORDER BY block_height DESC LIMIT 1'
+        );
+        let transparentSupply = BigInt(prevStats.rows[0]?.transparent_supply || 0);
+        let shieldedPool = BigInt(prevStats.rows[0]?.shielded_pool || 0);
+
+        // Build bulk insert values
+        const supplyValues: string[] = [];
+        for (const change of supplyChanges) {
+          transparentSupply += change.coinbaseReward - change.shieldedChange;
+          shieldedPool += change.shieldedChange;
+          const totalSupply = transparentSupply + shieldedPool;
+          supplyValues.push(`(${change.height}, ${this.safeBigIntToString(transparentSupply)}, ${this.safeBigIntToString(shieldedPool)}, ${this.safeBigIntToString(totalSupply)}, NOW())`);
+        }
+
+        // Bulk insert supply stats
+        if (supplyValues.length > 0) {
+          await client.query(`
+            INSERT INTO supply_stats (block_height, transparent_supply, shielded_pool, total_supply, updated_at)
+            VALUES ${supplyValues.join(', ')}
+            ON CONFLICT (block_height) DO UPDATE SET
+              transparent_supply = EXCLUDED.transparent_supply,
+              shielded_pool = EXCLUDED.shielded_pool,
+              total_supply = EXCLUDED.total_supply,
+              updated_at = NOW()
+          `);
+        }
+        timings.supply = Date.now() - t0; t0 = Date.now();
+      }
+
+      // Track totals for memory profiling
+      totalTxProcessed += txRecords.length;
+      totalUtxosCreated += utxoRecords.length;
+
+      // Update sync state to last block
+      const lastBlock = blocks[blocks.length - 1];
+      if (lastBlock) {
+        await this.updateSyncState(client, startHeight + blocks.length - 1, lastBlock.hash);
+      }
+
+      // Timing data available for debugging if needed (LOG_LEVEL=debug)
+      const totalDbTime = Object.values(timings).reduce((a, b) => a + b, 0);
+      logger.debug(`Timing breakdown: parse=${phaseTimings.firstPass}ms utxoLookup=${phaseTimings.utxoLookup}ms process=${phaseTimings.secondPass}ms dbWrites=${totalDbTime}ms`);
+
+      const elapsed = Date.now() - startTime;
+      const blocksProcessed = blocks.length;
+      logger.debug(`Batch indexed ${blocksProcessed} blocks in ${elapsed}ms (${(blocksProcessed / (elapsed / 1000)).toFixed(1)} blocks/sec)`);
+
+      // CRITICAL: Clear all large data structures to help GC reclaim memory
+      blockRecords.length = 0;
+      txRecords.length = 0;
+      fluxnodeRecords.length = 0;
+      utxoRecords.length = 0;
+      spendRecords.length = 0;
+      inputRefs.length = 0;
+      supplyChanges.length = 0;
+      batchUtxoMap.clear();
+      utxoLookupMap.clear();
+      addressTxMap.clear();
+      txParticipantsMap.clear();
+
+      // CRITICAL: Clear and null out the large Maps from outer scope that hold raw hex data
+      // These were causing the memory leak - blockRawHexMap and txHexMap hold large strings
+      // Nulling them allows V8 to fully release the memory
+      if (blockRawHexMap) { blockRawHexMap.clear(); blockRawHexMap = null; }
+      if (txHexMap) { txHexMap.clear(); txHexMap = null; }
+      if (parsedShieldedData) { parsedShieldedData.clear(); parsedShieldedData = null; }
+      if (parsedFluxNodeData) { parsedFluxNodeData.clear(); parsedFluxNodeData = null; }
+
+      // Clear input blocks array to break closure reference chain
+      // This allows GC to reclaim the Block objects even if this closure survives
+      for (let i = 0; i < blocksProcessed; i++) {
+        blocks[i] = null as any;
+      }
+      blocks.length = 0;
+
+      // NOTE: GC is now handled in sync-engine.ts every 500 blocks
+      // Doing GC here inside the transaction was blocking for ~6 seconds per batch
+
+      return blocksProcessed;
+    });
+  }
   private async processBlock(block: Block, expectedHeight?: number): Promise<void> {
     const blockHeight = block.height ?? expectedHeight;
     if (blockHeight === undefined) {
@@ -107,6 +1124,24 @@ export class BlockIndexer {
       }
 
       await this.updateSyncState(client, blockHeight, block.hash);
+    });
+
+    // Explicitly clear references to help GC reclaim memory
+    // The transactions have been written to DB, we no longer need them in memory
+    for (let i = 0; i < transactions.length; i++) {
+      transactions[i] = null as any;
+    }
+    transactions.length = 0;
+
+    // Clear block.tx array to release transaction references
+    if (Array.isArray(block.tx)) {
+      block.tx.length = 0;
+    }
+
+    // Memory profiling - log after block processing complete
+    logDetailedMem(`block-${blockHeight}-cleared`, {
+      cacheSize: this.rawTransactionCache.size,
+      cacheQueueSize: this.rawTransactionCacheQueue.length,
     });
   }
 
@@ -172,7 +1207,35 @@ export class BlockIndexer {
       return;
     }
 
-    this.rawTransactionCache.set(tx.txid, tx);
+    // Create a MINIMAL cache entry to prevent memory bloat
+    // The cache is ONLY used for UTXO value lookups (vout.value and vout.scriptPubKey.addresses)
+    // Strip ALL unnecessary data including scriptPubKey.hex/asm which can be very large
+    // Database writes use the original transaction objects, NOT from this cache
+    const lightweightVout = tx.vout?.map(out => ({
+      value: out.value,
+      n: out.n,
+      scriptPubKey: {
+        type: out.scriptPubKey?.type || 'unknown',
+        addresses: out.scriptPubKey?.addresses,
+        // Stripped: hex, asm, reqSigs - large and not needed for UTXO lookups
+        hex: '',
+        asm: '',
+      },
+    })) || [];
+
+    const lightweightTx: Transaction = {
+      txid: tx.txid,
+      hash: tx.hash || tx.txid,
+      version: tx.version,
+      vin: [], // Empty - vin not needed for UTXO value lookups
+      vout: lightweightVout,
+      size: tx.size || 0,
+      vsize: tx.vsize || 0,
+      locktime: tx.locktime || 0,
+      // Explicitly omit: hex, blockhash, confirmations, time, blocktime
+    };
+
+    this.rawTransactionCache.set(tx.txid, lightweightTx);
     this.rawTransactionCacheQueue.push(tx.txid);
 
     if (this.rawTransactionCacheQueue.length > this.RAW_TX_CACHE_LIMIT) {
@@ -194,8 +1257,12 @@ export class BlockIndexer {
 
     if (uncachedTxids.length > 0) {
       try {
+        // OPTIMIZED: JOIN to blocks table to get hash since block_hash column was removed
         const blockRows = await client.query(
-          'SELECT txid, block_hash FROM transactions WHERE txid = ANY($1)',
+          `SELECT t.txid, b.hash as block_hash
+           FROM transactions t
+           JOIN blocks b ON t.block_height = b.height
+           WHERE t.txid = ANY($1)`,
           [uncachedTxids]
         );
 
@@ -212,6 +1279,11 @@ export class BlockIndexer {
       }
     }
 
+    // Fetch uncached transactions for input value resolution
+    // Store in a temporary map instead of the main cache to avoid memory bloat
+    // from large consolidation transactions (1000+ inputs)
+    const tempTxMap = new Map<string, Transaction>();
+
     if (uncachedTxids.length > 0) {
       try {
         const batchHashes = uncachedTxids.map((txid) => blockHashMap.get(txid));
@@ -222,7 +1294,9 @@ export class BlockIndexer {
             logger.warn('Received raw transaction hex when expecting verbose JSON', { txid });
             return;
           }
-          this.cacheRawTransaction(result);
+          // Store in temp map, NOT the main cache - these are historical lookups
+          // that rarely need to be accessed again
+          tempTxMap.set(txid, result);
         });
       } catch (error: any) {
         logger.warn('Failed to fetch raw transactions during input hydration', { txids: uncachedTxids, error: error.message });
@@ -230,13 +1304,15 @@ export class BlockIndexer {
     }
 
     for (const [txid, vouts] of missingByTx.entries()) {
-      let rawTx = this.rawTransactionCache.get(txid);
+      // Check main cache first, then temp map from batch fetch
+      let rawTx = this.rawTransactionCache.get(txid) || tempTxMap.get(txid);
 
       if (!rawTx) {
+        // Last resort: individual RPC fetch (but don't cache to avoid bloat)
         const blockHash = blockHashMap.get(txid);
         try {
           rawTx = await this.rpc.getRawTransaction(txid, true, blockHash) as Transaction;
-          this.cacheRawTransaction(rawTx);
+          // Don't cache - this is a one-time historical lookup
         } catch (error: any) {
           logger.warn('Failed to hydrate input transaction via verbose RPC', {
             txid,
@@ -478,12 +1554,17 @@ export class BlockIndexer {
             output.n,
             utxoAddress,
             this.safeBigIntToString(value, `utxo:${tx.txid}:${output.n}`),
-            output.scriptPubKey.hex || '',
-            output.scriptPubKey.type || 'unknown',
+            sanitizeHex(output.scriptPubKey.hex || ''),
+            sanitizeUtf8(output.scriptPubKey.type || 'unknown'),
             block.height,
           ]);
 
-          // Address delta tracking handled later; nothing else needed here
+          // Pre-populate utxoInfoMap with this output for intra-block reference resolution
+          // This allows later transactions in the same block to resolve inputs from earlier txs
+          utxoInfoMap.set(`${tx.txid}:${output.n}`, {
+            value: value,
+            address: address || null,
+          });
         }
       }
 
@@ -547,10 +1628,13 @@ export class BlockIndexer {
       }
     }
 
-    if (inputKeys.length > 0) {
+    // Filter out keys already resolved (same-block outputs are pre-populated in utxoInfoMap)
+    const keysToLookup = inputKeys.filter(key => !utxoInfoMap.has(key));
+
+    if (keysToLookup.length > 0) {
       const chunkSize = 500;
-      for (let i = 0; i < inputKeys.length; i += chunkSize) {
-        const chunk = inputKeys.slice(i, i + chunkSize);
+      for (let i = 0; i < keysToLookup.length; i += chunkSize) {
+        const chunk = keysToLookup.slice(i, i + chunkSize);
         if (chunk.length === 0) continue;
 
         const params: Array<string | number> = [];
@@ -681,10 +1765,10 @@ export class BlockIndexer {
         const computedSize = prep.tx.size || 0;
         const computedVSize = prep.tx.vsize || computedSize;
 
+        // OPTIMIZED: Removed block.hash - JOIN from blocks table when needed
         txValues.push([
           prep.tx.txid,
           block.height,
-          block.hash,
           block.time,
           prep.tx.version || 0,
           prep.tx.locktime || 0,
@@ -806,8 +1890,12 @@ export class BlockIndexer {
         txAddressTotals.set(prep.tx.txid, txTotalsForTx);
       }
 
-      const rawHex = prep.tx.hex || null;
-      const computedSize = prep.tx.size ?? (rawHex ? Math.floor(rawHex.length / 2) : 0);
+      // Don't store hex during sync - saves ~30GB storage
+      // Hex is fetched on-demand via API and cached when viewed
+      const rawHex = null;
+      // Use tx.hex temporarily for size calculation, but don't store it
+      const txHexForSize = prep.tx.hex || '';
+      const computedSize = prep.tx.size ?? (txHexForSize ? Math.floor(txHexForSize.length / 2) : 0);
       const computedVSize = prep.tx.vsize ?? computedSize;
 
       // Calculate fee correctly for shielded transactions
@@ -856,10 +1944,10 @@ export class BlockIndexer {
       const fee = prep.isCoinbase ? BigInt(0) : inputTotal - prep.outputTotal - shieldedPoolChange;
       const safeFee = !prep.isCoinbase && fee < BigInt(0) ? BigInt(0) : fee;
 
+      // OPTIMIZED: Removed block.hash - JOIN from blocks table when needed
       txValues.push([
         prep.tx.txid,
         block.height,
-        block.hash,
         block.time,
         prep.tx.version,
         prep.tx.locktime,
@@ -876,34 +1964,49 @@ export class BlockIndexer {
     }
 
     // 1. Batch insert all transactions
+    // PHASE 3: txid is BYTEA - use decode() for first parameter
     if (txValues.length > 0) {
       const placeholders = txValues.map((_, i) => {
-        const offset = i * 15;
-        return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}, $${offset + 13}, $${offset + 14}, $${offset + 15})`;
+        const offset = i * 14;  // OPTIMIZED: 14 columns (was 15, removed block_hash)
+        // PHASE 3: decode() for txid (BYTEA)
+        return `(decode($${offset + 1}, 'hex'), $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}, $${offset + 13}, $${offset + 14})`;
       }).join(', ');
 
+      // OPTIMIZED: Removed block_hash column - JOIN from blocks table when needed
       const txQuery = `
         INSERT INTO transactions (
-          txid, block_height, block_hash, timestamp, version, locktime,
+          txid, block_height, timestamp, version, locktime,
           size, vsize, input_count, output_count, input_total, output_total,
           fee, is_coinbase, hex
         ) VALUES ${placeholders}
-        ON CONFLICT (txid) DO UPDATE SET
-          block_height = EXCLUDED.block_height,
-          block_hash = EXCLUDED.block_hash,
+        ON CONFLICT (block_height, txid) DO UPDATE SET
           timestamp = EXCLUDED.timestamp
       `;
 
       await client.query(txQuery, txValues.flat());
+
+      // Also insert into tx_lookup for fast txid -> block_height lookups on compressed data
+      // txid stored as BYTEA (decode from hex) to save ~50% space
+      const lookupPlaceholders = txValues.map((_: any, i: number) => {
+        const offset = i * 2;
+        return `(decode($${offset + 1}, 'hex'), $${offset + 2})`;
+      }).join(', ');
+
+      const lookupValues = txValues.map((txVals: any[]) => [txVals[0], txVals[1]]); // txid, block_height
+      await client.query(
+        `INSERT INTO tx_lookup (txid, block_height) VALUES ${lookupPlaceholders} ON CONFLICT (txid) DO NOTHING`,
+        lookupValues.flat()
+      );
     }
 
     // 2. Prepare temp table for spent UTXOs (create and populate BEFORE creating new UTXOs)
     // This fixes same-block create-and-spend bug: UTXOs created and spent in the same block
     // must be created first, then marked as spent.
+    // PHASE 3: Uses BYTEA for txid columns
     if (utxosToSpend.length > 0) {
       // Drop and recreate to ensure PRIMARY KEY is always present
       await client.query('DROP TABLE IF EXISTS temp_spent_utxos');
-      await client.query('CREATE TEMP TABLE temp_spent_utxos (txid TEXT, vout INT, spent_txid TEXT, spent_block_height INT, PRIMARY KEY (txid, vout)) ON COMMIT DROP');
+      await client.query('CREATE TEMP TABLE temp_spent_utxos (txid BYTEA, vout INT, spent_txid BYTEA, spent_block_height INT, PRIMARY KEY (txid, vout)) ON COMMIT DROP');
 
       // PostgreSQL has a parameter limit of 32767 (int16 max), and each spent UTXO has 4 fields
       // To be safe, chunk at 8000 UTXOs per query (8000 * 4 = 32000 parameters < 32767 limit)
@@ -913,9 +2016,10 @@ export class BlockIndexer {
         const chunk = utxosToSpend.slice(i, i + spendChunkSize);
         const flatValues = chunk.flat();
 
+        // PHASE 3: Use decode() for BYTEA txid columns
         const spendPlaceholders = chunk.map((_, idx) => {
           const offset = idx * 4;
-          return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4})`;
+          return `(decode($${offset + 1}, 'hex'), $${offset + 2}, decode($${offset + 3}, 'hex'), $${offset + 4})`;
         }).join(', ');
 
         await client.query(`INSERT INTO temp_spent_utxos (txid, vout, spent_txid, spent_block_height) VALUES ${spendPlaceholders} ON CONFLICT (txid, vout) DO UPDATE SET spent_txid = EXCLUDED.spent_txid, spent_block_height = EXCLUDED.spent_block_height`, flatValues);
@@ -923,7 +2027,14 @@ export class BlockIndexer {
     }
 
     // 3. Batch insert new UTXOs BEFORE marking as spent (fixes same-block create-and-spend bug)
+    // PHASE 3: Get address IDs for all addresses in this batch
     if (utxosToCreate.length > 0) {
+      // Extract unique addresses from UTXOs to create
+      const uniqueAddresses = [...new Set(utxosToCreate.map(utxo => utxo[2] as string))];
+
+      // Bulk create addresses and get ID map
+      const addressIdMap = await bulkCreateAddresses(client, uniqueAddresses, block.height);
+
       // PostgreSQL has a parameter limit of 32767 (int16 max), and each UTXO has 7 fields
       // To be safe, chunk at 4500 UTXOs per query (4500 * 7 = 31500 parameters < 32767 limit)
       const utxoChunkSize = 4500;
@@ -931,44 +2042,78 @@ export class BlockIndexer {
       for (let i = 0; i < utxosToCreate.length; i += utxoChunkSize) {
         const chunk = utxosToCreate.slice(i, i + utxoChunkSize);
 
-        const utxoPlaceholders = chunk.map((_, idx) => {
+        // PHASE 3: Build values with address_id instead of address, txid as hex string
+        const chunkValues: any[] = [];
+        for (const utxo of chunk) {
+          const addressId = addressIdMap.get(utxo[2] as string);
+          if (!addressId) {
+            throw new SyncError(`Address ID not found for address: ${utxo[2]}`, { blockHeight: block.height });
+          }
+          // [txid, vout, address_id, value, script_pubkey, script_type, block_height]
+          chunkValues.push([
+            utxo[0],      // txid (hex string - will be decoded in query)
+            utxo[1],      // vout
+            addressId,    // address_id (INTEGER)
+            utxo[3],      // value
+            utxo[4],      // script_pubkey
+            utxo[5],      // script_type
+            utxo[6],      // block_height
+          ]);
+        }
+
+        // PHASE 3: Use decode() for BYTEA txid, address_id instead of address
+        const utxoPlaceholders = chunkValues.map((_, idx) => {
           const offset = idx * 7;
-          return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, false)`;
+          return `(decode($${offset + 1}, 'hex'), $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7})`;
         }).join(', ');
 
+        // Insert into utxos_unspent (split table for unspent UTXOs)
+        // PHASE 3: address_id (INTEGER) instead of address (TEXT)
         const utxoQuery = `
-          INSERT INTO utxos (
-            txid, vout, address, value, script_pubkey, script_type, block_height, spent
+          INSERT INTO utxos_unspent (
+            txid, vout, address_id, value, script_pubkey, script_type, block_height
           ) VALUES ${utxoPlaceholders}
           ON CONFLICT (txid, vout) DO UPDATE SET
-            address = EXCLUDED.address,
+            address_id = EXCLUDED.address_id,
             value = EXCLUDED.value,
             script_pubkey = EXCLUDED.script_pubkey,
             script_type = EXCLUDED.script_type,
-            block_height = EXCLUDED.block_height,
-            spent = EXCLUDED.spent
+            block_height = EXCLUDED.block_height
         `;
 
-        await client.query(utxoQuery, chunk.flat());
+        await client.query(utxoQuery, chunkValues.flat());
       }
     }
 
     // 4. NOW mark UTXOs as spent (after they've been created in step 3)
+    // Move from utxos_unspent to utxos_spent
+    // PHASE 3: Uses address_id and BYTEA txid (both tables already have matching types)
     if (utxosToSpend.length > 0) {
+      // Insert into utxos_spent from utxos_unspent + temp spend info
+      // PHASE 3: Uses address_id instead of address
       await client.query(`
-        UPDATE utxos
-        SET spent = true,
-            spent_txid = temp.spent_txid,
-            spent_block_height = temp.spent_block_height,
-            spent_at = NOW()
-        FROM temp_spent_utxos temp
-        WHERE utxos.txid = temp.txid AND utxos.vout = temp.vout
+        INSERT INTO utxos_spent (
+          txid, vout, address_id, value, script_pubkey, script_type, block_height,
+          spent_txid, spent_block_height, created_at, spent_at
+        )
+        SELECT
+          u.txid, u.vout, u.address_id, u.value, u.script_pubkey, u.script_type, u.block_height,
+          temp.spent_txid, temp.spent_block_height, u.created_at, NOW()
+        FROM utxos_unspent u
+        INNER JOIN temp_spent_utxos temp ON u.txid = temp.txid AND u.vout = temp.vout
+        ON CONFLICT (spent_block_height, txid, vout) DO NOTHING
+      `);
+
+      // Delete from utxos_unspent
+      await client.query(`
+        DELETE FROM utxos_unspent u
+        USING temp_spent_utxos temp
+        WHERE u.txid = temp.txid AND u.vout = temp.vout
       `);
     }
 
     // 5. Refresh address transaction cache with correct net flows
     await this.updateAddressTransactionsCache(client, block, txAddressTotals);
-    await this.updateTransactionParticipants(client, txParticipants);
 
     // 6. Batch process FluxNode transactions (if any)
     if (fluxnodeTransactions.length > 0) {
@@ -980,470 +2125,24 @@ export class BlockIndexer {
         fluxnodeTxs: fluxnodeCount
       });
     }
-  }
 
-  /**
-   * Index a transaction
-   */
-  private async indexTransaction(
-    client: PoolClient,
-    tx: Transaction,
-    block: Block,
-    txIndex: number
-  ): Promise<void> {
-    // Defensive check: ensure tx.vin and tx.vout are arrays
-    if (!Array.isArray(tx.vin) || !Array.isArray(tx.vout)) {
-      logger.error('Transaction has invalid vin/vout structure, cannot index', {
-        txid: tx.txid,
-        hasVin: !!tx.vin,
-        hasVout: !!tx.vout,
-        vinType: typeof tx.vin,
-        voutType: typeof tx.vout,
-        blockHeight: block.height,
-      });
-      throw new SyncError('Transaction has invalid vin/vout structure', { txid: tx.txid });
-    }
+    // Track totals for memory profiling
+    totalTxProcessed += transactions.length;
+    totalUtxosCreated += utxosToCreate.length;
 
-    const MAX_BIGINT = BigInt('9223372036854775807');
-    let inputTotal = BigInt(0);
-
-    if (tx.vin.length > 0 && !tx.vin[0].coinbase) {
-      for (const input of tx.vin) {
-        if (!input.txid || input.vout === undefined) continue;
-
-        let value: bigint | null = null;
-
-        const result = await client.query(
-          'SELECT value FROM utxos WHERE txid = $1 AND vout = $2',
-          [input.txid, input.vout]
-        );
-
-        if (result.rows.length > 0) {
-          value = BigInt(result.rows[0].value);
-        } else {
-          try {
-            const rawTx = await this.rpc.getRawTransaction(input.txid, true) as Transaction;
-            const referencedOutput = rawTx?.vout?.[input.vout];
-            if (referencedOutput && typeof referencedOutput.value === 'number') {
-              // Clamp negative values (e.g., -1 for shielded outputs) to avoid bigint overflow
-              const clampedValue = referencedOutput.value < 0 ? 0 : referencedOutput.value;
-              value = BigInt(Math.round(clampedValue * 1e8));
-            }
-          } catch (error: any) {
-            logger.warn('Failed to hydrate input value while indexing transaction', {
-              txid: tx.txid,
-              inputTxid: input.txid,
-              vout: input.vout,
-              error: error.message,
-            });
-          }
-        }
-
-        if (value !== null) {
-          inputTotal += value;
-        }
-      }
-    }
-
-    let outputTotal = tx.vout.reduce((sum, output) => {
-      if (typeof output.value !== 'number') {
-        return sum;
-      }
-      // Clamp negative values (e.g., -1 for shielded outputs) to 0
-      const clampedValue = output.value < 0 ? 0 : output.value;
-      return sum + BigInt(Math.round(clampedValue * 1e8));
-    }, BigInt(0));
-
-    // Clamp outputTotal to PostgreSQL bigint max
-    if (outputTotal > MAX_BIGINT) {
-      logger.error('Transaction outputTotal exceeds PostgreSQL bigint max, clamping', {
-        txid: tx.txid,
-        outputTotal: outputTotal.toString(),
-        outputTotalFlux: (Number(outputTotal) / 1e8).toFixed(2),
-        clampedTo: MAX_BIGINT.toString(),
-        blockHeight: block.height,
-        outputCount: tx.vout.length,
-      });
-      outputTotal = MAX_BIGINT;
-    }
-
-    const isCoinbase = tx.vin.length > 0 && !!tx.vin[0].coinbase;
-
-    // Calculate fee correctly for shielded transactions
-    // For shielded transactions: fee = inputs - outputs + shieldedPoolChange
-    // where shieldedPoolChange accounts for coins moving between transparent and shielded pools
-    let shieldedPoolChange = BigInt(0);
-
-    // Parse shielded data from hex for v2/v4 transactions (RPC doesn't include vjoinsplit)
-    if (tx.version === 2 || tx.version === 4) {
-      try {
-        const { parseTransactionShieldedData } = await import('../parsers/block-parser');
-        let txHex = tx.hex;
-
-        // Try to get transaction hex if not available
-        if (!txHex) {
-          try {
-            const txData = await this.rpc.getRawTransaction(tx.txid, true);
-            txHex = (txData as any).hex;
-          } catch (error) {
-            logger.warn('Failed to fetch transaction hex for fee calculation', {
-              txid: tx.txid,
-              error: (error as Error).message,
-            });
-          }
-        }
-
-        if (txHex) {
-          const parsed = parseTransactionShieldedData(txHex);
-
-          // V4 Sapling valueBalance
-          if (tx.version === 4 && parsed.valueBalance !== undefined) {
-            shieldedPoolChange = parsed.valueBalance;
-          }
-
-          // V2/V4 JoinSplits
-          if (parsed.vjoinsplit && parsed.vjoinsplit.length > 0) {
-            let joinSplitChange = BigInt(0);
-            for (const joinSplit of parsed.vjoinsplit) {
-              joinSplitChange += joinSplit.vpub_old - joinSplit.vpub_new;
-            }
-            shieldedPoolChange += joinSplitChange;
-          }
-        }
-      } catch (error) {
-        logger.warn('Failed to parse shielded data for fee calculation', {
-          txid: tx.txid,
-          error: (error as Error).message,
-        });
-
-        // Fallback to RPC data if parsing fails
-        if (tx.version === 4 && tx.valueBalance !== undefined) {
-          shieldedPoolChange = BigInt(Math.round(tx.valueBalance * 1e8));
-        }
-
-        if ((tx.version === 2 || tx.version === 4) && tx.vjoinsplit && Array.isArray(tx.vjoinsplit)) {
-          let joinSplitChange = BigInt(0);
-          for (const joinSplit of tx.vjoinsplit) {
-            const vpubOld = BigInt(Math.round((joinSplit.vpub_old || 0) * 1e8));
-            const vpubNew = BigInt(Math.round((joinSplit.vpub_new || 0) * 1e8));
-            joinSplitChange += vpubOld - vpubNew;
-          }
-          shieldedPoolChange += joinSplitChange;
-        }
-      }
-    }
-
-    // Correct fee formula: fee = inputs - outputs - shieldedPoolChange
-    // We SUBTRACT shieldedPoolChange because:
-    // - When shielding: vpub_old - vpub_new is negative, subtracting it adds to fee (cancels out the shielded amount)
-    // - When deshielding: vpub_old - vpub_new is positive, subtracting it reduces fee (cancels out the deshielded amount)
-    const fee = isCoinbase ? BigInt(0) : inputTotal - outputTotal - shieldedPoolChange;
-    const safeFee = !isCoinbase && fee < BigInt(0) ? BigInt(0) : fee;
-
-    // Insert transaction
-    const txQuery = `
-      INSERT INTO transactions (
-        txid, block_height, block_hash, timestamp, version, locktime,
-        size, vsize, input_count, output_count, input_total, output_total,
-        fee, is_coinbase, hex
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-      ON CONFLICT (txid) DO UPDATE SET
-        block_height = EXCLUDED.block_height,
-        block_hash = EXCLUDED.block_hash,
-        timestamp = EXCLUDED.timestamp
-    `;
-
-    const txValues = [
-      tx.txid,
-      block.height,
-      block.hash,
-      block.time,
-      tx.version,
-      tx.locktime,
-      tx.size,
-      tx.vsize || tx.size,
-      tx.vin.length,
-      tx.vout.length,
-      this.safeBigIntToString(inputTotal, `tx:${tx.txid}:inputTotal`),
-      this.safeBigIntToString(outputTotal, `tx:${tx.txid}:outputTotal`),
-      this.safeBigIntToString(safeFee, `tx:${tx.txid}:fee`),
-      isCoinbase,
-      tx.hex || null,
-    ];
-
-    await client.query(txQuery, txValues);
-
-    // Process inputs (spend UTXOs)
-    for (const input of tx.vin) {
-      if (input.coinbase) continue; // Skip coinbase inputs
-
-      if (input.txid && input.vout !== undefined) {
-        await this.spendUTXO(client, input.txid, input.vout, tx.txid, block.height);
-      }
-    }
-
-    // Process outputs (create UTXOs)
-    for (const output of tx.vout) {
-      await this.createUTXO(client, tx.txid, output, block.height);
-    }
-  }
-
-  /**
-   * Create a new UTXO
-   */
-  private async createUTXO(
-    client: PoolClient,
-    txid: string,
-    output: any,
-    blockHeight: number
-  ): Promise<void> {
-    const address = output.scriptPubKey?.addresses?.[0];
-    // For outputs without addresses (shielded/OP_RETURN), use a placeholder address
-    const utxoAddress = address || 'SHIELDED_OR_NONSTANDARD';
-
-    // Flux/Zcash can have -1 for shielded outputs or invalid values
-    // Clamp negative values to 0 to avoid bigint overflow
-    const rawValue = output.value || 0;
-    const clampedValue = rawValue < 0 ? 0 : rawValue;
-    const value = BigInt(Math.round(clampedValue * 1e8));
-
-    const query = `
-      INSERT INTO utxos (
-        txid, vout, address, value, script_pubkey, script_type, block_height, spent
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, false)
-      ON CONFLICT (txid, vout) DO UPDATE SET
-        address = EXCLUDED.address,
-        value = EXCLUDED.value,
-        script_pubkey = EXCLUDED.script_pubkey,
-        script_type = EXCLUDED.script_type,
-        block_height = EXCLUDED.block_height,
-        spent = EXCLUDED.spent
-    `;
-
-    const values = [
-      txid,
-      output.n,
-      utxoAddress,
-      this.safeBigIntToString(value, `utxo:${txid}:${output.n}`),
-      output.scriptPubKey?.hex || '',
-      output.scriptPubKey?.type || 'unknown',
-      blockHeight,
-    ];
-
-    await client.query(query, values);
-
-    // Only update address summary for real addresses, not shielded placeholders
-    if (address && !this.skipAddressSummary) {
-      await this.updateAddressSummary(client, address);
-    }
-  }
-
-  /**
-   * Mark a UTXO as spent
-   */
-  private async spendUTXO(
-    client: PoolClient,
-    txid: string,
-    vout: number,
-    spentTxid: string,
-    spentBlockHeight: number
-  ): Promise<void> {
-    const query = `
-      UPDATE utxos
-      SET spent = true,
-          spent_txid = $3,
-          spent_block_height = $4,
-          spent_at = NOW()
-      WHERE txid = $1 AND vout = $2
-      RETURNING address
-    `;
-
-    const result = await client.query(query, [txid, vout, spentTxid, spentBlockHeight]);
-
-    // Update address summary if UTXO was found
-    if (result.rows.length > 0 && !this.skipAddressSummary) {
-      const address = result.rows[0].address;
-      await this.updateAddressSummary(client, address);
-    }
-  }
-
-  /**
-   * Index FluxNode transaction (version 3, 5, or 6)
-   */
-  private async indexFluxNodeTransaction(
-    client: PoolClient,
-    tx: Transaction,
-    block: Block
-  ): Promise<void> {
-    try {
-      const txAny = tx as any;
-
-      // Check if daemon provided FluxNode-specific fields
-      const hasDaemonParsedFields = txAny.nType !== undefined;
-
-      logger.debug('Indexing FluxNode transaction', {
-        txid: tx.txid,
-        version: tx.version,
-        hasDaemonFields: hasDaemonParsedFields,
-        nType: txAny.nType,
-        ip: txAny.ip
-      });
-
-      // Get hex for storage and potential parsing
-      let txHex: string | null = tx.hex || null;
-
-      if (!txHex) {
-        // Try to extract from raw block
-        const rawBlockHex = await this.rpc.getBlock(block.hash, 0) as unknown as string;
-        txHex = extractFluxNodeTransaction(rawBlockHex, tx.txid, block.height);
-
-        if (!txHex) {
-          logger.error('Could not get hex for FluxNode transaction, skipping', {
-            txid: tx.txid
-          });
-          return;
-        }
-      }
-
-      // If daemon didn't parse the fields, parse them ourselves from hex
-      if (!hasDaemonParsedFields && txHex) {
-        logger.debug('Daemon did not parse FluxNode fields, parsing from hex', {
-          txid: tx.txid
-        });
-
-        const { parseFluxNodeTransaction } = await import('../parsers/fluxnode-parser');
-        const parsedData = parseFluxNodeTransaction(txHex);
-
-        if (parsedData) {
-          // Merge parsed data into tx object
-          txAny.nType = parsedData.type;
-          txAny.collateralOutputHash = parsedData.collateralHash;
-          txAny.collateralOutputIndex = parsedData.collateralIndex;
-          txAny.ip = parsedData.ipAddress;
-          txAny.zelnodePubKey = parsedData.publicKey;
-          txAny.sig = parsedData.signature;
-          txAny.benchmarkTier = parsedData.benchmarkTier;
-
-          logger.debug('Successfully parsed FluxNode transaction from hex', {
-            txid: tx.txid,
-            nType: parsedData.type
-          });
-        } else {
-          logger.error('Failed to parse FluxNode transaction from hex', {
-            txid: tx.txid
-          });
-          return;
-        }
-      }
-
-      // Determine benchmark tier from collateral for start transactions
-      let benchmarkTier: string | null = txAny.benchmarkTier || null;
-
-      if (!benchmarkTier && txAny.collateralOutputHash && txAny.collateralOutputIndex !== undefined) {
-        // Look up collateral UTXO to get amount
-        const utxoResult = await client.query(
-          'SELECT value FROM utxos WHERE txid = $1 AND vout = $2',
-          [txAny.collateralOutputHash, txAny.collateralOutputIndex]
-        );
-
-        if (utxoResult.rows.length > 0) {
-          const collateralAmount = BigInt(utxoResult.rows[0].value);
-          benchmarkTier = determineFluxNodeTier(collateralAmount);
-        }
-      }
-
-      // Insert into fluxnode_transactions table
-      await client.query(
-        `INSERT INTO fluxnode_transactions (
-          txid, block_height, block_hash, block_time, version, type,
-          collateral_hash, collateral_index, ip_address, public_key, signature,
-          p2sh_address, benchmark_tier, extra_data, raw_hex
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-        ON CONFLICT (txid) DO UPDATE SET
-          block_height = EXCLUDED.block_height,
-          block_hash = EXCLUDED.block_hash,
-          block_time = EXCLUDED.block_time,
-          version = EXCLUDED.version,
-          type = EXCLUDED.type,
-          collateral_hash = EXCLUDED.collateral_hash,
-          collateral_index = EXCLUDED.collateral_index,
-          ip_address = EXCLUDED.ip_address,
-          public_key = EXCLUDED.public_key,
-          signature = EXCLUDED.signature,
-          p2sh_address = EXCLUDED.p2sh_address,
-          benchmark_tier = EXCLUDED.benchmark_tier,
-          extra_data = EXCLUDED.extra_data,
-          raw_hex = EXCLUDED.raw_hex`,
-        [
-          tx.txid,
-          block.height,
-          block.hash,
-          new Date(block.time * 1000),
-          tx.version,
-          txAny.nType ?? null,
-          txAny.collateralOutputHash || null,
-          txAny.collateralOutputIndex ?? null,
-          txAny.ip || null,
-          txAny.zelnodePubKey || txAny.fluxnodePubKey || null,
-          txAny.sig || null,
-          txAny.redeemScript || null,
-          benchmarkTier,
-          JSON.stringify({
-            sigTime: txAny.sigTime,
-            benchmarkSigTime: txAny.benchmarkSigTime,
-            updateType: txAny.updateType,
-            nFluxNodeTxVersion: txAny.nFluxNodeTxVersion
-          }),
-          txHex || '',
-        ]
-      );
-
-      // Also insert a basic entry in transactions table for consistency
-      await client.query(
-        `INSERT INTO transactions (
-          txid, block_height, block_hash, timestamp, version, locktime,
-          size, vsize, input_count, output_count, input_total, output_total,
-          fee, is_coinbase, hex, is_fluxnode_tx, fluxnode_type
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-        ON CONFLICT (txid) DO UPDATE SET
-          is_fluxnode_tx = TRUE,
-          fluxnode_type = EXCLUDED.fluxnode_type,
-          hex = EXCLUDED.hex`,
-        [
-          tx.txid,
-          block.height,
-          block.hash,
-          block.time, // INTEGER unix timestamp, not Date object!
-          tx.version,
-          tx.locktime || 0,
-          tx.size || (txHex ? txHex.length / 2 : 0),
-          tx.vsize || (txHex ? txHex.length / 2 : 0),
-          0, // No standard inputs
-          0, // No standard outputs
-          '0',
-          '0',
-          '0',
-          false,
-          txHex || '',
-          true, // is_fluxnode_tx
-          txAny.nType ?? null,
-        ]
-      );
-
-      logger.debug('Successfully indexed FluxNode transaction', {
-        txid: tx.txid,
-        version: tx.version,
-        nType: txAny.nType,
-        tier: benchmarkTier,
-        ip: txAny.ip
-      });
-    } catch (error: any) {
-      logger.error('Failed to index FluxNode transaction', {
-        txid: tx.txid,
-        error: error.message,
-      });
-      throw error;
-    }
+    // 7. Explicitly clear all intermediate structures to help GC
+    // This prevents memory buildup from large transactions/blocks
+    utxoInfoMap.clear();
+    txAddressTotals.clear();
+    txParticipants.clear();
+    txMap.clear();
+    parsedJoinSplitsMap.clear();
+    parsedValueBalanceMap.clear();
+    txValues.length = 0;
+    utxosToCreate.length = 0;
+    utxosToSpend.length = 0;
+    txPreparations.length = 0;
+    fluxnodeTransactions.length = 0;
   }
 
   /**
@@ -1563,7 +2262,8 @@ export class BlockIndexer {
 
     for (const tx of fluxnodeTxs) {
       const txAny = tx as any;
-      const txHex = tx.hex || '';
+      // Use hex for size calculation but don't store it (saves ~30GB)
+      const txHexForSize = tx.hex || '';
 
       // Determine tier from map or existing value
       let benchmarkTier: string | null = txAny.benchmarkTier || null;
@@ -1572,10 +2272,10 @@ export class BlockIndexer {
       }
 
       // FluxNode transactions table
+      // OPTIMIZED: Removed block.hash - JOIN from blocks table when needed
       fluxnodeTxValues.push([
         tx.txid,
         block.height,
-        block.hash,
         new Date(block.time * 1000),
         tx.version,
         txAny.nType ?? null,
@@ -1592,47 +2292,47 @@ export class BlockIndexer {
           updateType: txAny.updateType,
           nFluxNodeTxVersion: txAny.nFluxNodeTxVersion
         }),
-        txHex,
       ]);
 
-      // Regular transactions table
+      // Regular transactions table - store null for hex (fetched on-demand via API)
+      // OPTIMIZED: Removed block.hash - JOIN from blocks table when needed
       regularTxValues.push([
         tx.txid,
         block.height,
-        block.hash,
         block.time,
         tx.version,
         tx.locktime || 0,
-        tx.size || (txHex ? txHex.length / 2 : 0),
-        tx.vsize || (txHex ? txHex.length / 2 : 0),
+        tx.size || (txHexForSize ? txHexForSize.length / 2 : 0),
+        tx.vsize || (txHexForSize ? txHexForSize.length / 2 : 0),
         0, // input_count
         0, // output_count
         '0', // input_total
         '0', // output_total
         '0', // fee
         false, // is_coinbase
-        txHex,
+        null, // hex - not stored during sync, fetched on-demand via API
         true, // is_fluxnode_tx
         txAny.nType ?? null,
       ]);
     }
 
     // Step 5: Batch insert into fluxnode_transactions table
+    // OPTIMIZED: Removed block_hash column - JOIN from blocks table when needed
+    // PHASE 3: txid is BYTEA - use decode() for first parameter
     if (fluxnodeTxValues.length > 0) {
       const placeholders = fluxnodeTxValues.map((_, i) => {
-        const offset = i * 15;
-        return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}, $${offset + 13}, $${offset + 14}, $${offset + 15})`;
+        const offset = i * 13;  // OPTIMIZED: 13 columns (was 14, removed block_hash)
+        // PHASE 3: decode() for txid (BYTEA)
+        return `(decode($${offset + 1}, 'hex'), $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}, $${offset + 13})`;
       }).join(', ');
 
       await client.query(
         `INSERT INTO fluxnode_transactions (
-          txid, block_height, block_hash, block_time, version, type,
+          txid, block_height, block_time, version, type,
           collateral_hash, collateral_index, ip_address, public_key, signature,
-          p2sh_address, benchmark_tier, extra_data, raw_hex
+          p2sh_address, benchmark_tier, extra_data
         ) VALUES ${placeholders}
-        ON CONFLICT (txid) DO UPDATE SET
-          block_height = EXCLUDED.block_height,
-          block_hash = EXCLUDED.block_hash,
+        ON CONFLICT (block_height, txid) DO UPDATE SET
           block_time = EXCLUDED.block_time,
           version = EXCLUDED.version,
           type = EXCLUDED.type,
@@ -1643,30 +2343,45 @@ export class BlockIndexer {
           signature = EXCLUDED.signature,
           p2sh_address = EXCLUDED.p2sh_address,
           benchmark_tier = EXCLUDED.benchmark_tier,
-          extra_data = EXCLUDED.extra_data,
-          raw_hex = EXCLUDED.raw_hex`,
+          extra_data = EXCLUDED.extra_data`,
         fluxnodeTxValues.flat()
       );
     }
 
     // Step 6: Batch insert into transactions table
+    // OPTIMIZED: Removed block_hash column - JOIN from blocks table when needed
+    // PHASE 3: txid is BYTEA - use decode() for first parameter
     if (regularTxValues.length > 0) {
       const placeholders = regularTxValues.map((_, i) => {
-        const offset = i * 17;
-        return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}, $${offset + 13}, $${offset + 14}, $${offset + 15}, $${offset + 16}, $${offset + 17})`;
+        const offset = i * 16;  // OPTIMIZED: 16 columns (was 17, removed block_hash)
+        // PHASE 3: decode() for txid (BYTEA)
+        return `(decode($${offset + 1}, 'hex'), $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}, $${offset + 13}, $${offset + 14}, $${offset + 15}, $${offset + 16})`;
       }).join(', ');
 
       await client.query(
         `INSERT INTO transactions (
-          txid, block_height, block_hash, timestamp, version, locktime,
+          txid, block_height, timestamp, version, locktime,
           size, vsize, input_count, output_count, input_total, output_total,
           fee, is_coinbase, hex, is_fluxnode_tx, fluxnode_type
         ) VALUES ${placeholders}
-        ON CONFLICT (txid) DO UPDATE SET
+        ON CONFLICT (block_height, txid) DO UPDATE SET
           is_fluxnode_tx = TRUE,
           fluxnode_type = EXCLUDED.fluxnode_type,
           hex = EXCLUDED.hex`,
         regularTxValues.flat()
+      );
+
+      // Also insert into tx_lookup for fast txid -> block_height lookups on compressed data
+      // txid stored as BYTEA (decode from hex) to save ~50% space
+      const lookupPlaceholders = regularTxValues.map((_: any, i: number) => {
+        const offset = i * 2;
+        return `(decode($${offset + 1}, 'hex'), $${offset + 2})`;
+      }).join(', ');
+
+      const lookupValues = regularTxValues.map((txVals: any[]) => [txVals[0], txVals[1]]); // txid, block_height
+      await client.query(
+        `INSERT INTO tx_lookup (txid, block_height) VALUES ${lookupPlaceholders} ON CONFLICT (txid) DO NOTHING`,
+        lookupValues.flat()
       );
     }
 
@@ -1674,13 +2389,6 @@ export class BlockIndexer {
       count: fluxnodeTxs.length,
       blockHeight: block.height
     });
-  }
-
-  /**
-   * Update address summary statistics
-   */
-  private async updateAddressSummary(client: PoolClient, address: string): Promise<void> {
-    await client.query('SELECT update_address_summary($1)', [address]);
   }
 
   /**
@@ -1709,8 +2417,12 @@ export class BlockIndexer {
 
     if (entries.length === 0) return;
 
-    // PostgreSQL has a parameter limit of 32767 (int16 max), and each entry has 8 fields
-    // To be safe, chunk at 4000 entries per query (4000 * 8 = 32000 parameters < 32767 limit)
+    // PHASE 3: Get address IDs for all addresses in this batch
+    const uniqueAddresses = [...new Set(entries.map(e => e.address))];
+    const addressIdMap = await bulkCreateAddresses(client, uniqueAddresses, block.height);
+
+    // PostgreSQL has a parameter limit of 32767 (int16 max), and each entry has 7 fields
+    // To be safe, chunk at 4000 entries per query (4000 * 7 = 28000 parameters < 32767 limit)
     const chunkSize = 4000;
 
     for (let i = 0; i < entries.length; i += chunkSize) {
@@ -1720,9 +2432,16 @@ export class BlockIndexer {
       const MAX_BIGINT = BigInt('9223372036854775807');
       const WARN_THRESHOLD = MAX_BIGINT / BigInt(2); // Warn if over half of max
 
+      // PHASE 3: 7 columns - address_id (INTEGER) instead of address (TEXT), txid as BYTEA
       const placeholders = chunk.map((entry, index) => {
-        const base = index * 8;
+        const base = index * 7;
         const direction = entry.received >= entry.sent ? 'received' : 'sent';
+
+        // Get address_id for this entry
+        const addressId = addressIdMap.get(entry.address);
+        if (!addressId) {
+          throw new SyncError(`Address ID not found for address: ${entry.address}`, { blockHeight: block.height });
+        }
 
         // Clamp values to PostgreSQL bigint max before inserting
         let clampedReceived = entry.received;
@@ -1763,86 +2482,39 @@ export class BlockIndexer {
           clampedSent = MAX_BIGINT;
         }
 
+        // PHASE 3: address_id (INTEGER) instead of address (TEXT), txid will be decoded
         params.push(
-          entry.address,
+          addressId,
           entry.txid,
           block.height,
           block.time,
-          block.hash,
           direction,
           clampedReceived.toString(),
           clampedSent.toString()
         );
-        return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8})`;
+        // PHASE 3: decode() for txid (BYTEA)
+        return `($${base + 1}, decode($${base + 2}, 'hex'), $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7})`;
       }).join(', ');
 
+      // PHASE 3: address_id (INTEGER) instead of address (TEXT), txid (BYTEA)
       const sql = `
         INSERT INTO address_transactions (
-          address,
+          address_id,
           txid,
           block_height,
           timestamp,
-          block_hash,
           direction,
           received_value,
           sent_value
         ) VALUES ${placeholders}
-        ON CONFLICT (block_height, address, txid) DO UPDATE SET
+        ON CONFLICT (block_height, address_id, txid) DO UPDATE SET
           timestamp      = EXCLUDED.timestamp,
-          block_hash     = EXCLUDED.block_hash,
           direction      = EXCLUDED.direction,
           received_value = EXCLUDED.received_value,
           sent_value     = EXCLUDED.sent_value;
       `;
 
       await client.query(sql, params);
-    }
-  }
-
-  /**
-   * Upsert deduplicated input/output address sets for each transaction.
-   */
-  private async updateTransactionParticipants(
-    client: PoolClient,
-    participants: Map<string, { inputs: Set<string>; outputs: Set<string> }>
-  ): Promise<void> {
-    if (participants.size === 0) return;
-
-    const entries = Array.from(participants.entries());
-    const chunkSize = 500;
-    const addressLimit = 64;
-
-    for (let i = 0; i < entries.length; i += chunkSize) {
-      const chunk = entries.slice(i, i + chunkSize);
-      const params: Array<any> = [];
-      const placeholders = chunk.map((entry, index) => {
-        const base = index * 5;
-        const inputs = Array.from(entry[1].inputs);
-        const outputs = Array.from(entry[1].outputs);
-        params.push(
-          entry[0],
-          inputs.slice(0, addressLimit),
-          inputs.length,
-          outputs.slice(0, addressLimit),
-          outputs.length
-        );
-        return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`;
-      }).join(', ');
-
-      if (!placeholders) continue;
-
-      await client.query(
-        `
-          INSERT INTO transaction_participants (txid, input_addresses, input_count, output_addresses, output_count)
-          VALUES ${placeholders}
-          ON CONFLICT (txid) DO UPDATE SET
-            input_addresses = EXCLUDED.input_addresses,
-            input_count = EXCLUDED.input_count,
-            output_addresses = EXCLUDED.output_addresses,
-            output_count = EXCLUDED.output_count
-        `,
-        params
-      );
     }
   }
 
@@ -1987,15 +2659,16 @@ export class BlockIndexer {
       // V2 and V4 transactions with JoinSplits (Sprout shielded operations)
       // V4 transactions can contain BOTH JoinSplits (Sprout) AND valueBalance (Sapling)
       if (tx.version === 2 || tx.version === 4) {
-        // CRITICAL: Prefer RPC data over parsed data
-        // The hex parser can misread large FluxNode transactions and produce garbage JoinSplits
-        let joinsplits: any[] | undefined = tx.vjoinsplit;
-        let usingParsedData = false;
+        // CRITICAL: Prefer parsed hex data over RPC data
+        // Parsed hex gives satoshi-level precision; RPC returns floats which lose precision
+        // This must match the fast sync logic (indexBlocksBatch) for consistent supply calculation
+        let joinsplits: any[] | undefined = parsedVpubs as any[] | undefined;
+        let usingParsedData = joinsplits && joinsplits.length > 0;
 
-        // Only use parsed data if RPC didn't provide JoinSplit data
-        if ((!joinsplits || joinsplits.length === 0) && parsedVpubs && parsedVpubs.length > 0) {
-          joinsplits = parsedVpubs as any[];
-          usingParsedData = true;
+        // Fall back to RPC data if parsing didn't provide JoinSplit data
+        if ((!joinsplits || joinsplits.length === 0) && tx.vjoinsplit && tx.vjoinsplit.length > 0) {
+          joinsplits = tx.vjoinsplit;
+          usingParsedData = false;
         }
 
         if (joinsplits && Array.isArray(joinsplits)) {
@@ -2055,9 +2728,10 @@ export class BlockIndexer {
         }
       }
 
-      // V4 Sapling transactions with valueBalance - use parsed or existing data
+      // V4 Sapling transactions with valueBalance - prefer parsed data (matches fast sync logic)
       if (tx.version === 4) {
-        const vBalance = tx.valueBalance ?? parsedValueBalance;
+        // CRITICAL: Prefer parsed hex data over RPC data for consistency with fast sync
+        const vBalance = parsedValueBalance ?? tx.valueBalance;
         if (vBalance !== undefined) {
           // Standard Zcash/Flux Sapling semantics:
           // Positive valueBalance = value leaving shielded pool (pool decreases)
@@ -2094,37 +2768,61 @@ export class BlockIndexer {
       }
     }
 
-    // Get previous shielded pool value
+    // Calculate coinbase reward from transactions (must match fast sync logic)
+    let coinbaseReward = BigInt(0);
+    for (const tx of transactions) {
+      const isCoinbase = tx.vin && tx.vin.length > 0 && !!tx.vin[0].coinbase;
+      if (isCoinbase && tx.vout) {
+        for (const output of tx.vout) {
+          const satoshis = this.toSatoshis(output.value);
+          if (satoshis !== null) {
+            coinbaseReward += satoshis;
+          }
+        }
+        break; // Only one coinbase per block
+      }
+    }
+
+    // Get previous supply state (must match fast sync query)
     const prevQuery = `
-      SELECT shielded_pool
+      SELECT transparent_supply, shielded_pool
       FROM supply_stats
       WHERE block_height < $1
       ORDER BY block_height DESC
       LIMIT 1
     `;
     const prevResult = await client.query(prevQuery, [blockHeight]);
-    const prevShieldedPool = prevResult.rows[0]?.shielded_pool
+    let transparentSupply = prevResult.rows[0]?.transparent_supply
+      ? BigInt(prevResult.rows[0].transparent_supply)
+      : BigInt(0);
+    let shieldedPool = prevResult.rows[0]?.shielded_pool
       ? BigInt(prevResult.rows[0].shielded_pool)
       : BigInt(0);
 
-    // Calculate new shielded pool
-    const newShieldedPool = prevShieldedPool + shieldedPoolChange;
+    // Calculate new supply values (must match fast sync formulas exactly)
+    // transparent_supply += coinbaseReward - shieldedPoolChange
+    // shielded_pool += shieldedPoolChange
+    transparentSupply += coinbaseReward - shieldedPoolChange;
+    shieldedPool += shieldedPoolChange;
+    const totalSupply = transparentSupply + shieldedPool;
 
-    // Insert supply stats for this block
-    // Note: transparent_supply and total_supply are calculated on-demand by the API
-    // to avoid expensive SUM queries on every block during indexing
+    // Insert supply stats for this block (must match fast sync insert)
     const insertQuery = `
       INSERT INTO supply_stats (
         block_height, transparent_supply, shielded_pool, total_supply, updated_at
-      ) VALUES ($1, 0, $2, 0, NOW())
+      ) VALUES ($1, $2, $3, $4, NOW())
       ON CONFLICT (block_height) DO UPDATE SET
+        transparent_supply = EXCLUDED.transparent_supply,
         shielded_pool = EXCLUDED.shielded_pool,
+        total_supply = EXCLUDED.total_supply,
         updated_at = NOW()
     `;
 
     await client.query(insertQuery, [
       blockHeight,
-      newShieldedPool.toString(),
+      this.safeBigIntToString(transparentSupply, 'transparent_supply'),
+      this.safeBigIntToString(shieldedPool, 'shielded_pool'),
+      this.safeBigIntToString(totalSupply, 'total_supply'),
     ]);
 
     // Log significant shielded pool changes
@@ -2132,7 +2830,7 @@ export class BlockIndexer {
       logger.debug('Shielded pool change detected', {
         blockHeight,
         change: shieldedPoolChange.toString(),
-        newTotal: newShieldedPool.toString(),
+        newTotal: shieldedPool.toString(),
       });
     }
   }

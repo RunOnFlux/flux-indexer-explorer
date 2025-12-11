@@ -273,7 +273,7 @@ function getApiBaseUrl(): string {
 }
 
 // Store current API base URL - will update dynamically for server vs client
-let currentApiBaseUrl = getApiBaseUrl();
+let currentApiBaseUrl: string | null = null;
 
 /**
  * Create API client with dynamic configuration
@@ -295,8 +295,17 @@ function createApiClient() {
   });
 }
 
-// Initialize API client - will be recreated as needed
-let apiClient = createApiClient();
+// Lazy-initialize API client to ensure runtime env vars are used
+// (fixes issue where module loads during build when SERVER_API_URL isn't set)
+let apiClient: ReturnType<typeof createApiClient> | null = null;
+
+function getApiClient() {
+  if (!apiClient) {
+    apiClient = createApiClient();
+    console.log('[FluxIndexer Client] API client initialized with base URL:', currentApiBaseUrl);
+  }
+  return apiClient;
+}
 
 /**
  * Recreate API client with updated configuration
@@ -306,6 +315,9 @@ export function recreateApiClient(): void {
   apiClient = createApiClient();
   console.log('[FluxIndexer Client] API client recreated with base URL:', currentApiBaseUrl);
 }
+
+// Helper to get client - ensures lazy initialization
+const api = () => getApiClient();
 
 /**
  * Update the API base URL and rebuild the client if it changed
@@ -362,7 +374,7 @@ export class FluxIndexerAPI {
    */
   static async getStatus(): Promise<NetworkStatus> {
     try {
-      const response = await apiClient.get("api/v1/status").json<FluxIndexerApiResponse>();
+      const response = await api().get("api/v1/status").json<FluxIndexerApiResponse>();
 
       const daemonInfo = response.daemon && 'blocks' in response.daemon ? response.daemon : null;
 
@@ -395,7 +407,7 @@ export class FluxIndexerAPI {
    */
   static async getBlock(hashOrHeight: string | number): Promise<Block> {
     try {
-      const response = await apiClient.get(`api/v1/blocks/${hashOrHeight}`).json<FluxIndexerBlockResponse>();
+      const response = await api().get(`api/v1/blocks/${hashOrHeight}`).json<FluxIndexerBlockResponse>();
       return convertFluxIndexerBlock(response);
     } catch (error) {
       throw new FluxIndexerAPIError(
@@ -416,7 +428,7 @@ export class FluxIndexerAPI {
   }> {
     try {
       // Try to fetch block with transaction details
-      const response = await apiClient.get(`api/v1/blocks/${hashOrHeight}`).json<FluxIndexerBlockResponse>();
+      const response = await api().get(`api/v1/blocks/${hashOrHeight}`).json<FluxIndexerBlockResponse>();
 
       return {
         block: convertFluxIndexerBlock(response),
@@ -436,7 +448,7 @@ export class FluxIndexerAPI {
    */
   static async getBlockIndex(height: number): Promise<BlockSummary> {
     try {
-      const response = await apiClient.get(`api/v1/blocks/${height}`).json<FluxIndexerBlockResponse>();
+      const response = await api().get(`api/v1/blocks/${height}`).json<FluxIndexerBlockResponse>();
       return convertFluxIndexerBlockSummary(response);
     } catch (error) {
       throw new FluxIndexerAPIError(
@@ -452,7 +464,7 @@ export class FluxIndexerAPI {
    */
   static async getBlockHash(height: number): Promise<string> {
     try {
-      const response = await apiClient.get(`api/v1/blocks/${height}`).json<FluxIndexerBlockResponse>();
+      const response = await api().get(`api/v1/blocks/${height}`).json<FluxIndexerBlockResponse>();
       return response.hash;
     } catch (error) {
       throw new FluxIndexerAPIError(
@@ -469,7 +481,7 @@ export class FluxIndexerAPI {
    */
   static async getLatestBlocks(limit: number = 10): Promise<BlockSummary[]> {
     try {
-      const response = await apiClient.get("api/v1/blocks/latest", {
+      const response = await api().get("api/v1/blocks/latest", {
         searchParams: { limit: Math.max(1, Math.min(limit, 50)).toString() },
       }).json<FluxIndexerLatestBlocksResponse>();
 
@@ -535,7 +547,7 @@ export class FluxIndexerAPI {
     const config = getApiConfig();
 
     // Get current height first
-    const statusResponse = await apiClient.get("api/v1/status").json<FluxIndexerApiResponse>();
+    const statusResponse = await api().get("api/v1/status").json<FluxIndexerApiResponse>();
     const currentHeight = statusResponse.indexer.currentHeight;
 
     // Fetch blocks starting from current height
@@ -550,7 +562,7 @@ export class FluxIndexerAPI {
       const blockPromises = [];
       for (let h = startHeight; h >= endHeight && blocks.length < limit; h--) {
         blockPromises.push(
-          apiClient
+          api()
             .get(`api/v1/blocks/${h}`)
             .json<FluxIndexerBlockResponse>()
             .then(convertFluxIndexerBlockSummary)
@@ -578,7 +590,7 @@ export class FluxIndexerAPI {
    */
   static async getTransaction(txid: string): Promise<Transaction> {
     try {
-      const response = await apiClient.get(`api/v1/transactions/${txid}`).json<FluxIndexerTransactionResponse>();
+      const response = await api().get(`api/v1/transactions/${txid}`).json<FluxIndexerTransactionResponse>();
       const tx = convertFluxIndexerTransaction(response);
 
       // Check if this is a FluxNode transaction (0 inputs, 0 outputs)
@@ -589,7 +601,7 @@ export class FluxIndexerAPI {
         if (fluxNodeData && fluxNodeData.collateralOutputHash) {
           // Fetch the collateral transaction to determine tier
           try {
-            const collateralTx = await apiClient
+            const collateralTx = await api()
               .get(`api/v1/transactions/${fluxNodeData.collateralOutputHash}`)
               .json<FluxIndexerTransactionResponse>();
 
@@ -628,11 +640,66 @@ export class FluxIndexerAPI {
   }
 
   /**
+   * Fetch multiple transactions in a single request (batch endpoint)
+   *
+   * More efficient than fetching each transaction individually.
+   * Optionally provide blockHeight if all transactions are from the same block
+   * for maximum efficiency.
+   *
+   * @param txids - Array of transaction IDs
+   * @param blockHeight - Optional block height (optimization hint)
+   * @returns Array of transactions in same order as input txids
+   */
+  static async getTransactionsBatch(
+    txids: string[],
+    blockHeight?: number
+  ): Promise<Transaction[]> {
+    try {
+      const response = await api()
+        .post("api/v1/transactions/batch", {
+          json: { txids, blockHeight },
+        })
+        .json<{ transactions: FluxIndexerTransactionResponse[] }>();
+
+      return response.transactions.map((tx) => {
+        // Handle not_found case
+        if ('error' in tx && tx.error === 'not_found') {
+          return {
+            txid: (tx as unknown as { txid: string }).txid,
+            version: 0,
+            locktime: 0,
+            vin: [],
+            vout: [],
+            blockhash: '',
+            blockheight: 0,
+            confirmations: 0,
+            time: 0,
+            blocktime: 0,
+            valueOut: 0,
+            valueIn: 0,
+            fees: 0,
+            size: 0,
+            vsize: 0,
+          } as Transaction;
+        }
+        return convertFluxIndexerTransaction(tx);
+      });
+    } catch (error) {
+      throw new FluxIndexerAPIError(
+        `Failed to fetch transactions batch`,
+        getStatusCode(error),
+        error
+      );
+    }
+  }
+
+  /**
    * Fetch raw transaction hex data
+   * Uses ?includeHex=true to explicitly request hex (may require RPC fetch)
    */
   static async getRawTransaction(txid: string): Promise<{ rawtx: string }> {
     try {
-      const response = await apiClient.get(`api/v1/transactions/${txid}`).json<{ hex?: string }>();
+      const response = await api().get(`api/v1/transactions/${txid}?includeHex=true`).json<{ hex?: string }>();
       // FluxIndexer returns raw hex in the "hex" field
       return {
         rawtx: response.hex || "",
@@ -651,7 +718,7 @@ export class FluxIndexerAPI {
    */
   static async getAddress(address: string): Promise<AddressInfo> {
     try {
-      const response = await apiClient
+      const response = await api()
         .get(`api/v1/addresses/${address}`, {
           searchParams: {
             details: "txs",
@@ -681,7 +748,7 @@ export class FluxIndexerAPI {
    */
   static async getAddressBalance(address: string): Promise<number> {
     try {
-      const response = await apiClient.get(`api/v1/addresses/${address}`).json<FluxIndexerAddressResponse>();
+      const response = await api().get(`api/v1/addresses/${address}`).json<FluxIndexerAddressResponse>();
       return satoshisToFlux(response.balance || '0');
     } catch (error) {
       throw new FluxIndexerAPIError(
@@ -697,7 +764,7 @@ export class FluxIndexerAPI {
    */
   static async getAddressTotalReceived(address: string): Promise<number> {
     try {
-      const response = await apiClient.get(`api/v1/addresses/${address}`).json<FluxIndexerAddressResponse>();
+      const response = await api().get(`api/v1/addresses/${address}`).json<FluxIndexerAddressResponse>();
       return satoshisToFlux(response.totalReceived || '0');
     } catch (error) {
       throw new FluxIndexerAPIError(
@@ -713,7 +780,7 @@ export class FluxIndexerAPI {
    */
   static async getAddressTotalSent(address: string): Promise<number> {
     try {
-      const response = await apiClient.get(`api/v1/addresses/${address}`).json<FluxIndexerAddressResponse>();
+      const response = await api().get(`api/v1/addresses/${address}`).json<FluxIndexerAddressResponse>();
       return satoshisToFlux(response.totalSent || '0');
     } catch (error) {
       throw new FluxIndexerAPIError(
@@ -729,7 +796,7 @@ export class FluxIndexerAPI {
    */
   static async getAddressUnconfirmedBalance(address: string): Promise<number> {
     try {
-      const response = await apiClient.get(`api/v1/addresses/${address}`).json<FluxIndexerAddressResponse>();
+      const response = await api().get(`api/v1/addresses/${address}`).json<FluxIndexerAddressResponse>();
       return satoshisToFlux(response.unconfirmedBalance || '0');
     } catch (error) {
       throw new FluxIndexerAPIError(
@@ -745,7 +812,7 @@ export class FluxIndexerAPI {
    */
   static async getAddressUtxos(address: string): Promise<FluxIndexerUtxoResponse[]> {
     try {
-      const response = await apiClient.get(`api/v1/addresses/${address}/utxos`).json<FluxIndexerUtxoResponse[]>();
+      const response = await api().get(`api/v1/addresses/${address}/utxos`).json<FluxIndexerUtxoResponse[]>();
       return response || [];
     } catch (error) {
       throw new FluxIndexerAPIError(
@@ -820,7 +887,7 @@ export class FluxIndexerAPI {
         searchParams.toTimestamp = params.toTimestamp.toString();
       }
 
-      const response = await apiClient
+      const response = await api()
         .get(`api/v1/addresses/${address}/transactions`, { searchParams })
         .json<FluxIndexerAddressTransactionsResponse>();
 
@@ -889,7 +956,7 @@ export class FluxIndexerAPI {
    */
   static async getDashboardStats(): Promise<DashboardStats> {
     try {
-      return await apiClient.get("api/v1/stats/dashboard").json<DashboardStats>();
+      return await api().get("api/v1/stats/dashboard").json<DashboardStats>();
     } catch (error) {
       throw new FluxIndexerAPIError(
         "Failed to fetch dashboard stats",
@@ -904,7 +971,7 @@ export class FluxIndexerAPI {
    */
   static async getSyncStatus(): Promise<{ status: string; blockChainHeight: number; syncPercentage: number; height: number; type: string }> {
     try {
-      const response = await apiClient.get("api/v1/sync").json<FluxIndexerApiResponse>();
+      const response = await api().get("api/v1/sync").json<FluxIndexerApiResponse>();
 
       const chainHeight = response.indexer.chainHeight || 0;
       const currentHeight = response.indexer.currentHeight || 0;

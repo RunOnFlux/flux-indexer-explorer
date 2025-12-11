@@ -171,7 +171,7 @@ export function extractTransactionFromBlock(blockHex: string, targetTxid: string
 
         if (txid === targetTxid) {
           const txHex = txBytes.toString('hex');
-          logger.info('Successfully extracted transaction from block', {
+          logger.debug('Successfully extracted transaction from block', {
             txid,
             length: newOffset - txStart,
             offset: txStart,
@@ -432,7 +432,7 @@ export function extractCoinbaseTransaction(blockHex: string, blockHeight?: numbe
       const txEnd = parseStandardTransaction(buffer, offset);
       const coinbaseHex = buffer.slice(txStart, txEnd).toString('hex');
 
-      logger.info('Successfully extracted coinbase transaction from block', {
+      logger.debug('Successfully extracted coinbase transaction from block', {
         length: txEnd - txStart,
         offset: txStart,
         blockVersion
@@ -739,7 +739,9 @@ function parseStandardTransaction(
     offset += spendResult.size;
     trace?.('saplingSpendCount', offset, String(nShieldedSpend));
 
-    if (nShieldedSpend > 1000) {
+    // Flux 2MB blocks can hold ~5,200 shielded spends (384 bytes each)
+    // Large consolidation transactions may have 1000+ spends
+    if (nShieldedSpend > 6000) {
       throw new Error(`Unreasonable nShieldedSpend count: ${nShieldedSpend}`);
     }
 
@@ -768,7 +770,9 @@ function parseStandardTransaction(
     offset += outputResult.size;
     trace?.('saplingOutputCount', offset, String(nShieldedOutput));
 
-    if (nShieldedOutput > 1000) {
+    // Flux 2MB blocks can hold ~2,100 shielded outputs (948 bytes each)
+    // Large distribution transactions may have many outputs
+    if (nShieldedOutput > 3000) {
       throw new Error(`Unreasonable nShieldedOutput count: ${nShieldedOutput}`);
     }
 
@@ -1230,13 +1234,11 @@ export function parseTransactionShieldedData(txHex: string): {
 
   // Sapling v4 transaction handling
   if (isSaplingV4) {
-    // Determine if this v4 transaction has Sapling fields
-    let hasSaplingFields = false;
-    if (offset + 10 <= buffer.length) {
-      const firstByte = buffer[offset];
-      const potentialSpendCount = buffer[offset + 8];
-      hasSaplingFields = firstByte === 0x00 || potentialSpendCount < 100;
-    }
+    // All Sapling v4 transactions have valueBalance field (8 bytes)
+    // followed by vShieldedSpend count (varint) and vShieldedOutput count (varint)
+    // Previous heuristic was wrong: checking firstByte === 0x00 fails for large valueBalance
+    // A better check: ensure we have enough bytes for valueBalance + at least 2 varints
+    const hasSaplingFields = offset + 10 <= buffer.length;
 
     if (hasSaplingFields) {
       // Read valueBalance (8 bytes, signed) - keep as satoshis (bigint)
