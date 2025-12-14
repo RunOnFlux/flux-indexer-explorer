@@ -9,6 +9,64 @@ echo "=============================================="
 mkdir -p /var/log/supervisor
 
 #######################################
+# Robust download function with resume
+#######################################
+# Downloads a file with automatic resume on failure
+# Args: $1 = URL, $2 = output file
+# Returns: 0 on success, 1 on failure
+download_file() {
+  local url="$1"
+  local output="$2"
+  local max_attempts=10
+  local attempt=1
+  local wait_time=5
+
+  # Get expected file size
+  local expected_size=$(curl -sI "$url" | grep -i content-length | awk '{print $2}' | tr -d '\r')
+  if [ -z "$expected_size" ]; then
+    echo "[Download] WARNING: Could not determine file size, proceeding anyway"
+    expected_size=0
+  else
+    echo "[Download] Expected file size: $(echo "$expected_size" | awk '{printf "%.2f GB", $1/1024/1024/1024}')"
+  fi
+
+  while [ $attempt -le $max_attempts ]; do
+    echo "[Download] Attempt $attempt of $max_attempts..."
+
+    # Use -c to continue/resume partial downloads
+    if wget -c --timeout=30 --tries=1 --no-check-certificate --show-progress -O "$output" "$url"; then
+      # Verify file size if we know the expected size
+      if [ "$expected_size" -gt 0 ]; then
+        local actual_size=$(stat -c%s "$output" 2>/dev/null || echo "0")
+        if [ "$actual_size" -eq "$expected_size" ]; then
+          echo "[Download] Complete - size verified ($actual_size bytes)"
+          return 0
+        else
+          echo "[Download] Size mismatch: expected $expected_size, got $actual_size"
+          # Don't delete - we'll resume from this point
+        fi
+      else
+        echo "[Download] Complete (size not verified)"
+        return 0
+      fi
+    else
+      echo "[Download] wget failed, will retry..."
+    fi
+
+    # Calculate wait time with exponential backoff (max 60 seconds)
+    wait_time=$((wait_time * 2))
+    [ $wait_time -gt 60 ] && wait_time=60
+
+    echo "[Download] Waiting ${wait_time}s before retry..."
+    sleep $wait_time
+    attempt=$((attempt + 1))
+  done
+
+  echo "[Download] ERROR: Failed after $max_attempts attempts"
+  return 1
+}
+
+#######################################
 # SECTION 1: ClickHouse Bootstrap
 #######################################
 
@@ -105,8 +163,9 @@ bootstrap_clickhouse() {
       local archive_file="$backup_dir/bootstrap.tar.gz"
 
       echo "[ClickHouse Bootstrap] Downloading bootstrap archive..."
-      if ! wget --timeout=0 --tries=3 --no-check-certificate -q --show-progress -O "$archive_file" "$bootstrap_url"; then
+      if ! download_file "$bootstrap_url" "$archive_file"; then
         echo "[ClickHouse Bootstrap] ERROR: Failed to download bootstrap"
+        rm -f "$archive_file"
         return 1
       fi
 
@@ -128,8 +187,9 @@ bootstrap_clickhouse() {
       local archive_file="$backup_dir/bootstrap.zip"
 
       echo "[ClickHouse Bootstrap] Downloading bootstrap archive..."
-      if ! wget --timeout=0 --tries=3 --no-check-certificate -q --show-progress -O "$archive_file" "$bootstrap_url"; then
+      if ! download_file "$bootstrap_url" "$archive_file"; then
         echo "[ClickHouse Bootstrap] ERROR: Failed to download bootstrap"
+        rm -f "$archive_file"
         return 1
       fi
 
@@ -433,7 +493,7 @@ if [ -n "$BOOTSTRAP_URL" ]; then
     case "$BOOTSTRAP_URL" in
       *.tar.gz|*.tgz)
         echo "[Daemon Bootstrap] Detected tar.gz format"
-        if wget --timeout=0 --tries=3 --no-check-certificate -q --show-progress -O bootstrap.tar.gz "$BOOTSTRAP_URL"; then
+        if download_file "$BOOTSTRAP_URL" "bootstrap.tar.gz"; then
           echo "[Daemon Bootstrap] Extracting blockchain bootstrap..."
           tar -xzf bootstrap.tar.gz -C "$FLUX_DATA_DIR"
           rm -f bootstrap.tar.gz
@@ -441,12 +501,13 @@ if [ -n "$BOOTSTRAP_URL" ]; then
           echo "[Daemon Bootstrap] Bootstrap extracted successfully!"
         else
           echo "[Daemon Bootstrap] ERROR: Failed to download bootstrap"
+          rm -f bootstrap.tar.gz
           echo "[Daemon Bootstrap] Continuing with normal sync from genesis..."
         fi
         ;;
       *.zip)
         echo "[Daemon Bootstrap] Detected zip format"
-        if wget --timeout=0 --tries=3 --no-check-certificate -q --show-progress -O bootstrap.zip "$BOOTSTRAP_URL"; then
+        if download_file "$BOOTSTRAP_URL" "bootstrap.zip"; then
           echo "[Daemon Bootstrap] Extracting blockchain bootstrap..."
           unzip -q bootstrap.zip -d "$FLUX_DATA_DIR"
           rm -f bootstrap.zip
@@ -454,6 +515,7 @@ if [ -n "$BOOTSTRAP_URL" ]; then
           echo "[Daemon Bootstrap] Bootstrap extracted successfully!"
         else
           echo "[Daemon Bootstrap] ERROR: Failed to download bootstrap"
+          rm -f bootstrap.zip
           echo "[Daemon Bootstrap] Continuing with normal sync from genesis..."
         fi
         ;;
