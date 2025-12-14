@@ -4,7 +4,6 @@ import { useFluxNodeCount, useFluxInstancesCount, useArcaneAdoption } from "@/li
 import { useFluxSupply } from "@/lib/api/hooks/useFluxSupply";
 import { useDashboardStats } from "@/lib/api/hooks/useDashboardStats";
 import { useLatestBlocks } from "@/lib/api";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Activity,
@@ -22,34 +21,146 @@ interface StatCardProps {
   value: string | number;
   subtitle?: string;
   icon: React.ReactNode;
-  gradient: string;
+  accentColor: string;
+  glowColor: string;
   isLoading?: boolean;
+  delay?: number;
 }
 
-function StatCard({ title, value, subtitle, icon, gradient, isLoading }: StatCardProps) {
+function StatCard({ title, value, subtitle, icon, accentColor, glowColor, isLoading, delay = 0 }: StatCardProps) {
   return (
-    <Card className="overflow-hidden border-primary/5">
-      <div className={`h-0.5 ${gradient} opacity-60`} />
-      <CardHeader className="pb-3">
-        <CardTitle className="text-sm font-medium text-muted-foreground flex items-center gap-2">
-          {icon}
-          {title}
-        </CardTitle>
-      </CardHeader>
-      <CardContent>
+    <div
+      className="group relative overflow-hidden rounded-xl flux-glass-card p-5 transition-all duration-300 hover:scale-[1.02] animate-flux-fade-in"
+      style={{ animationDelay: `${delay}ms` }}
+    >
+      {/* Top accent line */}
+      <div
+        className="absolute top-0 left-0 right-0 h-[2px] opacity-60 group-hover:opacity-100 transition-opacity"
+        style={{ background: `linear-gradient(90deg, transparent, ${accentColor}, transparent)` }}
+      />
+
+      {/* Icon glow effect on hover */}
+      <div
+        className="absolute -top-10 -right-10 w-32 h-32 rounded-full blur-3xl opacity-0 group-hover:opacity-20 transition-opacity duration-500"
+        style={{ background: glowColor }}
+      />
+
+      <div className="relative">
+        {/* Header */}
+        <div className="flex items-center gap-2 mb-3">
+          <div
+            className="p-2 rounded-lg transition-all duration-300 group-hover:scale-110"
+            style={{ background: `${accentColor}20`, color: accentColor }}
+          >
+            {icon}
+          </div>
+          <span className="text-sm font-medium text-[var(--flux-text-muted)]">{title}</span>
+        </div>
+
+        {/* Value */}
         {isLoading ? (
           <div className="space-y-2">
-            <Skeleton className="h-8 w-32" />
-            {subtitle && <Skeleton className="h-4 w-24" />}
+            <Skeleton className="h-8 w-28 bg-white/5" />
+            {subtitle && <Skeleton className="h-4 w-20 bg-white/5" />}
           </div>
         ) : (
           <div>
-            <div className="text-2xl font-bold">{value}</div>
-            {subtitle && <p className="text-xs text-muted-foreground mt-1">{subtitle}</p>}
+            <div
+              className="text-2xl font-bold tracking-tight transition-colors"
+              style={{ color: 'var(--flux-text-primary)' }}
+            >
+              {value}
+            </div>
+            {subtitle && (
+              <p className="text-xs text-[var(--flux-text-muted)] mt-1">{subtitle}</p>
+            )}
           </div>
         )}
-      </CardContent>
-    </Card>
+      </div>
+    </div>
+  );
+}
+
+interface TooltipCardProps {
+  title: string;
+  value: string | number;
+  subtitle?: string;
+  icon: React.ReactNode;
+  accentColor: string;
+  glowColor: string;
+  isLoading?: boolean;
+  delay?: number;
+  children?: React.ReactNode;
+  tooltipContent?: React.ReactNode;
+}
+
+function TooltipCard({
+  title,
+  value,
+  subtitle,
+  icon,
+  accentColor,
+  glowColor,
+  isLoading,
+  delay = 0,
+  tooltipContent,
+}: TooltipCardProps) {
+  return (
+    <div
+      className="group relative overflow-visible rounded-xl flux-glass-card p-5 transition-all duration-300 hover:scale-[1.02] animate-flux-fade-in"
+      style={{ animationDelay: `${delay}ms` }}
+    >
+      {/* Top accent line */}
+      <div
+        className="absolute top-0 left-0 right-0 h-[2px] opacity-60 group-hover:opacity-100 transition-opacity rounded-t-xl"
+        style={{ background: `linear-gradient(90deg, transparent, ${accentColor}, transparent)` }}
+      />
+
+      {/* Icon glow effect on hover */}
+      <div
+        className="absolute -top-10 -right-10 w-32 h-32 rounded-full blur-3xl opacity-0 group-hover:opacity-20 transition-opacity duration-500"
+        style={{ background: glowColor }}
+      />
+
+      <div className="relative">
+        {/* Header */}
+        <div className="flex items-center gap-2 mb-3">
+          <div
+            className="p-2 rounded-lg transition-all duration-300 group-hover:scale-110"
+            style={{ background: `${accentColor}20`, color: accentColor }}
+          >
+            {icon}
+          </div>
+          <span className="text-sm font-medium text-[var(--flux-text-muted)]">{title}</span>
+        </div>
+
+        {/* Value */}
+        {isLoading ? (
+          <div className="space-y-2">
+            <Skeleton className="h-8 w-28 bg-white/5" />
+            {subtitle && <Skeleton className="h-4 w-20 bg-white/5" />}
+          </div>
+        ) : (
+          <div>
+            <div className="text-2xl font-bold tracking-tight text-[var(--flux-text-primary)]">
+              {value}
+            </div>
+            {subtitle && (
+              <p className="text-xs text-[var(--flux-text-muted)] mt-1">{subtitle}</p>
+            )}
+          </div>
+        )}
+
+        {/* Tooltip */}
+        {tooltipContent && (
+          <div className="absolute left-0 bottom-full mb-3 p-4 rounded-xl flux-glass-strong opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50 min-w-[220px] shadow-2xl">
+            {tooltipContent}
+            {/* Arrow */}
+            <div className="absolute left-6 bottom-[-6px] w-3 h-3 bg-[var(--flux-bg-surface)] border-r border-b border-[var(--flux-border)] rotate-45" />
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -62,159 +173,123 @@ export function NetworkStats() {
   const { data: arcaneAdoption, isLoading: arcaneLoading } = useArcaneAdoption();
   const avgBlockTime = dashboardStats?.averages.blockTimeSeconds ?? null;
   const tx24h = dashboardStats?.transactions24h ?? null;
-  // Use latest blocks data for block height (same API call as LatestBlocks component)
   const latestHeight = latestBlocks?.[0]?.height ?? null;
   const blockHeightValue = latestHeight !== null && latestHeight !== undefined
-      ? latestHeight.toLocaleString()
-      : "—";
+    ? latestHeight.toLocaleString()
+    : "—";
 
   return (
-    <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
       <StatCard
         title="Block Height"
         value={blockHeightValue}
         subtitle="Current height"
         icon={<Database className="h-4 w-4" />}
-        gradient="bg-gradient-to-r from-blue-500 to-cyan-500"
+        accentColor="#38e8ff"
+        glowColor="#38e8ff"
         isLoading={latestBlocksLoading && latestHeight === null}
+        delay={0}
       />
 
       <StatCard
-        title="App Instances Running"
+        title="App Instances"
         value={instancesCount?.toLocaleString() ?? "—"}
-        subtitle="Total running instances"
+        subtitle="Running on network"
         icon={<Boxes className="h-4 w-4" />}
-        gradient="bg-gradient-to-r from-purple-500 to-pink-500"
+        accentColor="#a855f7"
+        glowColor="#a855f7"
         isLoading={instancesCountLoading}
+        delay={50}
       />
 
-      {/* PoUW Nodes Card with hover tooltip */}
-      <Card className="overflow-visible border-primary/5 group relative">
-        <div className="h-0.5 bg-gradient-to-r from-orange-500 to-red-500 opacity-60" />
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm font-medium text-muted-foreground flex items-center gap-2">
-            <Server className="h-4 w-4" />
-            PoUW Nodes
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="relative">
-          {nodeCountLoading ? (
-            <div className="space-y-2">
-              <Skeleton className="h-8 w-32" />
-              <Skeleton className="h-4 w-24" />
-            </div>
-          ) : nodeCount ? (
-            <>
-              <div className="text-2xl font-bold">{nodeCount.total.toLocaleString()}</div>
-              <p className="text-xs text-muted-foreground mt-1">Active FluxNodes</p>
-              {/* Hover tooltip - positioned absolutely outside card */}
-              <div className="absolute left-0 bottom-full mb-2 p-3 bg-card border rounded-md shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50 min-w-[220px]">
-                <div className="space-y-2 text-sm">
-                  <div className="flex items-center justify-between">
-                    <span className="text-pink-500 font-medium flex items-center gap-2">
-                      <span className="w-3 h-3 rounded-full bg-pink-500"></span>
-                      CUMULUS
-                    </span>
-                    <span className="font-bold text-pink-500">
-                      {nodeCount["cumulus-enabled"].toLocaleString()}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-purple-500 font-medium flex items-center gap-2">
-                      <span className="w-3 h-3 rounded-full bg-purple-500"></span>
-                      NIMBUS
-                    </span>
-                    <span className="font-bold text-purple-500">
-                      {nodeCount["nimbus-enabled"].toLocaleString()}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-blue-500 font-medium flex items-center gap-2">
-                      <span className="w-3 h-3 rounded-full bg-blue-500"></span>
-                      STRATUS
-                    </span>
-                    <span className="font-bold text-blue-500">
-                      {nodeCount["stratus-enabled"].toLocaleString()}
-                    </span>
-                  </div>
-                </div>
-                {/* Arrow pointing down */}
-                <div className="absolute left-4 bottom-[-6px] w-3 h-3 bg-card border-r border-b rotate-45"></div>
+      <TooltipCard
+        title="PoUW Nodes"
+        value={nodeCount?.total.toLocaleString() ?? "—"}
+        subtitle="Active FluxNodes"
+        icon={<Server className="h-4 w-4" />}
+        accentColor="#38e8ff"
+        glowColor="#38e8ff"
+        isLoading={nodeCountLoading}
+        delay={100}
+        tooltipContent={
+          nodeCount && (
+            <div className="space-y-2.5 text-sm">
+              <div className="flex items-center justify-between gap-4">
+                <span className="flex items-center gap-2 text-[var(--tier-cumulus)]">
+                  <span className="w-2.5 h-2.5 rounded-full bg-[var(--tier-cumulus)]" />
+                  CUMULUS
+                </span>
+                <span className="font-bold text-[var(--tier-cumulus)]">
+                  {nodeCount["cumulus-enabled"].toLocaleString()}
+                </span>
               </div>
-            </>
-          ) : (
-            <div>
-              <div className="text-2xl font-bold">—</div>
-              <p className="text-xs text-muted-foreground mt-1">Active FluxNodes</p>
+              <div className="flex items-center justify-between gap-4">
+                <span className="flex items-center gap-2 text-[var(--tier-nimbus)]">
+                  <span className="w-2.5 h-2.5 rounded-full bg-[var(--tier-nimbus)]" />
+                  NIMBUS
+                </span>
+                <span className="font-bold text-[var(--tier-nimbus)]">
+                  {nodeCount["nimbus-enabled"].toLocaleString()}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <span className="flex items-center gap-2 text-[var(--tier-stratus)]">
+                  <span className="w-2.5 h-2.5 rounded-full bg-[var(--tier-stratus)]" />
+                  STRATUS
+                </span>
+                <span className="font-bold text-[var(--tier-stratus)]">
+                  {nodeCount["stratus-enabled"].toLocaleString()}
+                </span>
+              </div>
             </div>
-          )}
-        </CardContent>
-      </Card>
+          )
+        }
+      />
 
-      {/* ArcaneOS Adoption Card with hover tooltip */}
-      <Card className="overflow-visible border-primary/5 group relative">
-        <div className="h-0.5 bg-gradient-to-r from-teal-500 to-cyan-500 opacity-60" />
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm font-medium text-muted-foreground flex items-center gap-2">
-            <Activity className="h-4 w-4" />
-            ArcaneOS Adoption
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="relative">
-          {arcaneLoading ? (
-            <div className="space-y-2">
-              <Skeleton className="h-8 w-32" />
-              <Skeleton className="h-4 w-24" />
-            </div>
-          ) : arcaneAdoption ? (
-            <>
-              <div className="text-2xl font-bold">
-                {arcaneAdoption.percentage.toFixed(1)}%
+      <TooltipCard
+        title="ArcaneOS"
+        value={arcaneAdoption ? `${arcaneAdoption.percentage.toFixed(1)}%` : "—"}
+        subtitle={arcaneAdoption ? `${arcaneAdoption.arcane.toLocaleString()} nodes` : undefined}
+        icon={<Activity className="h-4 w-4" />}
+        accentColor="#22c55e"
+        glowColor="#22c55e"
+        isLoading={arcaneLoading}
+        delay={150}
+        tooltipContent={
+          arcaneAdoption && (
+            <div className="space-y-2.5 text-sm">
+              <div className="flex items-center justify-between gap-4">
+                <span className="flex items-center gap-2 text-[var(--flux-green)]">
+                  <span className="w-2.5 h-2.5 rounded-full bg-[var(--flux-green)]" />
+                  Arcane
+                </span>
+                <span className="font-bold text-[var(--flux-green)]">
+                  {arcaneAdoption.arcane.toLocaleString()}
+                </span>
               </div>
-              <p className="text-xs text-muted-foreground mt-1">
-                {arcaneAdoption.arcane.toLocaleString()} of {arcaneAdoption.total.toLocaleString()} nodes
-              </p>
-              {/* Hover tooltip - positioned absolutely outside card */}
-              <div className="absolute left-0 bottom-full mb-2 p-3 bg-card border rounded-md shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50 min-w-[220px]">
-                <div className="space-y-2 text-sm">
-                  <div className="flex items-center justify-between">
-                    <span className="text-teal-400 font-medium flex items-center gap-2">
-                      <span className="w-3 h-3 rounded-full bg-teal-400"></span>
-                      Arcane
-                    </span>
-                    <span className="font-bold text-teal-400">
-                      {arcaneAdoption.arcane.toLocaleString()}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-yellow-400 font-medium flex items-center gap-2">
-                      <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
-                      Legacy
-                    </span>
-                    <span className="font-bold text-yellow-400">
-                      {arcaneAdoption.legacy.toLocaleString()}
-                    </span>
-                  </div>
-                </div>
-                {/* Arrow pointing down */}
-                <div className="absolute left-4 bottom-[-6px] w-3 h-3 bg-card border-r border-b rotate-45"></div>
+              <div className="flex items-center justify-between gap-4">
+                <span className="flex items-center gap-2 text-[var(--flux-gold)]">
+                  <span className="w-2.5 h-2.5 rounded-full bg-[var(--flux-gold)]" />
+                  Legacy
+                </span>
+                <span className="font-bold text-[var(--flux-gold)]">
+                  {arcaneAdoption.legacy.toLocaleString()}
+                </span>
               </div>
-            </>
-          ) : (
-            <div>
-              <div className="text-2xl font-bold">—</div>
             </div>
-          )}
-        </CardContent>
-      </Card>
+          )
+        }
+      />
 
       <StatCard
         title="Circulating Supply"
         value={supplyStats ? `${(supplyStats.circulatingSupply / 1e6).toFixed(2)}M` : "—"}
         subtitle={supplyStats ? `${supplyStats.circulatingSupply.toLocaleString()} FLUX` : undefined}
         icon={<Layers className="h-4 w-4" />}
-        gradient="bg-gradient-to-r from-cyan-500 to-blue-500"
+        accentColor="#38e8ff"
+        glowColor="#38e8ff"
         isLoading={supplyLoading}
+        delay={200}
       />
 
       <StatCard
@@ -222,27 +297,32 @@ export function NetworkStats() {
         value={supplyStats ? `${(supplyStats.maxSupply / 1e6).toFixed(2)}M` : "—"}
         subtitle={supplyStats ? `${supplyStats.maxSupply.toLocaleString()} FLUX` : undefined}
         icon={<Coins className="h-4 w-4" />}
-        gradient="bg-gradient-to-r from-indigo-500 to-purple-500"
+        accentColor="#a855f7"
+        glowColor="#a855f7"
         isLoading={supplyLoading}
+        delay={250}
       />
 
       <StatCard
         title="Avg Block Time"
-        value={avgBlockTime !== null ? `${avgBlockTime.toFixed(1)} sec` : "—"}
-        subtitle="Recent average (target: 30s)"
+        value={avgBlockTime !== null ? `${avgBlockTime.toFixed(1)}s` : "—"}
+        subtitle="Target: 30 seconds"
         icon={<Clock className="h-4 w-4" />}
-        gradient="bg-gradient-to-r from-yellow-500 to-orange-500"
+        accentColor="#fbbf24"
+        glowColor="#fbbf24"
         isLoading={dashboardLoading && avgBlockTime === null}
+        delay={300}
       />
 
-      {/* Transactions (24h) Card with hover tooltip */}
       <StatCard
         title="Transactions (24h)"
         value={tx24h !== null ? tx24h.toLocaleString() : "—"}
         subtitle="Last 24 hours"
         icon={<TrendingUp className="h-4 w-4" />}
-        gradient="bg-gradient-to-r from-pink-500 to-rose-500"
+        accentColor="#ec4899"
+        glowColor="#ec4899"
         isLoading={dashboardLoading && tx24h === null}
+        delay={350}
       />
     </div>
   );
