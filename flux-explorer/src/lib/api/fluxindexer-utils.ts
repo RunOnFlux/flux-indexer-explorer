@@ -14,6 +14,7 @@ interface FluxIndexerTransactionVin {
   n?: number;
   scriptSig?: { hex: string; asm: string };
   addresses?: string[];
+  addr?: string;  // Batch endpoint returns addr directly
   value?: string;
   coinbase?: string;
 }
@@ -45,9 +46,13 @@ interface FluxIndexerTransaction {
   vout?: FluxIndexerTransactionVout[];
   blockHash?: string;
   blockHeight?: number;
+  block_height?: number;  // Batch endpoint uses snake_case
   confirmations?: number;
   blockTime?: number;
+  time?: number;  // Batch endpoint returns time directly
+  timestamp?: number;  // Batch endpoint can return timestamp
   value?: string;
+  valueOut?: string;  // Batch endpoint returns valueOut directly
   size?: number;
   vsize?: number;
   valueIn?: string;
@@ -87,6 +92,8 @@ interface FluxIndexerBlock {
     feeSat?: number;
     fee?: number;
     size?: number;
+    fromAddr?: string | null;
+    toAddr?: string | null;
   }>;
   txSummary?: {
     total: number;
@@ -170,7 +177,7 @@ export function convertFluxIndexerTransaction(bbTx: FluxIndexerTransaction): Tra
       sequence: input.sequence || 0,
       n: input.n || 0,
       scriptSig: input.scriptSig || { hex: '', asm: '' },
-      addr: input.addresses?.[0],
+      addr: input.addr || input.addresses?.[0],  // Batch endpoint returns addr directly
       valueSat: input.value ? parseInt(input.value) : 0,
       value: input.value ? satoshisToFlux(input.value) : 0,
       coinbase: input.coinbase,
@@ -200,11 +207,12 @@ export function convertFluxIndexerTransaction(bbTx: FluxIndexerTransaction): Tra
       };
     }) || [],
     blockhash: bbTx.blockHash,
-    blockheight: bbTx.blockHeight,
+    blockheight: bbTx.blockHeight ?? bbTx.block_height,
     confirmations: bbTx.confirmations || 0,
-    time: bbTx.blockTime || 0,
-    blocktime: bbTx.blockTime || 0,
-    valueOut: bbTx.value ? satoshisToFlux(bbTx.value) : 0,
+    time: bbTx.blockTime ?? bbTx.time ?? bbTx.timestamp ?? 0,
+    blocktime: bbTx.blockTime ?? bbTx.time ?? bbTx.timestamp ?? 0,
+    // Batch endpoint returns valueOut directly, regular endpoint uses value
+    valueOut: (bbTx.valueOut ?? bbTx.value) ? satoshisToFlux(bbTx.valueOut ?? bbTx.value ?? '0') : 0,
     size: computedSize,
     vsize: computedVSize,
     valueIn: bbTx.valueIn ? satoshisToFlux(bbTx.valueIn) : 0,
@@ -231,6 +239,8 @@ export function convertFluxIndexerBlock(bbBlock: FluxIndexerBlock): Block {
     feeSat: detail.feeSat ?? 0,
     fee: detail.fee ?? 0,
     size: detail.size ?? 0,
+    fromAddr: detail.fromAddr ?? null,
+    toAddr: detail.toAddr ?? null,
   })) || [];
 
   const txSummary = bbBlock.txSummary

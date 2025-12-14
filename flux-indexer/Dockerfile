@@ -80,7 +80,7 @@ FROM node:20-slim
 
 WORKDIR /app
 
-# Install runtime dependencies for Flux daemon and bootstrap import
+# Install runtime dependencies for Flux daemon
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libstdc++6 \
     libgomp1 \
@@ -93,7 +93,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     supervisor \
     gettext-base \
     wget \
-    postgresql-client \
+    # For ClickHouse client installation
+    apt-transport-https \
+    ca-certificates \
+    curl \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install ClickHouse client for database bootstrap
+# This allows the indexer to handle ClickHouse bootstrap instead of requiring a custom CH image
+RUN curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" > /etc/apt/sources.list.d/clickhouse.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends clickhouse-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy Flux daemon binaries and zcash params from build stage
@@ -106,7 +118,8 @@ RUN npm ci --only=production
 
 # Copy built indexer from builder
 COPY --from=indexer-builder /app/dist ./dist
-COPY --from=indexer-builder /app/src/database/schema.sql ./dist/database/
+# Copy ClickHouse schema
+COPY src/database/schema.sql ./dist/database/
 
 # Copy built frontend from frontend-builder (static export)
 COPY --from=frontend-builder /app/frontend/out ./frontend

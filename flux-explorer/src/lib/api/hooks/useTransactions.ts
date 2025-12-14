@@ -122,8 +122,8 @@ export function useTransactionsBatch(
   txids: string[],
   blockHeight?: number
 ): UseQueryResult<Transaction[], Error> {
-  // Create a stable key from txids
-  const txidsKey = txids.sort().join(',');
+  // Create a stable key from txids (sort a COPY to avoid mutating the input array)
+  const txidsKey = [...txids].sort().join(',');
 
   return useQuery<Transaction[], Error>({
     queryKey: [...transactionKeys.all, "batch", txidsKey, blockHeight],

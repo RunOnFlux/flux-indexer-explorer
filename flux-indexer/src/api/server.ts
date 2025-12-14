@@ -1,134 +1,34 @@
 /**
- * API Server
+ * ClickHouse API Server
  *
- * FluxIndexer REST API for Flux PoN blockchain
+ * FluxIndexer REST API backed by ClickHouse for Flux PoN blockchain
  */
 
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import compression from 'compression';
 import path from 'path';
-import { DatabaseConnection } from '../database/connection';
+import { ClickHouseConnection } from '../database/connection';
 import { FluxRPCClient } from '../rpc/flux-rpc-client';
-import { SyncEngine } from '../indexer/sync-engine';
+import { ClickHouseSyncEngine } from '../indexer/sync-engine';
 import { logger } from '../utils/logger';
-import { getScriptPubkey } from '../utils/script-utils';
-import { Transaction } from '../types';
 import { extractTransactionFromBlock } from '../parsers/block-parser';
 
-function decodeOpReturnData(scriptHex?: string | null): { hex: string; text: string | null } | null {
-  if (!scriptHex) return null;
-
-  try {
-    const buffer = Buffer.from(scriptHex, 'hex');
-    if (buffer.length === 0 || buffer[0] !== 0x6a) {
-      return null;
-    }
-
-    let index = 1;
-    if (index >= buffer.length) return null;
-
-    let length = buffer[index];
-    index += 1;
-
-    if (length === 0x4c) {
-      if (index >= buffer.length) return null;
-      length = buffer[index];
-      index += 1;
-    } else if (length === 0x4d) {
-      if (index + 1 >= buffer.length) return null;
-      length = buffer[index] | (buffer[index + 1] << 8);
-      index += 2;
-    } else if (length === 0x4e) {
-      if (index + 3 >= buffer.length) return null;
-      length = buffer.readUInt32LE(index);
-      index += 4;
-    }
-
-    const data = buffer.slice(index, index + length);
-    if (data.length === 0) {
-      return { hex: '', text: null };
-    }
-
-    const hex = data.toString('hex');
-    let text: string | null = null;
-
-    const ascii = data.toString('utf8');
-    if (/^[\x09\x0A\x0D\x20-\x7E]+$/.test(ascii)) {
-      text = ascii;
-    }
-
-    return { hex, text };
-  } catch (error) {
-    logger.debug('Failed to decode OP_RETURN data', { error: (error as Error).message });
-    return null;
-  }
-}
-
-export class APIServer {
+export class ClickHouseAPIServer {
   private app: express.Application;
   private server: any;
   private daemonReady = false;
-  private statusCheckFailures = 0;
 
-  // Cache for expensive count queries
-  private statsCache: {
-    data: { blocks: number; transactions: number; addresses: number } | null;
-    timestamp: number;
-  } = { data: null, timestamp: 0 };
-  private static readonly STATS_CACHE_TTL = 30000; // 30 seconds
-  private statsRefreshPromise: Promise<any> | null = null; // Track in-progress refresh
-
-  // Cache for status endpoint
+  // Caches
+  private statsCache: { data: any | null; timestamp: number } = { data: null, timestamp: 0 };
   private statusCache: { data: any | null; timestamp: number } = { data: null, timestamp: 0 };
-  private static readonly STATUS_CACHE_TTL = 5000; // 5 seconds
-  private statusRefreshPromise: Promise<any> | null = null; // Track in-progress refresh
-
-  // Cache for rich list supply calculation (expensive SUM on utxos table)
-  private richListSupplyCache: {
-    data: { totalSupply: string; totalAddresses: number } | null;
-    timestamp: number;
-  } = { data: null, timestamp: 0 };
-  private static readonly RICH_LIST_SUPPLY_CACHE_TTL = 30000; // 30 seconds
-  private richListSupplyRefreshPromise: Promise<any> | null = null;
-
-  // Block reward constants
-  private static readonly FIRST_HALVING_HEIGHT = 657850;
-  private static readonly SECOND_HALVING_HEIGHT = 1313200;
-  private static readonly FOUNDATION_ACTIVATION_HEIGHT = 2020000; // PON fork
-
-  /**
-   * Calculate expected block reward at a given height
-   * Matches the logic from flux-explorer/src/lib/block-rewards.ts
-   */
-  private getExpectedBlockReward(height: number): number {
-    if (height < 1) return 0;
-
-    // Before first halving: 150 FLUX
-    if (height < APIServer.FIRST_HALVING_HEIGHT) {
-      return 150;
-    }
-
-    // After first halving, before second: 75 FLUX
-    if (height < APIServer.SECOND_HALVING_HEIGHT) {
-      return 75;
-    }
-
-    // After second halving: 37.5 FLUX
-    // 3rd halving was canceled, so it stays at 37.5 until PON fork
-    if (height < APIServer.FOUNDATION_ACTIVATION_HEIGHT) {
-      return 37.5;
-    }
-
-    // PON era: fixed rewards totaling 14 FLUX
-    // (Cumulus: 1 + Nimbus: 3.5 + Stratus: 9 + Foundation: 0.5 = 14)
-    return 14;
-  }
+  private static readonly STATUS_CACHE_TTL = 30000; // 30s for status (doesn't need to be instant)
+  private static readonly STATS_CACHE_TTL = 2000;   // 2s for dashboard stats (matches frontend polling)
 
   constructor(
-    private db: DatabaseConnection,
+    private ch: ClickHouseConnection,
     private rpc: FluxRPCClient,
-    private syncEngine: SyncEngine,
+    private syncEngine: ClickHouseSyncEngine,
     private port: number = 3002
   ) {
     this.app = express();
@@ -137,43 +37,18 @@ export class APIServer {
     this.setupErrorHandling();
   }
 
-  /**
-   * Setup Express middleware
-   */
   private setupMiddleware(): void {
-    // Enable gzip/brotli compression for API responses
-    // Reduces response size by 70-90% for JSON payloads
-    this.app.use(compression({
-      filter: (req: Request, res: Response) => {
-        // Don't compress if client explicitly requests no compression
-        if (req.headers['x-no-compression']) {
-          return false;
-        }
-        // Otherwise, use compression for responses > 1KB
-        return compression.filter(req, res);
-      },
-      threshold: 1024, // Only compress responses larger than 1KB
-      level: 6, // Compression level (0-9, 6 is good balance of speed/ratio)
-    }));
-
+    this.app.use(compression({ threshold: 1024, level: 6 }));
     this.app.use(cors());
     this.app.use(express.json());
 
-    // Request logging
     this.app.use((req, res, next) => {
-      logger.debug(`${req.method} ${req.path}`, {
-        query: req.query,
-        ip: req.ip,
-      });
+      logger.debug(`${req.method} ${req.path}`, { query: req.query });
       next();
     });
   }
 
-  /**
-   * Setup API routes
-   */
   private setupRoutes(): void {
-    // FluxIndexer API v1
     // Status endpoints
     this.app.get('/api/v1/status', this.getStatus.bind(this));
     this.app.get('/api/v1/sync', this.getSyncStatus.bind(this));
@@ -193,37 +68,39 @@ export class APIServer {
     this.app.get('/api/v1/addresses/:address/transactions', this.getAddressTransactions.bind(this));
     this.app.get('/api/v1/addresses/:address/utxos', this.getAddressUTXOs.bind(this));
 
-    // Rich list endpoint
+    // Rich list
     this.app.get('/api/v1/richlist', this.getRichList.bind(this));
 
-    // Supply stats endpoint
+    // Supply stats
     this.app.get('/api/v1/supply', this.getSupplyStats.bind(this));
 
-    // Producer endpoints (PoN-specific)
+    // Producers
     this.app.get('/api/v1/producers', this.getProducers.bind(this));
     this.app.get('/api/v1/producers/:identifier', this.getProducer.bind(this));
 
-    // FluxNode endpoints (Flux-specific)
+    // FluxNode endpoints
     this.app.get('/api/v1/nodes', this.getFluxNodes.bind(this));
     this.app.get('/api/v1/nodes/:ip', this.getFluxNodeStatus.bind(this));
 
-    // Network endpoints
+    // Network
     this.app.get('/api/v1/network', this.getNetworkInfo.bind(this));
     this.app.get('/api/v1/mempool', this.getMempoolInfo.bind(this));
     this.app.get('/api/v1/stats/dashboard', this.getDashboardStats.bind(this));
 
-    // Health check (no /api prefix for monitoring tools)
+    // Analytics (leverages materialized views for instant aggregations)
+    this.app.get('/api/v1/analytics/tx-volume', this.getTxVolumeHistory.bind(this));
+    this.app.get('/api/v1/analytics/supply-history', this.getSupplyHistory.bind(this));
+
+    // Health check
     this.app.get('/health', (req, res) => {
-      res.json({ status: 'ok', timestamp: new Date().toISOString() });
+      res.json({ status: 'ok', backend: 'clickhouse', timestamp: new Date().toISOString() });
     });
 
-    // Serve frontend static files (dashboard)
+    // Serve frontend
     const frontendPath = path.join(__dirname, '../../frontend');
     this.app.use(express.static(frontendPath));
 
-    // Serve index.html for all non-API routes (SPA fallback)
     this.app.get('*', (req, res) => {
-      // Don't serve index.html for API routes
       if (req.path.startsWith('/api/') || req.path === '/health') {
         return res.status(404).json({ error: 'Not found' });
       }
@@ -231,1991 +108,1149 @@ export class APIServer {
     });
   }
 
-  /**
-   * GET /api/v1/stats/dashboard - Aggregated explorer stats
-   */
-  private dashboardCache: {
-    data: any | null;
-    timestamp: number;
-  } = { data: null, timestamp: 0 };
-  private static readonly DASHBOARD_CACHE_TTL = 5000; // 5 seconds
-
-  private blockCache: Map<string, { data: any; timestamp: number }> = new Map();
-  private static readonly BLOCK_CACHE_LIMIT = 200;
-  private static readonly BLOCK_CACHE_TTL = 10000; // 10 seconds for recent blocks
-
-  private async getDashboardStats(req: Request, res: Response): Promise<void> {
-    try {
-      const now = Date.now();
-      if (this.dashboardCache.data && (now - this.dashboardCache.timestamp) < APIServer.DASHBOARD_CACHE_TTL) {
-        res.json(this.dashboardCache.data);
-        return;
-      }
-
-      const nowSeconds = Math.floor(now / 1000);
-
-      const [latestBlockResult, avgBlockTimeResult, tx24hResult, rewardsResult] = await Promise.all([
-        this.db.query(`
-          SELECT height, hash, timestamp
-          FROM blocks
-          ORDER BY height DESC
-          LIMIT 1
-        `),
-        this.db.query(`
-          WITH recent AS (
-            SELECT
-              height,
-              timestamp,
-              LAG(timestamp) OVER (ORDER BY height) AS prev_timestamp
-            FROM blocks
-            ORDER BY height DESC
-            LIMIT 121
-          )
-          SELECT COALESCE(AVG(timestamp - prev_timestamp), 0)::numeric AS avg_interval
-          FROM recent
-          WHERE prev_timestamp IS NOT NULL
-        `),
-        this.db.query(
-          `SELECT COALESCE(SUM(tx_count), 0)::bigint AS tx_24h
-           FROM blocks
-           WHERE timestamp >= $1`,
-          [nowSeconds - 86400]
-        ),
-        // PHASE 3: encode txid as hex for JSON response (txid is now BYTEA)
-        this.db.query(`
-          SELECT
-            b.height,
-            b.hash,
-            b.timestamp,
-            encode(t.txid, 'hex') as txid,
-            t.output_total
-          FROM blocks b
-          JOIN transactions t
-            ON t.block_height = b.height AND t.is_coinbase = TRUE
-          ORDER BY b.height DESC
-          LIMIT 5
-        `),
-      ]);
-
-      const latestBlock = latestBlockResult.rows[0] || { height: 0, hash: null, timestamp: null };
-      const avgBlockTime = Number(avgBlockTimeResult.rows[0]?.avg_interval || 0);
-      const tx24h = Number(tx24hResult.rows[0]?.tx_24h || 0);
-
-      const coinbaseTxids = rewardsResult.rows.map((row: any) => row.txid);
-      let outputsByTxid = new Map<string, Array<{ address: string | null; valueSat: number }>>();
-
-      if (coinbaseTxids.length > 0) {
-        const outputsResult = await this.db.query(
-          `SELECT txid, address, value
-           FROM utxos
-           WHERE txid = ANY($1::text[])
-           ORDER BY value DESC`,
-          [coinbaseTxids]
-        );
-
-        outputsByTxid = outputsResult.rows.reduce((map: Map<string, Array<{ address: string | null; valueSat: number }>>, row: any) => {
-          const list = map.get(row.txid) || [];
-          const valueSat = row.value ? Number(row.value) : 0;
-          list.push({
-            address: row.address || null,
-            valueSat,
-          });
-          map.set(row.txid, list);
-          return map;
-        }, new Map<string, Array<{ address: string | null; valueSat: number }>>());
-      }
-
-      const latestRewards = rewardsResult.rows.map((row: any) => {
-        const valueSat = row.output_total ? Number(row.output_total) : 0;
-        const outputs = (outputsByTxid.get(row.txid) || []).map(output => ({
-          address: output.address,
-          valueSat: output.valueSat,
-          value: output.valueSat / 1e8,
-        }));
-
-        return {
-          height: Number(row.height),
-          hash: row.hash,
-          timestamp: Number(row.timestamp),
-          txid: row.txid,
-          totalRewardSat: valueSat,
-          totalReward: valueSat / 1e8,
-          outputs,
-        };
-      });
-
-      const payload = {
-        latestBlock: {
-          height: Number(latestBlock.height || 0),
-          hash: latestBlock.hash,
-          timestamp: latestBlock.timestamp ? Number(latestBlock.timestamp) : null,
-        },
-        averages: {
-          blockTimeSeconds: avgBlockTime,
-        },
-        transactions24h: tx24h,
-        latestRewards,
-        generatedAt: new Date().toISOString(),
-      };
-
-      this.dashboardCache = { data: payload, timestamp: now };
-      res.json(payload);
-    } catch (error: any) {
-      logger.error('Failed to get dashboard stats', { error: error.message });
-      res.status(500).json({ error: error.message });
-    }
-  }
-
-  /**
-   * Setup error handling
-   */
   private setupErrorHandling(): void {
     this.app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
-      logger.error('API error', {
-        error: err.message,
-        stack: err.stack,
-        path: req.path,
-      });
-
-      res.status(500).json({
-        error: err.message || 'Internal server error',
-      });
+      logger.error('API error', { error: err.message, path: req.path });
+      res.status(500).json({ error: err.message || 'Internal server error' });
     });
   }
 
-  /**
-   * GET /api/v1/status - Get status (CACHED)
-   */
+  // ========== Status Endpoints ==========
+
   private async getStatus(req: Request, res: Response): Promise<void> {
     try {
-      // Check cache first
       const now = Date.now();
-      if (this.statusCache.data && (now - this.statusCache.timestamp) < APIServer.STATUS_CACHE_TTL) {
+      if (this.statusCache.data && (now - this.statusCache.timestamp) < ClickHouseAPIServer.STATUS_CACHE_TTL) {
         res.json(this.statusCache.data);
         return;
       }
 
-      // If a refresh is already in progress, wait for it (request coalescing)
-      if (this.statusRefreshPromise) {
-        await this.statusRefreshPromise;
-        if (this.statusCache.data) {
-          res.json(this.statusCache.data);
-          return;
-        }
-      }
-
-      // Mark that we're refreshing to prevent concurrent requests
-      const refreshPromise = (async () => {
-        return await this.doStatusRefresh(now);
-      })();
-
-      this.statusRefreshPromise = refreshPromise;
-
+      let chainInfo: any = null;
+      let networkInfo: any = null;
       try {
-        const payload = await refreshPromise;
-        res.json(payload);
-      } finally {
-        this.statusRefreshPromise = null;
+        [chainInfo, networkInfo] = await Promise.all([
+          this.rpc.getBlockchainInfo(),
+          this.rpc.getNetworkInfo(),
+        ]);
+        this.daemonReady = true;
+      } catch (e) {
+        // Daemon not ready
       }
+
+      const syncState = await this.ch.queryOne<{
+        current_height: number;
+        chain_height: number;
+        is_syncing: number;
+        sync_percentage: number;
+      }>('SELECT current_height, chain_height, is_syncing, sync_percentage FROM sync_state FINAL WHERE id = 1');
+
+      // Use uniqExact() for accurate counts without expensive FINAL
+      // This counts unique primary key combinations without full table deduplication
+      const blockCount = await this.ch.queryCount('SELECT uniqExact(height) as count FROM blocks WHERE is_valid = 1');
+      const txCount = await this.ch.queryCount('SELECT uniqExact(txid, block_height) as count FROM transactions WHERE is_valid = 1');
+      // Count unique addresses from aggregated table - use uniqExact() for efficiency
+      const addressCount = await this.ch.queryCount('SELECT uniqExact(address) as count FROM address_summary_agg');
+
+      const currentHeight = syncState?.current_height ?? 0;
+      const chainHeight = chainInfo?.headers ?? syncState?.chain_height ?? 0;
+      const synced = currentHeight >= chainHeight - 1;
+      const percentage = syncState?.sync_percentage ?? (chainHeight > 0 ? (currentHeight / chainHeight) * 100 : 0);
+
+      // Response format expected by frontend (FluxIndexerApiResponse)
+      // Note: consensus from RPC is an object {chaintip, nextblock}, frontend expects string "PoN"
+      const payload = {
+        name: 'FluxIndexer',
+        version: '2.0.0',
+        network: chainInfo?.chain ?? 'mainnet',
+        consensus: 'PoN',  // Flux uses Proof of Node consensus
+        indexer: {
+          syncing: !synced,
+          synced,
+          currentHeight,
+          chainHeight,
+          progress: `${currentHeight}/${chainHeight}`,
+          blocksIndexed: blockCount,
+          transactionsIndexed: txCount,
+          addressesIndexed: addressCount,
+          percentage,
+          lastSyncTime: new Date().toISOString(),
+        },
+        daemon: chainInfo ? {
+          version: networkInfo?.version?.toString() ?? '0',
+          protocolVersion: networkInfo?.protocolversion ?? 0,
+          blocks: chainInfo.blocks,
+          headers: chainInfo.headers,
+          bestBlockHash: chainInfo.bestblockhash,
+          difficulty: chainInfo.difficulty,
+          chainwork: chainInfo.chainwork ?? '',
+          consensus: chainInfo.consensus,  // Keep raw object for daemon section
+          connections: networkInfo?.connections ?? 0,
+        } : {
+          status: 'unavailable',
+          version: '0',
+          consensus: 'PoN',
+        },
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+      };
+
+      this.statusCache = { data: payload, timestamp: now };
+      res.json(payload);
     } catch (error: any) {
       logger.error('Failed to get status', { error: error.message });
       res.status(500).json({ error: error.message });
     }
   }
 
-  /**
-   * Internal method to perform the actual status refresh
-   */
-  private async doStatusRefresh(now: number): Promise<any> {
-    try {
-      // Try to get blockchain and network info from daemon
-      let chainInfo: any = null;
-      let networkInfo: any = null;
-      let daemonHeight: number | null = null;
-
-      try {
-        chainInfo = await this.rpc.getBlockchainInfo();
-        networkInfo = await this.rpc.getNetworkInfo();
-
-        // Daemon is now responding
-        if (!this.daemonReady) {
-          this.daemonReady = true;
-          logger.info('Daemon RPC is now responding to status checks');
-        }
-        this.statusCheckFailures = 0;
-      } catch (rpcError) {
-        this.statusCheckFailures++;
-
-        // Log differently based on whether daemon was previously ready
-        if (this.daemonReady) {
-          // Was ready, now failing - this is concerning
-          logger.warn('RPC not available for status check (daemon may be restarting)');
-          this.daemonReady = false;
-        } else if (this.statusCheckFailures === 1) {
-          // First failure during warmup
-          logger.info('Daemon not responding yet (warming up...)');
-        } else if (this.statusCheckFailures % 20 === 0) {
-          // Every 20 failures (~2 minutes), log progress
-          logger.debug('Still waiting for daemon warmup', { attempts: this.statusCheckFailures });
-        }
-
-        // If RPC fails, try to get height from daemon log file
-        try {
-          const { execSync } = require('child_process');
-          const logOutput = execSync('tail -1 /var/log/supervisor/fluxd.log 2>/dev/null || echo ""', { encoding: 'utf8' });
-          const heightMatch = logOutput.match(/height=(\d+)/);
-          if (heightMatch) {
-            daemonHeight = parseInt(heightMatch[1]);
-            logger.debug('Got daemon height from log file', { height: daemonHeight });
-          }
-        } catch (logError) {
-          // Ignore log parsing errors
-        }
-      }
-
-      const syncState = await this.db.query('SELECT * FROM sync_state WHERE id = 1');
-      const state = syncState.rows[0];
-
-      // Use cached stats to avoid expensive COUNT queries (with request coalescing)
-      let stats = this.statsCache.data;
-
-      if (!stats || (now - this.statsCache.timestamp) > APIServer.STATS_CACHE_TTL) {
-        // If a stats refresh is already in progress, wait for it
-        if (this.statsRefreshPromise) {
-          await this.statsRefreshPromise;
-          stats = this.statsCache.data;
-        } else {
-          // Start a new refresh using pg_class statistics (instant, no table scan)
-          const refreshPromise = (async () => {
-            const statsQuery = `
-              SELECT
-                schemaname,
-                relname,
-                n_live_tup as count
-              FROM pg_stat_user_tables
-              WHERE schemaname = 'public'
-                AND relname IN ('blocks', 'transactions', 'address_summary')
-            `;
-
-            const result = await this.db.query(statsQuery);
-
-            const statsMap = new Map(
-              result.rows.map((row: any) => [row.relname, parseInt(row.count || '0')])
-            );
-
-            const newStats = {
-              blocks: statsMap.get('blocks') || 0,
-              transactions: statsMap.get('transactions') || 0,
-              addresses: statsMap.get('address_summary') || 0,
-            };
-
-            this.statsCache = { data: newStats, timestamp: now };
-            return newStats;
-          })();
-
-          this.statsRefreshPromise = refreshPromise;
-
-          try {
-            stats = await refreshPromise;
-          } finally {
-            this.statsRefreshPromise = null;
-          }
-        }
-      }
-
-      const currentHeight = state?.current_height || 0;
-      const chainHeight = state?.chain_height || 0;
-      const isSynced = chainInfo ? (currentHeight >= chainHeight - 1) : false;
-
-      // Fallback if stats are still unavailable
-      if (!stats) {
-        stats = { blocks: 0, transactions: 0, addresses: 0 };
-      }
-
-      const payload = {
-        name: 'FluxIndexer',
-        version: '1.0.0',
-        network: chainInfo?.chain || 'mainnet',
-        consensus: 'PoN',
-        indexer: {
-          syncing: state?.is_syncing || false,
-          synced: isSynced,
-          currentHeight,
-          chainHeight,
-          progress: chainHeight > 0 ? ((currentHeight / chainHeight) * 100).toFixed(2) + '%' : '0%',
-          blocksIndexed: stats.blocks,
-          transactionsIndexed: stats.transactions,
-          addressesIndexed: stats.addresses,
-          lastSyncTime: state?.last_sync_time || null,
-        },
-        daemon: chainInfo ? {
-          version: networkInfo?.subversion || '/Flux:9.0.0/',
-          protocolVersion: networkInfo?.protocolversion || 170015,
-          blocks: chainInfo.blocks,
-          headers: chainInfo.headers,
-          bestBlockHash: chainInfo.bestblockhash,
-          difficulty: chainInfo.difficulty,
-          chainwork: chainInfo.chainwork,
-          consensus: 'PoN',
-          connections: networkInfo?.connections || 0,
-          networkActive: networkInfo?.networkactive || false,
-        } : {
-          status: 'warming up',
-          version: '/Flux:9.0.0/',
-          protocolVersion: 170015,
-          blocks: daemonHeight || 0,
-          headers: chainHeight,
-          bestBlockHash: daemonHeight ? `Syncing... (${daemonHeight.toLocaleString()})` : 'Syncing from bootstrap...',
-          difficulty: 0,
-          chainwork: '',
-          consensus: 'PoN',
-          connections: 0,
-          networkActive: false,
-        },
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-      };
-
-      // Cache the response
-      this.statusCache = { data: payload, timestamp: now };
-      return payload;
-    } catch (error: any) {
-      logger.error('Failed to refresh status', { error: error.message });
-      throw error;
-    }
-  }
-
-  /**
-   * GET /api/v1/sync - Get sync status
-   */
   private async getSyncStatus(req: Request, res: Response): Promise<void> {
     try {
-      const syncState = await this.db.query('SELECT * FROM sync_state WHERE id = 1');
-      const state = syncState.rows[0];
+      const syncState = await this.ch.queryOne<{
+        current_height: number;
+        chain_height: number;
+        sync_percentage: number;
+        is_syncing: number;
+        blocks_per_second: number;
+      }>('SELECT * FROM sync_state FINAL WHERE id = 1');
 
-      const currentHeight = state?.current_height || 0;
+      const currentHeight = syncState?.current_height ?? 0;
+      const chainHeight = syncState?.chain_height ?? 0;
+      const percentage = syncState?.sync_percentage ?? 0;
+      const isSyncing = (syncState?.is_syncing ?? 0) === 1;
 
-      // Try to get live chain height from daemon headers, fallback to database if daemon unavailable
-      let chainHeight = state?.chain_height || 0;
-      try {
-        const chainInfo = await this.rpc.getBlockchainInfo();
-        chainHeight = chainInfo.headers;
-      } catch (rpcError: any) {
-        // Daemon not ready or error - use stale database value
-        logger.debug('Failed to get live chain height from daemon, using database value', { error: rpcError.message });
-      }
-
-      const percentageRaw = chainHeight > 0
-        ? (currentHeight / chainHeight) * 100
-        : 0;
-      const synced = chainHeight > 0 ? currentHeight >= chainHeight - 1 : false;
-
+      // Response format expected by frontend dashboard
       res.json({
         indexer: {
-          syncing: state?.is_syncing || false,
-          synced,
+          syncing: isSyncing,
+          synced: currentHeight >= chainHeight - 1,
           currentHeight,
           chainHeight,
-          progress: `${percentageRaw.toFixed(2)}%`,
-          percentage: parseFloat(percentageRaw.toFixed(2)),
-          lastSyncTime: state?.last_sync_time || null,
+          progress: `${currentHeight}/${chainHeight}`,
+          percentage,
+          lastSyncTime: new Date().toISOString(),
         },
         timestamp: new Date().toISOString(),
+        // Also include flat format for backwards compatibility
+        currentHeight,
+        chainHeight,
+        syncPercentage: percentage,
+        isSyncing,
+        blocksPerSecond: syncState?.blocks_per_second ?? 0,
       });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
   }
 
-  /**
-   * GET /api/v1/blocks - Get list of recent blocks
-   */
+  // ========== Block Endpoints ==========
+
   private async getBlocks(req: Request, res: Response): Promise<void> {
     try {
-      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 20));
-      const offset = Math.max(0, parseInt(req.query.offset as string) || 0);
+      const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+      const offset = parseInt(req.query.offset as string) || 0;
 
-      // Get total count
-      const countResult = await this.db.query('SELECT COUNT(*) as total_count FROM blocks');
-      const totalBlocks = parseInt(countResult.rows[0]?.total_count || '0', 10);
-
-      // Get blocks
-      const blocksResult = await this.db.query(`
-        SELECT
-          height,
-          hash,
-          timestamp,
-          tx_count,
-          size,
-          producer
+      // Use GROUP BY to deduplicate without expensive FINAL
+      const blocks = await this.ch.query<any>(`
+        SELECT height, hash, timestamp, tx_count, size, producer, difficulty
         FROM blocks
+        WHERE is_valid = 1
+        GROUP BY height, hash, timestamp, tx_count, size, producer, difficulty
         ORDER BY height DESC
-        LIMIT $1 OFFSET $2
-      `, [limit, offset]);
+        LIMIT ${limit}
+        OFFSET ${offset}
+      `);
 
-      res.json({
-        blocks: blocksResult.rows.map(row => ({
-          height: row.height,
-          hash: row.hash,
-          timestamp: row.timestamp,
-          txCount: row.tx_count,
-          size: row.size,
-          producer: row.producer,
-        })),
-        total: totalBlocks,
-        limit,
-        offset,
-      });
-    } catch (error: any) {
-      logger.error('Failed to get blocks', { error: error.message });
-      res.status(500).json({ error: error.message });
-    }
-  }
-
-  /**
-   * GET /api/v1/blocks/range - Get blocks in a height range (for bulk data fetching)
-   * Query params:
-   *   - from: starting block height (required)
-   *   - to: ending block height (required)
-   *   - fields: comma-separated list of fields to return (optional, defaults to essential fields)
-   *
-   * Max range: 10,000 blocks per request
-   * Example: /api/v1/blocks/range?from=2000000&to=2010000&fields=height,timestamp,difficulty
-   */
-  private async getBlocksRange(req: Request, res: Response): Promise<void> {
-    try {
-      const fromHeight = parseInt(req.query.from as string);
-      const toHeight = parseInt(req.query.to as string);
-      const fieldsParam = req.query.fields as string;
-
-      // Validate required parameters
-      if (isNaN(fromHeight) || isNaN(toHeight)) {
-        res.status(400).json({
-          error: 'Missing required parameters: from and to (block heights)',
-          example: '/api/v1/blocks/range?from=2000000&to=2010000'
-        });
-        return;
-      }
-
-      // Validate range
-      if (fromHeight > toHeight) {
-        res.status(400).json({ error: 'from must be less than or equal to to' });
-        return;
-      }
-
-      const maxRange = 10000;
-      if (toHeight - fromHeight > maxRange) {
-        res.status(400).json({
-          error: `Range too large. Maximum ${maxRange} blocks per request.`,
-          requested: toHeight - fromHeight + 1,
-          max: maxRange
-        });
-        return;
-      }
-
-      // Define allowed fields and their SQL column names
-      const allowedFields: Record<string, string> = {
-        height: 'height',
-        hash: 'hash',
-        timestamp: 'timestamp',
-        time: 'timestamp', // alias
-        difficulty: 'difficulty',
-        size: 'size',
-        tx_count: 'tx_count',
-        txCount: 'tx_count', // alias
-        producer: 'producer',
-        producer_reward: 'producer_reward',
-        chainwork: 'chainwork',
-        bits: 'bits',
-        nonce: 'nonce',
-        version: 'version',
-        merkle_root: 'merkle_root',
-        prev_hash: 'prev_hash',
-      };
-
-      // Parse requested fields or use defaults
-      let selectedFields: string[];
-      if (fieldsParam) {
-        const requestedFields = fieldsParam.split(',').map(f => f.trim().toLowerCase());
-        const invalidFields = requestedFields.filter(f => !allowedFields[f]);
-        if (invalidFields.length > 0) {
-          res.status(400).json({
-            error: `Invalid fields: ${invalidFields.join(', ')}`,
-            allowedFields: Object.keys(allowedFields)
-          });
-          return;
-        }
-        selectedFields = requestedFields.map(f => allowedFields[f]);
-      } else {
-        // Default lightweight fields
-        selectedFields = ['height', 'timestamp', 'difficulty', 'hash', 'tx_count', 'size'];
-      }
-
-      // Ensure unique fields (in case of aliases)
-      selectedFields = [...new Set(selectedFields)];
-
-      const query = `
-        SELECT ${selectedFields.join(', ')}
-        FROM blocks
-        WHERE height >= $1 AND height <= $2
-        ORDER BY height ASC
-      `;
-
-      const result = await this.db.query(query, [fromHeight, toHeight]);
-
-      // Transform rows to use consistent naming
-      const blocks = result.rows.map((row: any) => {
-        const block: any = {};
-        if (row.height !== undefined) block.height = row.height;
-        if (row.hash !== undefined) block.hash = row.hash;
-        if (row.timestamp !== undefined) block.time = row.timestamp;
-        if (row.difficulty !== undefined) block.difficulty = parseFloat(row.difficulty);
-        if (row.size !== undefined) block.size = row.size;
-        if (row.tx_count !== undefined) block.txCount = row.tx_count;
-        if (row.producer !== undefined) block.producer = row.producer;
-        if (row.producer_reward !== undefined) block.producerReward = row.producer_reward;
-        if (row.chainwork !== undefined) block.chainwork = row.chainwork;
-        if (row.bits !== undefined) block.bits = row.bits;
-        if (row.nonce !== undefined) block.nonce = row.nonce;
-        if (row.version !== undefined) block.version = row.version;
-        if (row.merkle_root !== undefined) block.merkleRoot = row.merkle_root;
-        if (row.prev_hash !== undefined) block.prevHash = row.prev_hash;
-        return block;
-      });
+      const totalResult = await this.ch.queryOne<{ count: number }>('SELECT uniqExact(height) as count FROM blocks WHERE is_valid = 1');
 
       res.json({
         blocks,
-        meta: {
-          from: fromHeight,
-          to: toHeight,
-          count: blocks.length,
-          fields: selectedFields
-        }
+        pagination: {
+          total: Number(totalResult?.count ?? 0),
+          limit,
+          offset,
+        },
       });
     } catch (error: any) {
-      logger.error('Failed to get blocks range', { error: error.message });
       res.status(500).json({ error: error.message });
     }
   }
 
-  private latestBlocksCache: {
-    data: any | null;
-    timestamp: number;
-    currentHeight: number;
-    limit: number; // Track the limit used for this cache
-  } = { data: null, timestamp: 0, currentHeight: -1, limit: 0 };
-  private static readonly LATEST_BLOCKS_CACHE_TTL = 5000; // 5 seconds (increased from 2s to reduce query load)
-  private latestBlocksRefreshPromise: Promise<any> | null = null; // Track in-progress refresh
-
-  /**
-   * GET /api/v1/blocks/latest - Get latest blocks with aggregated counts (OPTIMIZED with request coalescing)
-   */
   private async getLatestBlocks(req: Request, res: Response): Promise<void> {
     try {
-      const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 10));
+      const limit = Math.min(parseInt(req.query.limit as string) || 10, 50);
 
-      // Check cache first (quick check without querying DB)
-      // Cache is valid only if it has the same limit AND is not expired
-      const now = Date.now();
-      if (
-        this.latestBlocksCache.data &&
-        this.latestBlocksCache.limit === limit &&
-        (now - this.latestBlocksCache.timestamp) < APIServer.LATEST_BLOCKS_CACHE_TTL
-      ) {
-        res.json(this.latestBlocksCache.data);
+      // Step 1: Get latest blocks - use GROUP BY to deduplicate without expensive FINAL
+      const blocks = await this.ch.query<any>(`
+        SELECT height, hash, timestamp, tx_count, size, producer
+        FROM blocks
+        WHERE is_valid = 1
+        GROUP BY height, hash, timestamp, tx_count, size, producer
+        ORDER BY height DESC
+        LIMIT ${limit}
+      `);
+
+      if (blocks.length === 0) {
+        res.json({ blocks: [] });
         return;
       }
 
-      // If a refresh is already in progress, wait for it (request coalescing)
-      if (this.latestBlocksRefreshPromise) {
-        await this.latestBlocksRefreshPromise;
-        // After waiting, check if the cache now has the data we need (matching limit)
-        if (this.latestBlocksCache.data && this.latestBlocksCache.limit === limit) {
-          res.json(this.latestBlocksCache.data);
-          return;
-        }
-        // Otherwise fall through to refresh with correct limit
+      // Step 2: Get FluxNode transaction counts for ONLY these block heights
+      // This is much faster than a full JOIN because we constrain to specific heights
+      const minHeight = blocks[blocks.length - 1].height;
+      const maxHeight = blocks[0].height;
+
+      const txCounts = await this.ch.query<{
+        block_height: number;
+        regular_count: string;
+        fluxnode_count: string;
+        fluxnode_start_count: string;
+        fluxnode_confirm_count: string;
+      }>(`
+        SELECT
+          block_height,
+          toString(uniqExactIf((txid, block_height), is_fluxnode_tx = 0)) as regular_count,
+          toString(uniqExactIf((txid, block_height), is_fluxnode_tx = 1)) as fluxnode_count,
+          toString(uniqExactIf((txid, block_height), fluxnode_type = 2)) as fluxnode_start_count,
+          toString(uniqExactIf((txid, block_height), fluxnode_type = 4)) as fluxnode_confirm_count
+        FROM transactions
+        WHERE block_height >= ${minHeight} AND block_height <= ${maxHeight} AND is_valid = 1
+        GROUP BY block_height
+      `);
+
+      // Step 3: Get FluxNode tier counts from fluxnode_transactions
+      const tierCountsQuery = await this.ch.query<{
+        block_height: number;
+        cumulus_count: string;
+        nimbus_count: string;
+        stratus_count: string;
+      }>(`
+        SELECT
+          block_height,
+          toString(uniqExactIf((txid, block_height), benchmark_tier = 'CUMULUS')) as cumulus_count,
+          toString(uniqExactIf((txid, block_height), benchmark_tier = 'NIMBUS')) as nimbus_count,
+          toString(uniqExactIf((txid, block_height), benchmark_tier = 'STRATUS')) as stratus_count
+        FROM fluxnode_transactions
+        WHERE block_height >= ${minHeight} AND block_height <= ${maxHeight} AND is_valid = 1 AND type = 4
+        GROUP BY block_height
+      `);
+
+      // Build lookup maps
+      const txCountMap = new Map<number, {
+        regular: number;
+        fluxnode: number;
+        start: number;
+        confirm: number;
+      }>();
+      for (const tc of txCounts) {
+        txCountMap.set(tc.block_height, {
+          regular: parseInt(tc.regular_count) || 0,
+          fluxnode: parseInt(tc.fluxnode_count) || 0,
+          start: parseInt(tc.fluxnode_start_count) || 0,
+          confirm: parseInt(tc.fluxnode_confirm_count) || 0,
+        });
       }
 
-      // Start refresh and track it
-      const refreshPromise = this.refreshLatestBlocks(limit, now);
-      this.latestBlocksRefreshPromise = refreshPromise;
-
-      try {
-        const data = await refreshPromise;
-        res.json(data);
-      } finally {
-        this.latestBlocksRefreshPromise = null;
+      const tierCountsMap = new Map<number, {
+        cumulus: number;
+        nimbus: number;
+        stratus: number;
+      }>();
+      for (const tc of tierCountsQuery) {
+        tierCountsMap.set(tc.block_height, {
+          cumulus: parseInt(tc.cumulus_count) || 0,
+          nimbus: parseInt(tc.nimbus_count) || 0,
+          stratus: parseInt(tc.stratus_count) || 0,
+        });
       }
+
+      // Response format expected by frontend (FluxIndexerLatestBlocksResponse)
+      res.json({
+        blocks: blocks.map(b => {
+          const counts = txCountMap.get(b.height) || { regular: 0, fluxnode: 0, start: 0, confirm: 0 };
+          const tiers = tierCountsMap.get(b.height) || { cumulus: 0, nimbus: 0, stratus: 0 };
+          const unknownCount = counts.confirm - (tiers.cumulus + tiers.nimbus + tiers.stratus);
+
+          return {
+            height: b.height,
+            hash: b.hash,  // Keep full 64-char hash
+            time: b.timestamp,
+            timestamp: b.timestamp,
+            txCount: b.tx_count,
+            tx_count: b.tx_count,
+            size: b.size,
+            producer: b.producer,
+            regularTxCount: counts.regular,
+            regular_tx_count: counts.regular,
+            nodeConfirmationCount: counts.fluxnode,
+            node_confirmation_count: counts.fluxnode,
+            tierCounts: {
+              cumulus: tiers.cumulus,
+              nimbus: tiers.nimbus,
+              stratus: tiers.stratus,
+              starting: counts.start,
+              unknown: Math.max(0, unknownCount)
+            },
+            tier_counts: {
+              cumulus: tiers.cumulus,
+              nimbus: tiers.nimbus,
+              stratus: tiers.stratus,
+              starting: counts.start,
+              unknown: Math.max(0, unknownCount)
+            },
+          };
+        }),
+      });
     } catch (error: any) {
-      logger.error('Failed to get latest blocks', { error: error.message });
       res.status(500).json({ error: error.message });
     }
   }
 
-  /**
-   * Internal method to refresh latest blocks cache
-   */
-  private async refreshLatestBlocks(limit: number, now: number): Promise<any> {
+  private async getBlocksRange(req: Request, res: Response): Promise<void> {
     try {
-      // Get current height
-      const heightResult = await this.db.query('SELECT MAX(height) as max_height FROM blocks');
-      const currentHeight = heightResult.rows[0]?.max_height || 0;
+      const start = parseInt(req.query.start as string);
+      const end = parseInt(req.query.end as string);
 
-      // OPTIMIZED: Use explicit block_height bounds for TimescaleDB chunk exclusion
-      // The block_range CTE provides min/max heights that allow chunk pruning
-      const query = `
-        WITH latest_blocks AS (
-          SELECT height, hash, timestamp, tx_count, size
-          FROM blocks
-          ORDER BY height DESC
-          LIMIT $1
-        ),
-        block_range AS (
-          SELECT MIN(height) as min_h, MAX(height) as max_h FROM latest_blocks
-        ),
-        fluxnode_counts AS (
-          SELECT
-            fn.block_height,
-            COUNT(*) AS node_count
-          FROM fluxnode_transactions fn
-          WHERE fn.block_height >= (SELECT min_h FROM block_range)
-            AND fn.block_height <= (SELECT max_h FROM block_range)
-          GROUP BY fn.block_height
-        )
-        SELECT
-          lb.height,
-          lb.hash,
-          lb.timestamp,
-          lb.tx_count,
-          lb.size,
-          COALESCE(fc.node_count, 0) AS node_confirmation_count,
-          (lb.tx_count - COALESCE(fc.node_count, 0)) AS regular_tx_count
-        FROM latest_blocks lb
-        LEFT JOIN fluxnode_counts fc ON fc.block_height = lb.height
-        ORDER BY lb.height DESC
-      `;
+      if (isNaN(start) || isNaN(end)) {
+        res.status(400).json({ error: 'start and end parameters are required' });
+        return;
+      }
 
-      const result = await this.db.query(query, [limit]);
+      if (end - start > 100) {
+        res.status(400).json({ error: 'Range cannot exceed 100 blocks' });
+        return;
+      }
 
-      const blocks = result.rows.map(row => ({
-        height: Number(row.height),
-        hash: row.hash,
-        time: Number(row.timestamp),
-        txCount: Number((row.tx_count ?? row.txcount) ?? 0),
-        size: Number(row.size ?? 0),
-        regularTxCount: Number(row.regular_tx_count ?? 0),
-        nodeConfirmationCount: Number(row.node_confirmation_count ?? 0),
-      }));
+      // Use GROUP BY to deduplicate without expensive FINAL
+      const blocks = await this.ch.query<any>(`
+        SELECT height, hash, timestamp, tx_count, size, producer, producer_reward, difficulty
+        FROM blocks
+        WHERE height >= {start:UInt32} AND height <= {end:UInt32} AND is_valid = 1
+        GROUP BY height, hash, timestamp, tx_count, size, producer, producer_reward, difficulty
+        ORDER BY height ASC
+      `, { start, end });
 
-      const responseData = { blocks };
-
-      // Update cache
-      this.latestBlocksCache = {
-        data: responseData,
-        timestamp: now,
-        currentHeight,
-        limit,
-      };
-
-      return responseData;
+      res.json({ blocks });
     } catch (error: any) {
-      logger.error('Failed to refresh latest blocks', { error: error.message });
-      throw error;
+      res.status(500).json({ error: error.message });
     }
   }
 
-  /**
-   * GET /api/v1/blocks/:heightOrHash - Get block by height or hash
-   */
   private async getBlock(req: Request, res: Response): Promise<void> {
     try {
       const { heightOrHash } = req.params;
-      const page = parseInt(req.query.page as string) || 1;
-      const pageSize = 200;
+      const isHeight = /^\d+$/.test(heightOrHash);
 
-      const cacheKey = `${heightOrHash}:${page}:${pageSize}`;
-      const cached = this.blockCache.get(cacheKey);
-      if (cached && (Date.now() - cached.timestamp) < APIServer.BLOCK_CACHE_TTL) {
-        res.json(cached.data);
-        return;
-      }
-
-      let block;
-
-      // Check if it's a height or hash
-      if (/^\d+$/.test(heightOrHash)) {
-        const height = parseInt(heightOrHash);
-        block = await this.db.query('SELECT * FROM blocks WHERE height = $1', [height]);
+      // Single-row lookups by primary key - use LIMIT 1 instead of FINAL
+      let block: any;
+      if (isHeight) {
+        block = await this.ch.queryOne<any>(`
+          SELECT * FROM blocks
+          WHERE height = {height:UInt32} AND is_valid = 1
+          LIMIT 1
+        `, { height: parseInt(heightOrHash) });
       } else {
-        block = await this.db.query('SELECT * FROM blocks WHERE hash = $1', [heightOrHash]);
+        block = await this.ch.queryOne<any>(`
+          SELECT * FROM blocks
+          WHERE hash = {hash:FixedString(64)} AND is_valid = 1
+          LIMIT 1
+        `, { hash: heightOrHash.padStart(64, '0') });
       }
 
-      if (block.rows.length === 0) {
+      if (!block) {
         res.status(404).json({ error: 'Block not found' });
         return;
       }
 
-      const blockData = block.rows[0];
+      // Get transactions for this block - use GROUP BY to deduplicate without expensive FINAL
+      const transactions = await this.ch.query<any>(`
+        SELECT txid, tx_index, timestamp, input_count, output_count,
+               input_total, output_total, fee, is_coinbase,
+               is_fluxnode_tx, fluxnode_type, size, is_shielded, version
+        FROM transactions
+        WHERE block_height = {height:UInt32} AND is_valid = 1
+        GROUP BY txid, tx_index, timestamp, input_count, output_count,
+                 input_total, output_total, fee, is_coinbase,
+                 is_fluxnode_tx, fluxnode_type, size, is_shielded, version
+        ORDER BY tx_index
+      `, { height: block.height });
 
-      // Get current block height to calculate confirmations
-      const currentHeightResult = await this.db.query('SELECT MAX(height) as max_height FROM blocks');
-      const currentHeight = currentHeightResult.rows[0]?.max_height || 0;
-      const confirmations = blockData.height ? Math.max(0, currentHeight - blockData.height + 1) : 0;
+      // Get FluxNode details (tier, IP) for this block's FluxNode transactions
+      // Also get first output (to address) for all transactions in parallel
+      const [fluxnodeDetails, firstOutputs, firstInputs] = await Promise.all([
+        this.ch.query<{
+          txid: string;
+          benchmark_tier: string;
+          ip_address: string;
+        }>(`
+          SELECT txid, benchmark_tier, ip_address
+          FROM fluxnode_transactions
+          WHERE block_height = {height:UInt32} AND is_valid = 1
+        `, { height: block.height }),
+        // Get first output (vout=0) for each transaction - the "to" address
+        this.ch.query<{ txid: string; address: string; value: string }>(`
+          SELECT txid, address, value
+          FROM utxos
+          WHERE block_height = {height:UInt32} AND vout = 0
+        `, { height: block.height }),
+        // Get first input for each transaction - find UTXOs spent in this block
+        // Use spent_block_height directly instead of subquery for better performance
+        this.ch.query<{ spent_txid: string; address: string; value: string }>(`
+          SELECT spent_txid, address, value
+          FROM utxos
+          WHERE spent_block_height = {height:UInt32} AND spent = 1
+          ORDER BY spent_txid, vout
+        `, { height: block.height }),
+      ]);
 
-      // Get next block hash
-      let nextBlockHash: string | null = null;
-      if (blockData.height !== null && blockData.height !== undefined) {
-        const nextBlock = await this.db.query('SELECT hash FROM blocks WHERE height = $1', [blockData.height + 1]);
-        if (nextBlock.rows.length > 0) {
-          nextBlockHash = nextBlock.rows[0].hash;
+      // Build lookup map for FluxNode details
+      const fluxnodeMap = new Map<string, { tier: string; ip: string }>();
+      for (const fn of fluxnodeDetails) {
+        fluxnodeMap.set(fn.txid, { tier: fn.benchmark_tier, ip: fn.ip_address });
+      }
+
+      // Build lookup map for first output (to address)
+      const toAddrMap = new Map<string, { address: string; value: string }>();
+      for (const out of firstOutputs) {
+        toAddrMap.set(out.txid, { address: out.address, value: out.value });
+      }
+
+      // Build lookup map for first input (from address) - take first per txid
+      const fromAddrMap = new Map<string, { address: string; value: string }>();
+      for (const inp of firstInputs) {
+        if (!fromAddrMap.has(inp.spent_txid)) {
+          fromAddrMap.set(inp.spent_txid, { address: inp.address, value: inp.value });
         }
       }
 
-      // PHASE 3: encode txid as hex for JSON response (txid is now BYTEA)
-      const txResult = await this.db.query(`
-        SELECT
-          encode(t.txid, 'hex') as txid,
-          t.is_coinbase,
-          t.output_total,
-          t.fee,
-          t.size,
-          t.vsize,
-          fn.type AS fluxnode_type,
-          fn.benchmark_tier,
-          fn.ip_address,
-          fn.public_key,
-          fn.signature
-        FROM transactions t
-        LEFT JOIN fluxnode_transactions fn ON fn.txid = t.txid AND fn.block_height = t.block_height
-        WHERE t.block_height = $1
-        ORDER BY
-          CASE
-            WHEN t.is_coinbase THEN 0
-            WHEN fn.type IS NULL THEN 1
-            WHEN fn.type = 2 THEN 2
-            ELSE 3
-          END,
-          t.txid
-      `, [blockData.height]);
+      // Get next/prev block hashes - use LIMIT 1 instead of FINAL for single lookups
+      const [prevBlock, nextBlock] = await Promise.all([
+        block.height > 0 ? this.ch.queryOne<{ hash: string }>(`
+          SELECT hash FROM blocks WHERE height = {h:UInt32} AND is_valid = 1 LIMIT 1
+        `, { h: block.height - 1 }) : null,
+        this.ch.queryOne<{ hash: string }>(`
+          SELECT hash FROM blocks WHERE height = {h:UInt32} AND is_valid = 1 LIMIT 1
+        `, { h: block.height + 1 }),
+      ]);
 
-      const allTxRows = txResult.rows;
-      const totalTxs = allTxRows.length;
+      // Get current chain height for confirmations
+      const chainHeight = await this.ch.queryOne<{ h: number }>(`
+        SELECT max(height) as h FROM blocks WHERE is_valid = 1
+      `);
 
-      const summary = {
-        total: totalTxs,
-        coinbase: 0,
-        transfers: 0,
-        fluxnodeStart: 0,
-        fluxnodeConfirm: 0,
-        fluxnodeOther: 0,
-        tierCounts: {
-          cumulus: 0,
-          nimbus: 0,
-          stratus: 0,
-          starting: 0,
-          unknown: 0,
-        },
-      };
+      // Calculate tx summary and tier counts
+      let coinbaseCount = 0;
+      let fluxnodeStartCount = 0;
+      let fluxnodeConfirmCount = 0;
+      let fluxnodeOtherCount = 0;
+      const tierCounts = { cumulus: 0, nimbus: 0, stratus: 0, starting: 0, unknown: 0 };
 
-      const txDetails = allTxRows.map((row: any, index: number) => {
+      const txDetails = transactions.map((tx: any, idx: number) => {
+        // txid is already 64 chars from FixedString - don't strip leading zeros
+        const txid = tx.txid;
         let kind: 'coinbase' | 'transfer' | 'fluxnode_start' | 'fluxnode_confirm' | 'fluxnode_other' = 'transfer';
-        if (row.is_coinbase) {
+
+        // Get FluxNode details from lookup map
+        const fnDetails = fluxnodeMap.get(tx.txid);
+        let fluxnodeTier: string | null = fnDetails?.tier || null;
+        const fluxnodeIp: string | null = fnDetails?.ip || null;
+
+        if (tx.is_coinbase === 1) {
           kind = 'coinbase';
-          summary.coinbase += 1;
-        } else if (row.fluxnode_type !== null && row.fluxnode_type !== undefined) {
-          if (row.fluxnode_type === 2) {
+          coinbaseCount++;
+        } else if (tx.is_fluxnode_tx === 1) {
+          if (tx.fluxnode_type === 1 || tx.fluxnode_type === 2) {
             kind = 'fluxnode_start';
-            summary.fluxnodeStart += 1;
-            summary.tierCounts.starting += 1;
-          } else if (row.fluxnode_type === 4) {
+            fluxnodeStartCount++;
+            tierCounts.starting++;
+          } else if (tx.fluxnode_type === 4) {
             kind = 'fluxnode_confirm';
-            summary.fluxnodeConfirm += 1;
+            fluxnodeConfirmCount++;
+            // Count by tier for type 4 (confirm) transactions
+            if (fluxnodeTier) {
+              const tierLower = fluxnodeTier.toLowerCase();
+              if (tierLower === 'cumulus') tierCounts.cumulus++;
+              else if (tierLower === 'nimbus') tierCounts.nimbus++;
+              else if (tierLower === 'stratus') tierCounts.stratus++;
+              else tierCounts.unknown++;
+            } else {
+              tierCounts.unknown++;
+            }
           } else {
             kind = 'fluxnode_other';
-            summary.fluxnodeOther += 1;
-          }
-
-          if (row.benchmark_tier) {
-            const tier = String(row.benchmark_tier).toUpperCase();
-            if (tier === 'CUMULUS') summary.tierCounts.cumulus += 1;
-            else if (tier === 'NIMBUS') summary.tierCounts.nimbus += 1;
-            else if (tier === 'STRATUS') summary.tierCounts.stratus += 1;
-            else summary.tierCounts.unknown += 1;
-          } else if (kind === 'fluxnode_confirm') {
-            summary.tierCounts.unknown += 1;
-          }
-        } else {
-          summary.transfers += 1;
-        }
-
-        const valueSat = row.output_total ? Number(row.output_total) : 0;
-
-        // Calculate fee correctly for coinbase transactions
-        // Fee = MAX(0, total_output - expected_block_reward)
-        // Negative values indicate unclaimed mining rewards (burned), not fees
-        let feeSat: number;
-        if (row.is_coinbase) {
-          const expectedReward = this.getExpectedBlockReward(blockData.height);
-          const expectedRewardSat = Math.floor(expectedReward * 1e8);
-          const calculatedFee = valueSat - expectedRewardSat;
-          // If output < expected, unclaimed rewards are burned - fee should be 0
-          feeSat = calculatedFee > 0 ? calculatedFee : 0;
-        } else {
-          feeSat = row.fee ? Number(row.fee) : 0;
-        }
-
-        // Convert benchmark tier to tier name (handles both numeric and string values)
-        let fluxnodeTier: string | null = null;
-        if (row.benchmark_tier !== null && row.benchmark_tier !== undefined) {
-          const tierStr = String(row.benchmark_tier).toUpperCase().trim();
-
-          // Handle numeric tiers (1=CUMULUS, 2=NIMBUS, 3=STRATUS)
-          if (tierStr === '1') fluxnodeTier = 'CUMULUS';
-          else if (tierStr === '2') fluxnodeTier = 'NIMBUS';
-          else if (tierStr === '3') fluxnodeTier = 'STRATUS';
-          // Handle string tiers (already correct format)
-          else if (tierStr === 'CUMULUS' || tierStr === 'NIMBUS' || tierStr === 'STRATUS') {
-            fluxnodeTier = tierStr;
-          }
-          // Unknown tier value
-          else {
-            fluxnodeTier = null;
+            fluxnodeOtherCount++;
           }
         }
+
+        // Get from/to addresses for display
+        const fromInfo = fromAddrMap.get(tx.txid);
+        const toInfo = toAddrMap.get(tx.txid);
+        const fromAddr = fromInfo?.address && fromInfo.address !== 'SHIELDED_OR_NONSTANDARD' ? fromInfo.address : null;
+        const toAddr = toInfo?.address && toInfo.address !== 'SHIELDED_OR_NONSTANDARD' ? toInfo.address : null;
 
         return {
-          txid: row.txid,
-          order: index,
+          txid,
+          order: tx.tx_index ?? idx,
           kind,
-          isCoinbase: !!row.is_coinbase,
-          fluxnodeType: row.fluxnode_type ?? null,
+          isCoinbase: tx.is_coinbase === 1,
+          fluxnodeType: tx.is_fluxnode_tx === 1 ? tx.fluxnode_type : null,
           fluxnodeTier,
-          fluxnodeIp: row.ip_address || null,
-          fluxnodePubKey: row.public_key || null,
-          fluxnodeSignature: row.signature || null,
-          valueSat,
-          value: valueSat / 1e8,
-          feeSat,
-          fee: feeSat / 1e8,
-          size: row.size !== null && row.size !== undefined
-            ? Number(row.size)
-            : row.vsize !== null && row.vsize !== undefined
-              ? Number(row.vsize)
-              : 0,
+          fluxnodeIp,
+          valueSat: Number(tx.output_total),
+          value: Number(tx.output_total) / 1e8,
+          valueInSat: Number(tx.input_total),
+          valueIn: Number(tx.input_total) / 1e8,
+          feeSat: Number(tx.fee),
+          fee: Number(tx.fee) / 1e8,
+          size: tx.size,
+          version: tx.version,
+          isShielded: tx.is_shielded === 1,
+          // Include from/to addresses to avoid separate batch API call
+          fromAddr,
+          toAddr,
         };
       });
 
-      const pagedDetails = txDetails.slice((page - 1) * pageSize, page * pageSize);
+      // Sort transactions by type: coinbase first, then transfers, then fluxnode transactions
+      // This provides logical grouping for block visualization
+      const kindOrder: Record<string, number> = {
+        coinbase: 0,
+        transfer: 1,
+        fluxnode_start: 2,
+        fluxnode_confirm: 3,
+        fluxnode_other: 4,
+      };
+      txDetails.sort((a, b) => {
+        const orderA = kindOrder[a.kind] ?? 5;
+        const orderB = kindOrder[b.kind] ?? 5;
+        if (orderA !== orderB) return orderA - orderB;
+        // Within same type, preserve original block order
+        return a.order - b.order;
+      });
 
-      const payload = {
-        page,
-        totalPages: Math.max(1, Math.ceil(Math.max(0, totalTxs) / pageSize)),
-        itemsOnPage: pagedDetails.length,
-        hash: blockData.hash,
-        previousBlockHash: blockData.prev_hash,
-        nextBlockHash,
-        height: blockData.height,
-        confirmations,
-        size: blockData.size,
-        time: blockData.timestamp,
-        version: blockData.version,
-        merkleRoot: blockData.merkle_root,
-        nonce: blockData.nonce !== null && blockData.nonce !== undefined ? blockData.nonce.toString() : null,
-        bits: blockData.bits,
-        difficulty: blockData.difficulty,
-        txCount: blockData.tx_count,
-        producer: blockData.producer,
-        producerReward: blockData.producer_reward ? blockData.producer_reward.toString() : null,
-        txs: pagedDetails.map(detail => ({ txid: detail.txid })),
+      // Response format expected by frontend (FluxIndexerBlockResponse)
+      res.json({
+        hash: block.hash,  // Keep full 64-char hash
+        height: block.height,
+        size: block.size,
+        version: block.version,
+        merkleRoot: block.merkle_root,  // Keep full 64-char hash
+        time: block.timestamp,
+        nonce: block.nonce,
+        bits: block.bits,
+        difficulty: block.difficulty?.toString() ?? '0',
+        chainWork: block.chainwork,
+        confirmations: (chainHeight?.h ?? block.height) - block.height + 1,
+        previousBlockHash: prevBlock?.hash ?? null,  // Keep full 64-char hash
+        nextBlockHash: nextBlock?.hash ?? null,  // Keep full 64-char hash
+        reward: block.producer_reward ? Number(block.producer_reward) / 1e8 : 0,
+        txCount: block.tx_count,
+        producer: block.producer || null,
+        // Transaction IDs array (for backward compat)
+        tx: transactions.map((t: any) => t.txid),
+        // Transaction details
         txDetails,
         txSummary: {
-          ...summary,
-          regular: summary.coinbase + summary.transfers,
-          fluxnodeTotal: summary.fluxnodeStart + summary.fluxnodeConfirm + summary.fluxnodeOther,
+          total: transactions.length,
+          regular: transactions.length - coinbaseCount - fluxnodeStartCount - fluxnodeConfirmCount - fluxnodeOtherCount,
+          coinbase: coinbaseCount,
+          transfers: transactions.length - coinbaseCount - fluxnodeStartCount - fluxnodeConfirmCount - fluxnodeOtherCount,
+          fluxnodeStart: fluxnodeStartCount,
+          fluxnodeConfirm: fluxnodeConfirmCount,
+          fluxnodeOther: fluxnodeOtherCount,
+          fluxnodeTotal: fluxnodeStartCount + fluxnodeConfirmCount + fluxnodeOtherCount,
+          tierCounts,
         },
-      };
-
-      this.blockCache.set(cacheKey, { data: payload, timestamp: Date.now() });
-      if (this.blockCache.size > APIServer.BLOCK_CACHE_LIMIT) {
-        const oldestKey = this.blockCache.keys().next().value;
-        if (oldestKey) {
-          this.blockCache.delete(oldestKey);
-        }
-      }
-
-      res.json(payload);
-    } catch (error: any) {
-      logger.error('Failed to get block', { error: error.message });
-      res.status(500).json({ error: error.message });
-    }
-  }
-
-  /**
-   * GET /api/v1/blocks/:height - Get block by height
-   */
-  private async getBlockByHeight(req: Request, res: Response): Promise<void> {
-    try {
-      const height = parseInt(req.params.height);
-      const block = await this.db.query('SELECT hash FROM blocks WHERE height = $1', [height]);
-
-      if (block.rows.length === 0) {
-        res.status(404).json({ error: 'Block not found' });
-        return;
-      }
-
-      res.json({
-        blockHash: block.rows[0].hash,
       });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
   }
 
-  /**
-   * GET /api/v1/transactions/:txid - Get transaction
-   * Query params:
-   *   - includeHex: boolean (default: false) - Include raw transaction hex (requires RPC fetch if not cached)
-   */
-  private async getTransaction(req: Request, res: Response): Promise<void> {
-    try {
-      const { txid } = req.params;
-      const includeHex = req.query.includeHex === 'true';
+  // ========== Transaction Endpoints ==========
 
-      // First, try to get block_height from tx_lookup for fast TimescaleDB chunk exclusion
-      // This avoids scanning all compressed chunks when looking up by txid
-      // txid stored as BYTEA, so decode the hex string for lookup
-      const lookup = await this.db.query('SELECT block_height FROM tx_lookup WHERE txid = decode($1, \'hex\')', [txid]);
-
-      let tx;
-      if (lookup.rows.length > 0) {
-        // Found in lookup - use both txid and block_height for efficient query
-        // OPTIMIZED: JOIN to blocks to get block_hash since column was removed from transactions
-        // PHASE 3: txid is BYTEA - decode hex input for comparison
-        const blockHeight = lookup.rows[0].block_height;
-        tx = await this.db.query(
-          `SELECT t.*, b.hash as block_hash
-           FROM transactions t
-           JOIN blocks b ON t.block_height = b.height
-           WHERE t.txid = decode($1, 'hex') AND t.block_height = $2`,
-          [txid, blockHeight]
-        );
-      } else {
-        // Not in lookup (probably recent transaction) - query directly
-        // Recent data is in uncompressed chunks so this is still fast
-        // OPTIMIZED: JOIN to blocks to get block_hash
-        // PHASE 3: txid is BYTEA - decode hex input for comparison
-        tx = await this.db.query(
-          `SELECT t.*, b.hash as block_hash
-           FROM transactions t
-           JOIN blocks b ON t.block_height = b.height
-           WHERE t.txid = decode($1, 'hex')`,
-          [txid]
-        );
-      }
-
-      if (tx.rows.length === 0) {
-        res.status(404).json({ error: 'Transaction not found' });
-        return;
-      }
-
-      const txData = tx.rows[0];
-
-      // Get current block height to calculate confirmations
-      const currentHeightResult = await this.db.query('SELECT MAX(height) as max_height FROM blocks');
-      const currentHeight = currentHeightResult.rows[0]?.max_height || 0;
-      const confirmations = txData.block_height ? Math.max(0, currentHeight - txData.block_height + 1) : 0;
-
-      // Get inputs - query utxos_spent directly since only spent UTXOs have spent_txid
-      // PHASE 3: spent_txid is BYTEA, JOIN addresses for address lookup, encode txid for response
-      const inputs = await this.db.query(
-        `SELECT encode(u.txid, 'hex') as txid, u.vout, a.address, u.value,
-                u.script_pubkey, u.script_type, u.block_height,
-                encode(u.spent_txid, 'hex') as spent_txid, u.spent_block_height
-         FROM utxos_spent u
-         JOIN addresses a ON u.address_id = a.id
-         WHERE u.spent_txid = decode($1, 'hex')
-         ORDER BY u.vout`,
-        [txid]
-      );
-
-      // Get outputs - use VIEW to get both spent and unspent UTXOs for this transaction
-      const outputs = await this.db.query(
-        'SELECT * FROM utxos WHERE txid = $1 ORDER BY vout',
-        [txid]
-      );
-
-      let sizeBytes = txData.size && Number(txData.size) > 0
-        ? Number(txData.size)
-        : 0;
-      let vsizeBytes = txData.vsize && Number(txData.vsize) > 0
-        ? Number(txData.vsize)
-        : 0;
-      let hexValue = txData.hex as string | null;
-
-      if (!hexValue || hexValue.length === 0) {
-        hexValue = null;
-      } else if (sizeBytes === 0 || vsizeBytes === 0) {
-        // Compute size from stored hex - no need to fetch from daemon
-        const computedSize = Math.floor(hexValue.length / 2);
-        if (sizeBytes === 0) sizeBytes = computedSize;
-        if (vsizeBytes === 0) vsizeBytes = computedSize;
-      }
-
-      // Only fetch hex from daemon if explicitly requested via ?includeHex=true
-      // This avoids slow RPC calls for normal transaction viewing
-      if (!hexValue && includeHex) {
-        try {
-          // Flux daemon doesn't support blockhash parameter, requires txindex=1
-          const rawTx = await this.rpc.getRawTransaction(txid, false);
-          let fetchedHex: string | null = null;
-          let fetchedSize = sizeBytes;
-          let fetchedVSize = vsizeBytes;
-
-          if (typeof rawTx === 'string' && rawTx.length > 0) {
-            fetchedHex = rawTx;
-            fetchedSize = Math.floor(rawTx.length / 2);
-            fetchedVSize = fetchedSize;
-          }
-
-          const updateSize = fetchedSize > 0 ? fetchedSize : null;
-          const updateVSize = fetchedVSize > 0 ? fetchedVSize : null;
-          const updateHex = fetchedHex && fetchedHex.length > 0 ? fetchedHex : null;
-
-          if (updateSize !== null || updateVSize !== null || updateHex !== null) {
-            // PHASE 3: txid is BYTEA - decode hex input for comparison
-            await this.db.query(
-              `
-                UPDATE transactions
-                SET
-                  size = COALESCE($1, size),
-                  vsize = COALESCE($2, vsize),
-                  hex = COALESCE($3, hex)
-                WHERE txid = decode($4, 'hex')
-              `,
-              [updateSize, updateVSize, updateHex, txid]
-            );
-          }
-
-          if (updateSize !== null) sizeBytes = updateSize;
-          if (updateVSize !== null) vsizeBytes = updateVSize;
-          if (updateHex !== null) hexValue = updateHex;
-        } catch (error: any) {
-          // Flux daemon returns HTTP 500 for many transactions
-          // Extract them from raw block hex instead
-          if (txData.block_hash) {
-            try {
-              const rawBlockHex = await this.rpc.getBlock(txData.block_hash, 0) as unknown as string;
-              const txHex = extractTransactionFromBlock(rawBlockHex, txid, txData.block_height);
-
-              if (txHex && txHex.length > 0) {
-                const fetchedSize = Math.floor(txHex.length / 2);
-
-                // PHASE 3: txid is BYTEA - decode hex input for comparison
-                await this.db.query(
-                  `UPDATE transactions SET size = $1, vsize = $2, hex = $3 WHERE txid = decode($4, 'hex')`,
-                  [fetchedSize, fetchedSize, txHex, txid]
-                );
-
-                sizeBytes = fetchedSize;
-                vsizeBytes = fetchedSize;
-                hexValue = txHex;
-
-                logger.info('Successfully extracted transaction hex from block for API', {
-                  txid,
-                  block: txData.block_hash,
-                  size: fetchedSize
-                });
-              } else {
-                logger.warn('Transaction not found in block hex for API', {
-                  txid,
-                  block: txData.block_hash
-                });
-              }
-            } catch (blockError: any) {
-              logger.warn('Failed to extract transaction from block hex for API', {
-                txid,
-                block: txData.block_hash,
-                error: blockError.message
-              });
-            }
-          } else {
-            logger.warn('Failed to hydrate transaction size', { txid, error: error.message });
-          }
-        }
-      }
-
-      // Calculate fee correctly for coinbase transactions
-      // Coinbase transactions have no inputs (inputs.rows.length === 0)
-      // Fee = MAX(0, total_output - expected_block_reward)
-      // Negative values indicate unclaimed mining rewards (burned), not fees
-      const isCoinbase = inputs.rows.length === 0;
-      let feeZatoshis: bigint;
-
-      if (isCoinbase && txData.block_height) {
-        const expectedReward = this.getExpectedBlockReward(txData.block_height);
-        const expectedRewardZatoshis = BigInt(Math.floor(expectedReward * 100000000));
-        const outputTotal = BigInt(txData.output_total || 0);
-        const calculatedFee = outputTotal - expectedRewardZatoshis;
-        // If output < expected, unclaimed rewards are burned - fee should be 0
-        feeZatoshis = calculatedFee > BigInt(0) ? calculatedFee : BigInt(0);
-      } else {
-        feeZatoshis = txData.fee ? BigInt(txData.fee) : BigInt(0);
-      }
-
-      // PHASE 3: Use original txid param (hex string) instead of txData.txid (now BYTEA Buffer)
-      res.json({
-        txid: txid,
-        version: txData.version,
-        locktime: txData.locktime,
-        vin: inputs.rows.map(row => ({
-          txid: row.txid,
-          vout: row.vout,
-          sequence: 0,
-          n: row.vout,
-          addresses: row.address && row.address !== 'SHIELDED_OR_NONSTANDARD' ? [row.address] : [],
-          value: row.value ? row.value.toString() : '0',
-        })),
-        vout: outputs.rows.map(row => {
-          const scriptType = row.script_type || 'unknown';
-          const normalizedAddress = row.address === 'SHIELDED_OR_NONSTANDARD' ? null : row.address;
-          // Reconstruct script_pubkey if not stored (standard types skip storage)
-          const scriptHex = getScriptPubkey(row.script_pubkey, scriptType, row.address) || '';
-          const opReturn = scriptType === 'nulldata' ? decodeOpReturnData(scriptHex) : null;
-
-          return {
-            value: row.value ? row.value.toString() : '0',
-            n: row.vout,
-            scriptPubKey: {
-              hex: scriptHex,
-              asm: '',
-              addresses: normalizedAddress ? [normalizedAddress] : [],
-              type: scriptType,
-              opReturnHex: opReturn?.hex ?? null,
-              opReturnText: opReturn?.text ?? null,
-            },
-            spentTxId: row.spent_txid || undefined,
-            spentHeight: row.spent_block_height || undefined,
-          };
-        }),
-        blockHash: txData.block_hash,
-        blockHeight: txData.block_height,
-        confirmations,
-        blockTime: txData.timestamp,
-        size: sizeBytes,
-        vsize: vsizeBytes,
-        value: txData.output_total ? txData.output_total.toString() : '0',
-        valueIn: txData.input_total ? txData.input_total.toString() : '0',
-        fees: feeZatoshis.toString(),
-        hex: hexValue,
-      });
-    } catch (error: any) {
-      logger.error('Failed to get transaction', { error: error.message });
-      res.status(500).json({ error: error.message });
-    }
-  }
-
-  /**
-   * POST /api/v1/transactions/batch - Get multiple transactions in a single request
-   *
-   * Optimized for fetching multiple transactions efficiently, especially when
-   * blockHeight is known (e.g., block transaction list page).
-   *
-   * Request body:
-   *   - txids: string[] (required) - Array of transaction IDs (max 50)
-   *   - blockHeight: number (optional) - If all txs are from same block, provide for efficiency
-   */
   private async getTransactionsBatch(req: Request, res: Response): Promise<void> {
     try {
-      const { txids, blockHeight } = req.body as { txids: string[]; blockHeight?: number };
+      const { txids } = req.body;
 
       if (!Array.isArray(txids) || txids.length === 0) {
         res.status(400).json({ error: 'txids array is required' });
         return;
       }
 
-      if (txids.length > 50) {
-        res.status(400).json({ error: 'Maximum 50 transactions per batch' });
+      if (txids.length > 100) {
+        res.status(400).json({ error: 'Maximum 100 transactions per batch' });
         return;
       }
 
-      // Validate txid format
-      const validTxids = txids.filter(txid => typeof txid === 'string' && /^[a-fA-F0-9]{64}$/.test(txid));
-      if (validTxids.length === 0) {
-        res.status(400).json({ error: 'No valid transaction IDs provided' });
-        return;
-      }
+      const paddedTxids = txids.map((t: string) => t.padStart(64, '0'));
+      const inClause = paddedTxids.map((t: string) => `'${t}'`).join(', ');
 
-      // Get current block height for confirmations calculation
-      const currentHeightResult = await this.db.query('SELECT MAX(height) as max_height FROM blocks');
-      const currentHeight = currentHeightResult.rows[0]?.max_height || 0;
+      // Don't use FINAL for targeted IN lookups - duplicates rare and acceptable vs OOM
+      const transactions = await this.ch.query<any>(`
+        SELECT txid, block_height, timestamp, input_count, output_count,
+               input_total, output_total, fee, is_coinbase, is_shielded
+        FROM transactions
+        WHERE txid IN (${inClause}) AND is_valid = 1
+      `);
 
-      // Build the txid bytea array for SQL
-      const txidParams = validTxids.map((_, i) => `decode($${i + 1}, 'hex')`).join(', ');
+      // Get outputs (first output per transaction for display)
+      const outputs = await this.ch.query<{ txid: string; address: string; value: string }>(`
+        SELECT txid, address, value
+        FROM utxos
+        WHERE txid IN (${inClause}) AND vout = 0
+      `);
+      const outputMap = new Map(outputs.map(o => [o.txid, o]));
 
-      let txQuery: string;
-      let txParams: any[];
-
-      if (blockHeight !== undefined) {
-        // Optimized path: blockHeight known - single chunk access
-        txQuery = `
-          SELECT t.*, b.hash as block_hash, encode(t.txid, 'hex') as txid_hex
-          FROM transactions t
-          JOIN blocks b ON t.block_height = b.height
-          WHERE t.txid IN (${txidParams}) AND t.block_height = $${validTxids.length + 1}
-        `;
-        txParams = [...validTxids, blockHeight];
-      } else {
-        // General path: use tx_lookup for efficient chunk access
-        // First get block_heights from tx_lookup
-        const lookupQuery = `
-          SELECT encode(txid, 'hex') as txid_hex, block_height
-          FROM tx_lookup
-          WHERE txid IN (${txidParams})
-        `;
-        const lookupResult = await this.db.query(lookupQuery, validTxids);
-
-        // Create a map of txid -> block_height
-        const heightMap = new Map<string, number>();
-        for (const row of lookupResult.rows) {
-          heightMap.set(row.txid_hex, row.block_height);
+      // Get inputs (first input per transaction - the spending UTXO)
+      const inputs = await this.ch.query<{ spent_txid: string; address: string; value: string }>(`
+        SELECT spent_txid, address, value
+        FROM utxos
+        WHERE spent_txid IN (${inClause})
+        ORDER BY spent_txid, vout
+      `);
+      // Group by spent_txid, take first for each
+      const inputMap = new Map<string, { address: string; value: string }>();
+      for (const inp of inputs) {
+        if (!inputMap.has(inp.spent_txid)) {
+          inputMap.set(inp.spent_txid, inp);
         }
-
-        // Build optimized query with block_height hints for each txid
-        // This enables TimescaleDB chunk exclusion
-        const conditions = validTxids.map((txid, i) => {
-          const height = heightMap.get(txid);
-          if (height !== undefined) {
-            return `(t.txid = decode($${i + 1}, 'hex') AND t.block_height = ${height})`;
-          }
-          return `t.txid = decode($${i + 1}, 'hex')`;
-        }).join(' OR ');
-
-        txQuery = `
-          SELECT t.*, b.hash as block_hash, encode(t.txid, 'hex') as txid_hex
-          FROM transactions t
-          JOIN blocks b ON t.block_height = b.height
-          WHERE ${conditions}
-        `;
-        txParams = validTxids;
       }
 
-      // Fetch all transactions
-      const txResult = await this.db.query(txQuery, txParams);
-
-      // Create map for quick lookup
+      // Build a map of txid -> transaction data for order-preserving lookup
       const txMap = new Map<string, any>();
-      for (const row of txResult.rows) {
-        txMap.set(row.txid_hex, row);
+      for (const tx of transactions) {
+        txMap.set(tx.txid, tx);
       }
 
-      // Batch fetch all inputs
-      const inputsQuery = `
-        SELECT encode(u.spent_txid, 'hex') as spent_txid_hex,
-               encode(u.txid, 'hex') as txid, u.vout, a.address, u.value,
-               u.script_pubkey, u.script_type, u.block_height
-        FROM utxos_spent u
-        JOIN addresses a ON u.address_id = a.id
-        WHERE u.spent_txid IN (${txidParams})
-        ORDER BY u.spent_txid, u.vout
-      `;
-      const inputsResult = await this.db.query(inputsQuery, validTxids);
-
-      // Group inputs by txid
-      const inputsMap = new Map<string, any[]>();
-      for (const row of inputsResult.rows) {
-        const txid = row.spent_txid_hex;
-        if (!inputsMap.has(txid)) {
-          inputsMap.set(txid, []);
-        }
-        inputsMap.get(txid)!.push(row);
-      }
-
-      // Batch fetch all outputs using the utxos view
-      const outputsQuery = `
-        SELECT * FROM utxos WHERE txid = ANY($1) ORDER BY txid, vout
-      `;
-      const outputsResult = await this.db.query(outputsQuery, [validTxids]);
-
-      // Group outputs by txid
-      const outputsMap = new Map<string, any[]>();
-      for (const row of outputsResult.rows) {
-        const txid = row.txid;
-        if (!outputsMap.has(txid)) {
-          outputsMap.set(txid, []);
-        }
-        outputsMap.get(txid)!.push(row);
-      }
-
-      // Build response array in same order as input txids
-      const transactions = validTxids.map(txid => {
-        const txData = txMap.get(txid);
-        if (!txData) {
-          return { txid, error: 'not_found' };
+      // Return transactions in the same order as the input txids array
+      const orderedResults = paddedTxids.map(paddedTxid => {
+        const tx = txMap.get(paddedTxid);
+        if (!tx) {
+          // Transaction not found - return placeholder
+          return {
+            txid: paddedTxid,  // Keep full 64-char txid
+            error: 'not_found',
+          };
         }
 
-        const inputs = inputsMap.get(txid) || [];
-        const outputs = outputsMap.get(txid) || [];
-        const confirmations = txData.block_height ? Math.max(0, currentHeight - txData.block_height + 1) : 0;
+        // Keep full 64-char txid - don't strip leading zeros
+        const txidFull = tx.txid;
+        const output = outputMap.get(tx.txid);
+        const input = inputMap.get(tx.txid);
 
-        // Calculate fee
-        const isCoinbase = inputs.length === 0;
-        let feeZatoshis: bigint;
+        // Build minimal vin/vout for display purposes
+        const vin = tx.is_coinbase === 1
+          ? [{ coinbase: 'coinbase', n: 0 }]
+          : input
+            ? [{ addr: input.address, value: input.value, n: 0 }]
+            : [];
 
-        if (isCoinbase && txData.block_height) {
-          const expectedReward = this.getExpectedBlockReward(txData.block_height);
-          const expectedRewardZatoshis = BigInt(Math.floor(expectedReward * 100000000));
-          const outputTotal = BigInt(txData.output_total || 0);
-          const calculatedFee = outputTotal - expectedRewardZatoshis;
-          feeZatoshis = calculatedFee > BigInt(0) ? calculatedFee : BigInt(0);
-        } else {
-          feeZatoshis = txData.fee ? BigInt(txData.fee) : BigInt(0);
-        }
+        const vout = output
+          ? [{
+              value: output.value,
+              n: 0,
+              scriptPubKey: {
+                addresses: output.address && output.address !== 'SHIELDED_OR_NONSTANDARD' ? [output.address] : [],
+              },
+            }]
+          : [];
 
         return {
-          txid: txid,
-          version: txData.version,
-          locktime: txData.locktime,
-          vin: inputs.map(row => ({
-            txid: row.txid,
-            vout: row.vout,
-            sequence: 0,
-            n: row.vout,
-            addresses: row.address && row.address !== 'SHIELDED_OR_NONSTANDARD' ? [row.address] : [],
-            value: row.value ? row.value.toString() : '0',
-          })),
-          vout: outputs.map(row => {
-            const scriptType = row.script_type || 'unknown';
-            const normalizedAddress = row.address === 'SHIELDED_OR_NONSTANDARD' ? null : row.address;
-            const scriptHex = getScriptPubkey(row.script_pubkey, scriptType, row.address) || '';
-            const opReturn = scriptType === 'nulldata' ? decodeOpReturnData(scriptHex) : null;
-
-            return {
-              value: row.value ? row.value.toString() : '0',
-              n: row.vout,
-              scriptPubKey: {
-                hex: scriptHex,
-                asm: '',
-                addresses: normalizedAddress ? [normalizedAddress] : [],
-                type: scriptType,
-                opReturnHex: opReturn?.hex ?? null,
-                opReturnText: opReturn?.text ?? null,
-              },
-              spentTxId: row.spent_txid || undefined,
-              spentHeight: row.spent_block_height || undefined,
-            };
-          }),
-          blockHash: txData.block_hash,
-          blockHeight: txData.block_height,
-          confirmations,
-          blockTime: txData.timestamp,
-          size: txData.size ? Number(txData.size) : 0,
-          vsize: txData.vsize ? Number(txData.vsize) : 0,
-          value: txData.output_total ? txData.output_total.toString() : '0',
-          valueIn: txData.input_total ? txData.input_total.toString() : '0',
-          fees: feeZatoshis.toString(),
+          txid: txidFull,
+          block_height: tx.block_height,
+          blockheight: tx.block_height,
+          timestamp: tx.timestamp,
+          time: tx.timestamp,
+          input_count: tx.input_count,
+          output_count: tx.output_count,
+          valueIn: tx.input_total?.toString() || '0',
+          valueOut: tx.output_total?.toString() || '0',
+          fees: tx.fee?.toString() || '0',
+          is_coinbase: tx.is_coinbase,
+          is_shielded: tx.is_shielded,
+          vin,
+          vout,
         };
       });
 
-      res.json({ transactions });
+      res.json({ transactions: orderedResults });
     } catch (error: any) {
-      logger.error('Failed to get transactions batch', { error: error.message });
       res.status(500).json({ error: error.message });
     }
   }
 
-  /**
-   * GET /api/v1/addresses/:address - Get address info
-   */
+  private async getTransaction(req: Request, res: Response): Promise<void> {
+    try {
+      const { txid } = req.params;
+      const includeHex = req.query.includeHex === 'true';
+      const paddedTxid = txid.padStart(64, '0');
+
+      // Direct lookup - don't use FINAL, it loads entire table into memory
+      const tx = await this.ch.queryOne<any>(`
+        SELECT * FROM transactions
+        WHERE txid = {txid:FixedString(64)} AND is_valid = 1
+        LIMIT 1
+      `, { txid: paddedTxid });
+
+      if (!tx) {
+        res.status(404).json({ error: 'Transaction not found' });
+        return;
+      }
+
+      // Get outputs (UTXOs) for this transaction
+      // Don't use FINAL for targeted lookups - it processes entire table before filtering
+      // For specific txid lookups, duplicates are rare and acceptable vs OOM risk
+      const outputs = await this.ch.query<any>(`
+        SELECT vout, address, value, script_type, script_pubkey, spent, spent_txid, spent_block_height
+        FROM utxos
+        WHERE txid = {txid:FixedString(64)}
+        ORDER BY vout
+      `, { txid: paddedTxid });
+
+      // Get inputs by finding UTXOs that were spent by this transaction
+      const inputs = await this.ch.query<any>(`
+        SELECT txid as prev_txid, vout as prev_vout, address, value, script_type
+        FROM utxos
+        WHERE spent_txid = {txid:FixedString(64)}
+        ORDER BY vout
+      `, { txid: paddedTxid });
+
+      // Get block info for confirmations
+      const block = await this.ch.queryOne<{ hash: string; timestamp: number }>(`
+        SELECT hash, timestamp FROM blocks
+        WHERE height = {h:UInt32} AND is_valid = 1
+        LIMIT 1
+      `, { h: tx.block_height });
+
+      const chainHeight = await this.ch.queryOne<{ h: number }>(`
+        SELECT max(height) as h FROM blocks WHERE is_valid = 1
+      `);
+
+      // Build vin array (format expected by frontend)
+      const vin = tx.is_coinbase === 1
+        ? [{ coinbase: 'coinbase', sequence: 0xffffffff, n: 0 }]
+        : inputs.map((inp: any, idx: number) => ({
+            txid: inp.prev_txid,  // Keep full 64-char txid
+            vout: inp.prev_vout,
+            sequence: 0xffffffff,
+            n: idx,
+            scriptSig: { hex: '', asm: '' },
+            addresses: inp.address ? [inp.address] : [],
+            value: inp.value.toString(),
+          }));
+
+      // Build vout array (format expected by frontend)
+      const vout = outputs.map((out: any) => ({
+        value: out.value.toString(),
+        n: out.vout,
+        scriptPubKey: {
+          hex: out.script_pubkey || '',
+          asm: '',
+          addresses: out.address && out.address !== 'SHIELDED_OR_NONSTANDARD' ? [out.address] : [],
+          type: out.script_type,
+        },
+        spentTxId: out.spent === 1 ? out.spent_txid : undefined,  // Keep full 64-char txid
+        spentIndex: out.spent === 1 ? 0 : undefined,
+        spentHeight: out.spent === 1 ? out.spent_block_height : undefined,
+      }));
+
+      // Response format expected by frontend (FluxIndexerTransactionResponse)
+      const response: any = {
+        txid: tx.txid,  // Keep full 64-char txid
+        version: tx.version,
+        lockTime: tx.locktime,
+        vin,
+        vout,
+        blockHash: block?.hash ?? null,  // Keep full 64-char hash
+        blockHeight: tx.block_height,
+        confirmations: (chainHeight?.h ?? tx.block_height) - tx.block_height + 1,
+        blockTime: block?.timestamp ?? tx.timestamp,
+        value: tx.output_total.toString(),
+        size: tx.size,
+        vsize: tx.vsize || tx.size,
+        valueIn: tx.input_total.toString(),
+        fees: tx.fee.toString(),
+      };
+
+      // Add hex if requested (fetch from daemon via RPC)
+      if (includeHex) {
+        try {
+          // verbose=false returns raw hex string instead of decoded object
+          // Flux daemon doesn't support blockhash parameter, requires txindex=1
+          const rawTx = await this.rpc.getRawTransaction(req.params.txid, false);
+          response.hex = typeof rawTx === 'string' ? rawTx : '';
+        } catch (err: any) {
+          // Flux daemon returns HTTP 500 for many transactions without txindex
+          // Fallback: Extract from raw block hex instead
+          const blockhash = block?.hash?.trim();
+          if (blockhash) {
+            try {
+              logger.debug('Extracting tx hex from block', { txid: req.params.txid, blockhash });
+              const rawBlockHex = await this.rpc.getBlock(blockhash, 0) as unknown as string;
+              const txHex = extractTransactionFromBlock(rawBlockHex, req.params.txid, tx.block_height);
+
+              if (txHex && txHex.length > 0) {
+                response.hex = txHex;
+                logger.info('Extracted transaction hex from block', {
+                  txid: req.params.txid,
+                  block: blockhash,
+                  size: Math.floor(txHex.length / 2)
+                });
+              } else {
+                logger.warn('Transaction not found in block hex', { txid: req.params.txid, block: blockhash });
+                response.hex = '';
+              }
+            } catch (blockErr: any) {
+              logger.warn('Failed to extract transaction from block', {
+                txid: req.params.txid,
+                block: blockhash,
+                error: blockErr?.message || blockErr
+              });
+              response.hex = '';
+            }
+          } else {
+            logger.warn('Failed to fetch raw tx hex (no block hash)', {
+              txid: req.params.txid,
+              error: err?.message || err
+            });
+            response.hex = '';
+          }
+        }
+      }
+
+      res.json(response);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  // ========== Address Endpoints ==========
+
   private async getAddress(req: Request, res: Response): Promise<void> {
     try {
       const { address } = req.params;
-      const page = parseInt(req.query.page as string) || 1;
-      // Limit page size to 100, default to 25 (was 1000 before)
-      // This prevents loading excessive transactions and improves response time
-      const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize as string) || 25));
 
-      // Get address summary
-      const summary = await this.db.query(
-        'SELECT * FROM address_summary WHERE address = $1',
-        [address]
-      );
+      // Query address summary and live FluxNode data in parallel
+      const [summary, fluxnodeData] = await Promise.all([
+        // Address balance/tx data from aggregated table
+        this.ch.queryOne<any>(`
+          SELECT
+            address,
+            sumMerge(balance) AS balance,
+            sumMerge(tx_count) AS tx_count,
+            sumMerge(received_total) AS received_total,
+            sumMerge(sent_total) AS sent_total,
+            minMerge(first_seen) AS first_seen,
+            maxMerge(last_activity) AS last_activity
+          FROM address_summary_agg
+          WHERE address = {address:String}
+          GROUP BY address
+        `, { address }),
+        // Live FluxNode counts from separate table
+        this.ch.queryOne<any>(`
+          SELECT cumulus_count, nimbus_count, stratus_count, total_collateral
+          FROM live_fluxnodes FINAL
+          WHERE address = {address:String}
+        `, { address }),
+      ]);
 
-      if (summary.rows.length === 0) {
-        res.status(404).json({ error: 'Address not found' });
+      if (!summary) {
+        // Return empty address info (format expected by frontend: FluxIndexerAddressResponse)
+        res.json({
+          address,
+          balance: '0',
+          totalReceived: '0',
+          totalSent: '0',
+          unconfirmedBalance: '0',
+          unconfirmedTxs: 0,
+          txs: 0,
+        });
         return;
       }
 
-      const addressData = summary.rows[0];
-
-      // Get transactions using optimized address_transactions materialized table
-      // This is 5-10x faster than joining transactions + utxos tables
-      // Uses idx_address_tx_pagination index for optimal performance
-      // OPTIMIZED: JOIN to blocks to get block_hash since column was removed
-      // PHASE 3: JOIN addresses table for address lookup, encode txid for response
-      const txQuery = `
-        SELECT encode(at.txid, 'hex') as txid, at.block_height, at.timestamp, b.hash as block_hash
-        FROM address_transactions at
-        JOIN addresses addr ON at.address_id = addr.id
-        JOIN blocks b ON at.block_height = b.height
-        WHERE addr.address = $1
-        ORDER BY at.block_height DESC, at.txid DESC
-        LIMIT $2 OFFSET $3
-      `;
-
-      const transactions = await this.db.query(txQuery, [
-        address,
-        pageSize,
-        (page - 1) * pageSize,
-      ]);
-
+      // Response format expected by frontend (FluxIndexerAddressResponse)
+      // Values as strings (satoshis) for precision
       res.json({
-        page,
-        totalPages: Math.ceil(addressData.tx_count / pageSize),
-        itemsOnPage: transactions.rows.length,
-        address: addressData.address,
-        balance: addressData.balance ? addressData.balance.toString() : '0',
-        totalReceived: addressData.received_total ? addressData.received_total.toString() : '0',
-        totalSent: addressData.sent_total ? addressData.sent_total.toString() : '0',
-        unconfirmedBalance: addressData.unconfirmed_balance ? addressData.unconfirmed_balance.toString() : '0',
+        address,
+        balance: summary.balance.toString(),
+        totalReceived: summary.received_total.toString(),
+        totalSent: summary.sent_total.toString(),
+        unconfirmedBalance: '0',
         unconfirmedTxs: 0,
-        txs: addressData.tx_count,
-        transactions: transactions.rows,
-        cumulusCount: addressData.cumulus_count || 0,
-        nimbusCount: addressData.nimbus_count || 0,
-        stratusCount: addressData.stratus_count || 0,
-        fluxnodeLastSync: addressData.fluxnode_last_sync || null,
+        txs: summary.tx_count,
+        // Additional fields for convenience
+        balanceFlux: Number(summary.balance) / 1e8,
+        txCount: summary.tx_count,
+        firstSeen: summary.first_seen,
+        lastActivity: summary.last_activity,
+        // FluxNode counts from live_fluxnodes table (flat structure for frontend compatibility)
+        cumulusCount: fluxnodeData?.cumulus_count || 0,
+        nimbusCount: fluxnodeData?.nimbus_count || 0,
+        stratusCount: fluxnodeData?.stratus_count || 0,
       });
     } catch (error: any) {
-      logger.error('Failed to get address', { error: error.message });
       res.status(500).json({ error: error.message });
     }
   }
 
-  /**
-   * GET /api/v1/addresses/:address/transactions - Get address transactions
-   */
   private async getAddressTransactions(req: Request, res: Response): Promise<void> {
     try {
       const { address } = req.params;
-      const fromTimestamp = req.query.fromTimestamp ? parseInt(req.query.fromTimestamp as string) : undefined;
-      const toTimestamp = req.query.toTimestamp ? parseInt(req.query.toTimestamp as string) : undefined;
+      const limit = Math.min(parseInt(req.query.limit as string) || 25, 100);
+      const offset = parseInt(req.query.offset as string) || 0;
 
-      // Cursor-based pagination parameters (preferred method)
+      // Cursor-based pagination (efficient for ClickHouse - no OFFSET scanning)
       const cursorHeight = req.query.cursorHeight ? parseInt(req.query.cursorHeight as string) : undefined;
       const cursorTxid = req.query.cursorTxid as string | undefined;
 
-      // Legacy offset pagination (kept for backward compatibility with CSV exports)
-      const offset = Math.max(0, parseInt(req.query.offset as string) || 0);
+      // Build query with optional cursor
+      let whereClause = 'address = {address:String} AND is_valid = 1';
+      const params: Record<string, any> = { address };
 
-      // For date range exports, allow larger batch sizes (up to 10000)
-      // Otherwise cap at 100 for standard pagination
-      const maxLimit = (fromTimestamp !== undefined || toTimestamp !== undefined) ? 10000 : 100;
-      const limit = Math.min(maxLimit, Math.max(1, parseInt(req.query.limit as string) || 20));
-
-      // TEMPORARY: Disable transaction history during initial sync to prevent blocking
-      // Check if we're in fast sync mode (far behind)
-      const syncState = await this.db.query('SELECT current_height, chain_height FROM sync_state WHERE id = 1');
-      if (syncState.rows.length > 0) {
-        const currentHeight = syncState.rows[0].current_height;
-        const chainHeight = syncState.rows[0].chain_height;
-        const blocksBehind = chainHeight - currentHeight;
-
-        if (blocksBehind > 1000) {
-          res.status(503).json({
-            error: 'Transaction history temporarily unavailable during initial blockchain sync',
-            message: `Indexer is ${blocksBehind.toLocaleString()} blocks behind. Transaction history will be available once sync is complete.`,
-            currentHeight,
-            chainHeight,
-            progress: `${((currentHeight / chainHeight) * 100).toFixed(2)}%`
-          });
-          return;
-        }
-      }
-
-      // Get transaction count from summary
-      const countQuery = await this.db.query(
-        'SELECT tx_count FROM address_summary WHERE address = $1',
-        [address]
-      );
-
-      if (countQuery.rows.length === 0) {
-        res.status(404).json({ error: 'Address not found' });
-        return;
-      }
-
-      const totalTxs = parseInt(countQuery.rows[0].tx_count, 10) || 0;
-
-      // ULTRA-OPTIMIZED: Use materialized address_transactions table (migration 007)
-      // This eliminates expensive UNION and LATERAL JOIN queries entirely
-      // Falls back to old query if table doesn't exist yet
-      // Support timestamp filtering for date range exports
-      // PHASE 3: JOIN addresses table for address lookup (address_id replaces address)
-      const whereConditions = ['addr.address = $1'];
-      const queryParams: any[] = [address];
-      let paramIndex = 2;
-
-      if (fromTimestamp !== undefined) {
-        whereConditions.push(`at.timestamp >= $${paramIndex}`);
-        queryParams.push(fromTimestamp);
-        paramIndex++;
-      }
-
-      if (toTimestamp !== undefined) {
-        whereConditions.push(`at.timestamp <= $${paramIndex}`);
-        queryParams.push(toTimestamp);
-        paramIndex++;
-      }
-
-      // Cursor-based pagination: Use composite key (block_height, txid) for efficient seeks
-      // This replaces OFFSET which becomes extremely slow with large datasets
-      // PHASE 3: txid is BYTEA - decode cursor txid for comparison
       if (cursorHeight !== undefined && cursorTxid) {
-        whereConditions.push(`(at.block_height, at.txid) < ($${paramIndex}, decode($${paramIndex + 1}, 'hex'))`);
-        queryParams.push(cursorHeight, cursorTxid);
-        paramIndex += 2;
+        // Cursor-based: get rows after the cursor position
+        // ORDER BY (address, block_height DESC, tx_index, txid) matches our schema
+        whereClause += ` AND (block_height < {cursorHeight:UInt32} OR (block_height = {cursorHeight:UInt32} AND txid > {cursorTxid:FixedString(64)}))`;
+        params.cursorHeight = cursorHeight;
+        params.cursorTxid = cursorTxid.padStart(64, '0');
       }
 
-      // OPTIMIZED: JOIN to blocks to get block_hash since column was removed from address_transactions
-      // PHASE 3: JOIN addresses table, encode txid for response
-      const txQuery = `
-        SELECT
-          encode(at.txid, 'hex') as txid,
-          at.block_height,
-          at.timestamp,
-          b.hash AS block_hash,
-          at.direction,
-          at.received_value,
-          at.sent_value,
-          COALESCE(t.is_coinbase, FALSE) AS is_coinbase,
-          COALESCE(t.fee, 0)::bigint AS fee_value
-        FROM address_transactions at
-        JOIN addresses addr ON at.address_id = addr.id
-        JOIN blocks b ON at.block_height = b.height
-        LEFT JOIN transactions t ON t.txid = at.txid AND t.block_height = at.block_height
-        WHERE ${whereConditions.join(' AND ')}
-        ORDER BY at.block_height DESC, at.txid DESC
-        LIMIT $${paramIndex}${cursorHeight === undefined && offset > 0 ? ` OFFSET $${paramIndex + 1}` : ''}
-      `;
+      // Step 1: Get address transactions - use GROUP BY to deduplicate without expensive FINAL
+      const addressTxs = await this.ch.query<any>(`
+        SELECT txid, block_height, block_hash, tx_index, timestamp,
+               direction, received_value, sent_value, is_coinbase
+        FROM address_transactions
+        WHERE ${whereClause}
+        GROUP BY txid, block_height, block_hash, tx_index, timestamp,
+                 direction, received_value, sent_value, is_coinbase
+        ORDER BY block_height DESC, tx_index ASC, txid ASC
+        LIMIT ${limit + 1}
+        ${cursorHeight === undefined && offset > 0 ? `OFFSET ${offset}` : ''}
+      `, params);
 
-      // Use cursor-based pagination if cursor is provided, otherwise fall back to offset
-      if (cursorHeight === undefined && offset > 0) {
-        queryParams.push(limit, offset);
-      } else {
-        queryParams.push(limit);
-      }
+      // Check for more results
+      const hasMore = addressTxs.length > limit;
+      const resultTxs = hasMore ? addressTxs.slice(0, limit) : addressTxs;
 
-      const transactions = await this.db.query(txQuery, queryParams);
-
-      // Get filtered count if timestamp filters are applied
-      let filteredTotal = totalTxs;
-      if (fromTimestamp !== undefined || toTimestamp !== undefined) {
-        // Build count query with WHERE conditions excluding cursor (cursor is for pagination, not filtering)
-        // PHASE 3: JOIN addresses table for address lookup
-        const countWhereConditions = ['addr.address = $1'];
-        const countParams: any[] = [address];
-        let countParamIndex = 2;
-
-        if (fromTimestamp !== undefined) {
-          countWhereConditions.push(`at.timestamp >= $${countParamIndex}`);
-          countParams.push(fromTimestamp);
-          countParamIndex++;
-        }
-
-        if (toTimestamp !== undefined) {
-          countWhereConditions.push(`at.timestamp <= $${countParamIndex}`);
-          countParams.push(toTimestamp);
-          countParamIndex++;
-        }
-
-        // PHASE 3: JOIN addresses table for address lookup
-        const countQueryFiltered = `
-          SELECT COUNT(*) as filtered_count
-          FROM address_transactions at
-          JOIN addresses addr ON at.address_id = addr.id
-          WHERE ${countWhereConditions.join(' AND ')}
-        `;
-        const filteredCountResult = await this.db.query(countQueryFiltered, countParams);
-        filteredTotal = parseInt(filteredCountResult.rows[0]?.filtered_count || '0', 10);
-      }
-
-      const currentHeightResult = await this.db.query('SELECT MAX(height) as max_height FROM blocks');
-      const currentHeight = currentHeightResult.rows[0]?.max_height || 0;
-
-      const txids = transactions.rows.map((row: any) => row.txid);
-      const participantsMap = new Map<string, { inputs: string[]; outputs: string[]; inputCount: number; outputCount: number }>();
-
-      // Get transaction participants from utxos tables (input/output addresses)
-      if (txids.length > 0) {
-        // Inputs come from spent UTXOs (spent_txid only exists in utxos_spent)
-        // PHASE 3: JOIN addresses table for address lookup, decode hex txids for BYTEA comparison
-        const inputResult = await this.db.query(
-          `
-            SELECT
-              encode(u.spent_txid, 'hex') AS txid,
-              ARRAY_AGG(DISTINCT a.address) FILTER (
-                WHERE a.address IS NOT NULL AND a.address <> 'SHIELDED_OR_NONSTANDARD'
-              ) AS input_addresses
-            FROM utxos_spent u
-            JOIN addresses a ON u.address_id = a.id
-            WHERE u.spent_txid = ANY(
-              SELECT decode(unnest($1::text[]), 'hex')
-            )
-            GROUP BY u.spent_txid
-          `,
-          [txids]
-        );
-
-        for (const row of inputResult.rows) {
-          const addresses: string[] = Array.isArray(row.input_addresses)
-            ? row.input_addresses.filter((addr: string | null) => !!addr)
-            : [];
-          participantsMap.set(row.txid, {
-            inputs: addresses,
-            outputs: [],
-            inputCount: addresses.length,
-            outputCount: 0,
-          });
-        }
-
-        // Outputs can be in either table, use VIEW for completeness
-        // VIEW already handles addresses JOIN and txid encoding
-        const outputResult = await this.db.query(
-          `
-            SELECT
-              txid,
-              ARRAY_AGG(DISTINCT address) FILTER (
-                WHERE address IS NOT NULL AND address <> 'SHIELDED_OR_NONSTANDARD'
-              ) AS output_addresses
-            FROM utxos
-            WHERE txid = ANY($1)
-            GROUP BY txid
-          `,
-          [txids]
-        );
-
-        for (const row of outputResult.rows) {
-          const addresses: string[] = Array.isArray(row.output_addresses)
-            ? row.output_addresses.filter((addr: string | null) => !!addr)
-            : [];
-          const existing = participantsMap.get(row.txid) || {
-            inputs: [],
-            outputs: [],
-            inputCount: 0,
-            outputCount: 0,
-          };
-          existing.outputs = addresses;
-          existing.outputCount = addresses.length;
-          participantsMap.set(row.txid, existing);
+      // Step 2: Get fee/total data for just these specific transactions (targeted lookup)
+      let txDataMap = new Map<string, { fee: string; input_total: string; output_total: string }>();
+      if (resultTxs.length > 0) {
+        const txidList = resultTxs.map((tx: any) => `'${tx.txid}'`).join(',');
+        const txData = await this.ch.query<any>(`
+          SELECT txid, fee, input_total, output_total
+          FROM transactions
+          WHERE txid IN (${txidList}) AND is_valid = 1
+        `);
+        for (const td of txData) {
+          txDataMap.set(td.txid, { fee: td.fee, input_total: td.input_total, output_total: td.output_total });
         }
       }
 
-      // Calculate next cursor for efficient pagination
-      const lastTx = transactions.rows[transactions.rows.length - 1];
-      const nextCursor = lastTx ? {
-        height: Number(lastTx.block_height),
-        txid: lastTx.txid
-      } : null;
+      // Get current chain height for confirmations calculation
+      const chainHeight = await this.ch.queryOne<{ h: number }>(`
+        SELECT max(height) as h FROM blocks WHERE is_valid = 1
+      `);
+      const currentHeight = chainHeight?.h ?? 0;
 
-      const responseData: any = {
+      // Merge the data
+      const transactions = resultTxs.map((at: any) => {
+        const td = txDataMap.get(at.txid) || { fee: '0', input_total: '0', output_total: '0' };
+        return { ...at, fee: td.fee, input_total: td.input_total, output_total: td.output_total };
+      });
+
+      // Get total count - use uniqExact() for accurate count without expensive FINAL
+      const totalResult = await this.ch.queryOne<{ count: number }>(`
+        SELECT uniqExact(txid, block_height) as count
+        FROM address_transactions
+        WHERE address = {address:String} AND is_valid = 1
+      `, { address });
+
+      // Build next cursor if there are more results
+      let nextCursor: { height: number; txid: string } | undefined;
+      if (hasMore && transactions.length > 0) {
+        const lastTx = transactions[transactions.length - 1];
+        nextCursor = {
+          height: lastTx.block_height,
+          txid: lastTx.txid,  // Keep full 64-char txid
+        };
+      }
+
+      // Response format expected by frontend (FluxIndexerAddressTransactionsResponse)
+      res.json({
         address,
-        transactions: transactions.rows.map(row => {
-          const receivedValue = BigInt(row.received_value || 0);
-          const sentValue = BigInt(row.sent_value || 0);
-          const direction = row.direction || (receivedValue >= sentValue ? 'received' : 'sent');
-          const feeValue = BigInt(row.fee_value || 0);
-          const participants = participantsMap.get(row.txid) || { inputs: [], outputs: [], inputCount: 0, outputCount: 0 };
-          const dedupe = (list: string[]) => Array.from(new Set(list)).slice(0, 8);
-          const rawInputs = participants.inputs || [];
-          const rawOutputs = participants.outputs || [];
-          const counterpartInputs = rawInputs.filter(addr => addr !== address);
-          const counterpartOutputs = rawOutputs.filter(addr => addr !== address);
-          const totalInputCount = typeof participants.inputCount === 'number' ? participants.inputCount : rawInputs.length;
-          const totalOutputCount = typeof participants.outputCount === 'number' ? participants.outputCount : rawOutputs.length;
-          const includesSelfInput = sentValue > BigInt(0);
-          const includesSelfOutput = receivedValue > BigInt(0);
-          const fromAddressCount = Math.max(0, totalInputCount - (includesSelfInput ? 1 : 0));
-          const toAddressCount = Math.max(0, totalOutputCount - (includesSelfOutput ? 1 : 0));
+        transactions: transactions.map((tx: any) => {
+          const receivedValue = tx.received_value?.toString() ?? '0';
+          const sentValue = tx.sent_value?.toString() ?? '0';
+          const receivedBig = BigInt(receivedValue);
+          const sentBig = BigInt(sentValue);
+          const fee = tx.fee?.toString() ?? '0';
+          const inputTotal = tx.input_total?.toString() ?? '0';
+          const outputTotal = tx.output_total?.toString() ?? '0';
+          const outputBig = BigInt(outputTotal);
 
-          let changeValue = BigInt(0);
-          let toOthersValue = BigInt(0);
-          let selfTransfer = false;
+          // Net value for display - the actual difference (what left or entered the address)
+          const isSent = sentBig > receivedBig;
+          const netValue = isSent
+            ? (sentBig - receivedBig).toString()  // Amount that left this address
+            : receivedBig > sentBig
+              ? (receivedBig - sentBig).toString()  // Amount that entered this address
+              : '0';
 
-          if (direction === 'sent') {
-            changeValue = receivedValue > BigInt(0) ? receivedValue : BigInt(0);
-            const computed = sentValue - changeValue - feeValue;
-            toOthersValue = computed > BigInt(0) ? computed : BigInt(0);
-            selfTransfer = toOthersValue === BigInt(0);
-          }
+          // For sent transactions, "sent to others" = total outputs minus what came back to this address
+          // This excludes change that returned to the sender
+          const toOthersValue = isSent
+            ? (outputBig - receivedBig > BigInt(0) ? (outputBig - receivedBig).toString() : '0')
+            : '0';
 
           return {
-            txid: row.txid,
-            blockHeight: Number(row.block_height),
-            timestamp: Number(row.timestamp),
-            blockHash: row.block_hash,
-            direction,
-            value: (receivedValue - sentValue).toString(),
-            receivedValue: receivedValue.toString(),
-            sentValue: sentValue.toString(),
-            fromAddresses: dedupe(counterpartInputs),
-            fromAddressCount,
-            toAddresses: dedupe(counterpartOutputs),
-            toAddressCount,
-            selfTransfer,
-            feeValue: feeValue.toString(),
-            changeValue: changeValue.toString(),
-            toOthersValue: toOthersValue.toString(),
-            confirmations: row.block_height ? Math.max(0, currentHeight - Number(row.block_height) + 1) : 0,
-            isCoinbase: row.is_coinbase === true,
+            txid: tx.txid,  // Keep full 64-char txid
+            blockHeight: tx.block_height,
+            timestamp: tx.timestamp,
+            blockHash: tx.block_hash,  // Keep full 64-char hash
+            confirmations: currentHeight - tx.block_height + 1,
+            direction: tx.direction || (isSent ? 'sent' : 'received'),
+            value: netValue,
+            receivedValue,
+            sentValue,
+            feeValue: fee,
+            toOthersValue,
+            inputTotal,
+            outputTotal,
+            fromAddresses: [],
+            fromAddressCount: 0,
+            toAddresses: [],
+            toAddressCount: 0,
+            // True self-transfer: address both sends AND receives, but nothing goes to other addresses
+            // (all outputs return to the same address, only fee is lost)
+            selfTransfer: receivedBig > BigInt(0) && sentBig > BigInt(0) && (outputBig - receivedBig) <= BigInt(0),
+            isCoinbase: tx.is_coinbase === 1,
           };
         }),
-        total: totalTxs,
-        filteredTotal: filteredTotal, // Filtered count (respects timestamp range)
+        total: Number(totalResult?.count ?? 0),
+        filteredTotal: Number(totalResult?.count ?? 0),
         limit,
-      };
-
-      // Include cursor in response for cursor-based pagination
-      if (nextCursor && transactions.rows.length === limit) {
-        responseData.nextCursor = nextCursor;
-      }
-
-      // Include offset in response for legacy offset-based pagination
-      if (cursorHeight === undefined) {
-        responseData.offset = offset;
-      }
-
-      res.json(responseData);
+        offset: cursorHeight !== undefined ? 0 : offset,
+        nextCursor,
+      });
     } catch (error: any) {
-      logger.error('Failed to get address transactions', { error: error.message });
       res.status(500).json({ error: error.message });
     }
   }
 
-  /**
-   * GET /api/v1/addresses/:address/utxos - Get address UTXOs
-   */
   private async getAddressUTXOs(req: Request, res: Response): Promise<void> {
     try {
       const { address } = req.params;
 
-      // Use utxos_unspent with addresses JOIN for better performance
-      // PHASE 3: JOIN addresses table for address lookup, encode txid for response
-      const utxos = await this.db.query(
-        `SELECT encode(u.txid, 'hex') as txid, u.vout, u.value, u.block_height
-         FROM utxos_unspent u
-         JOIN addresses a ON u.address_id = a.id
-         WHERE a.address = $1
-         ORDER BY u.block_height DESC, u.vout`,
-        [address]
-      );
-
-      res.json(
-        utxos.rows.map(row => ({
-          txid: row.txid,
-          vout: row.vout,
-          value: row.value ? row.value.toString() : '0',
-          height: row.block_height,
-          confirmations: 0, // Calculate from current height
-        }))
-      );
-    } catch (error: any) {
-      logger.error('Failed to get UTXOs', { error: error.message });
-      res.status(500).json({ error: error.message });
-    }
-  }
-
-  /**
-   * GET /api/v1/producers - Get all producers
-   */
-  private async getProducers(req: Request, res: Response): Promise<void> {
-    try {
-      const limit = parseInt(req.query.limit as string) || 100;
-
-      const producers = await this.db.query(
-        `SELECT * FROM producers
-         ORDER BY blocks_produced DESC
-         LIMIT $1`,
-        [limit]
-      );
-
-      const totalBlocks = await this.db.query('SELECT COUNT(*) as count FROM blocks WHERE producer IS NOT NULL');
+      // Use GROUP BY to deduplicate without expensive FINAL
+      const utxos = await this.ch.query<any>(`
+        SELECT txid, vout, value, script_type, block_height
+        FROM utxos
+        WHERE address = {address:String} AND spent = 0
+        GROUP BY txid, vout, value, script_type, block_height
+        ORDER BY block_height DESC
+        LIMIT 1000
+      `, { address });
 
       res.json({
-        producers: producers.rows.map(row => ({
-          fluxnode: row.fluxnode,
-          blocksProduced: row.blocks_produced,
-          firstBlock: row.first_block,
-          lastBlock: row.last_block,
-          totalRewards: row.total_rewards ? row.total_rewards.toString() : '0',
-          averageBlockTime: row.avg_block_time,
-          percentageOfBlocks: totalBlocks.rows[0].count > 0
-            ? ((row.blocks_produced / totalBlocks.rows[0].count) * 100).toFixed(2)
-            : '0.00',
+        utxos: utxos.map(u => ({
+          txid: u.txid,  // Keep full 64-char txid
+          vout: u.vout,
+          value: Number(u.value) / 1e8,
+          valueSat: u.value,
+          scriptType: u.script_type,
+          blockHeight: u.block_height,
         })),
-        totalProducers: producers.rows.length,
       });
     } catch (error: any) {
-      logger.error('Failed to get producers', { error: error.message });
       res.status(500).json({ error: error.message });
     }
   }
 
-  /**
-   * GET /api/v1/producers/:identifier - Get specific producer
-   */
-  private async getProducer(req: Request, res: Response): Promise<void> {
-    try {
-      const { identifier } = req.params;
+  // ========== Rich List ==========
 
-      const producer = await this.db.query(
-        'SELECT * FROM producers WHERE fluxnode = $1',
-        [identifier]
-      );
-
-      if (producer.rows.length === 0) {
-        res.status(404).json({ error: 'Producer not found' });
-        return;
-      }
-
-      const row = producer.rows[0];
-
-      res.json({
-        fluxnode: row.fluxnode,
-        blocksProduced: row.blocks_produced,
-        firstBlock: row.first_block,
-        lastBlock: row.last_block,
-        totalRewards: row.total_rewards ? row.total_rewards.toString() : '0',
-        averageBlockTime: row.avg_block_time,
-      });
-    } catch (error: any) {
-      logger.error('Failed to get producer', { error: error.message });
-      res.status(500).json({ error: error.message });
-    }
-  }
-
-  /**
-   * GET /api/v1/richlist
-   * Get rich list with pagination (CACHED - supply calculation cached for 30s)
-   */
   private async getRichList(req: Request, res: Response): Promise<void> {
     try {
-      const page = Math.max(1, parseInt(req.query.page as string) || 1);
-      const pageSize = Math.min(1000, Math.max(1, parseInt(req.query.pageSize as string) || 100));
-      const minBalance = parseInt(req.query.minBalance as string) || 1;
-      const offset = (page - 1) * pageSize;
+      // Support both limit/offset and page/pageSize styles
+      const pageSize = Math.min(parseInt(req.query.pageSize as string) || parseInt(req.query.limit as string) || 100, 1000);
+      const page = Math.max(parseInt(req.query.page as string) || 1, 1);
+      const offset = parseInt(req.query.offset as string) || ((page - 1) * pageSize);
 
-      // Get supply stats from cache or refresh
-      const now = Date.now();
-      let supplyStats = this.richListSupplyCache.data;
-
-      if (!supplyStats || (now - this.richListSupplyCache.timestamp) > APIServer.RICH_LIST_SUPPLY_CACHE_TTL) {
-        // If a refresh is already in progress, wait for it (request coalescing)
-        if (this.richListSupplyRefreshPromise) {
-          await this.richListSupplyRefreshPromise;
-          supplyStats = this.richListSupplyCache.data;
-        } else {
-          // Start a new refresh
-          const refreshPromise = (async () => {
-            // Get total count of addresses (using pg_stat_user_tables for speed)
-            const totalAddresses = await this.db.query(`
-              SELECT n_live_tup as count
-              FROM pg_stat_user_tables
-              WHERE schemaname = 'public' AND relname = 'address_summary'
-            `);
-
-            // Get correct total supply from address balances + shielded pool
-            // Using address_summary is 13x faster than summing all UTXOs (127ms vs 1735ms)
-            const supplyQuery = await this.db.query(`
-              SELECT
-                COALESCE(SUM(balance), 0) as transparent_supply,
-                (SELECT COALESCE(shielded_pool, 0) FROM supply_stats ORDER BY block_height DESC LIMIT 1) as shielded_pool
-              FROM address_summary
-              WHERE balance > 0
-            `);
-
-            const transparentSupply = BigInt(supplyQuery.rows[0]?.transparent_supply || '0');
-            const shieldedPool = BigInt(supplyQuery.rows[0]?.shielded_pool || '0');
-            const totalSupply = (transparentSupply + shieldedPool).toString();
-
-            const newStats = {
-              totalSupply,
-              totalAddresses: parseInt(totalAddresses.rows[0]?.count || '0'),
-            };
-
-            this.richListSupplyCache = { data: newStats, timestamp: now };
-            return newStats;
-          })();
-
-          this.richListSupplyRefreshPromise = refreshPromise;
-
-          try {
-            supplyStats = await refreshPromise;
-          } finally {
-            this.richListSupplyRefreshPromise = null;
-          }
-        }
-      }
-
-      // Fallback if stats are still unavailable
-      if (!supplyStats) {
-        supplyStats = { totalSupply: '0', totalAddresses: 0 };
-      }
-
-      // Get paginated rich list
-      const richListQuery = await this.db.query(`
+      // Query addresses with balances, then join with live_fluxnodes for node counts
+      const addresses = await this.ch.query<any>(`
         SELECT
-          address,
-          balance,
-          tx_count,
-          received_total,
-          sent_total,
-          unspent_count,
-          first_seen,
-          last_activity,
-          cumulus_count,
-          nimbus_count,
-          stratus_count
-        FROM address_summary
-        WHERE balance >= $1
-        ORDER BY balance DESC
-        LIMIT $2 OFFSET $3
-      `, [minBalance * 1e8, pageSize, offset]);
+          a.address,
+          a.balance,
+          a.tx_count,
+          a.last_activity,
+          fn.cumulus_count,
+          fn.nimbus_count,
+          fn.stratus_count
+        FROM (
+          SELECT
+            address,
+            sumMerge(balance) AS balance,
+            sumMerge(tx_count) AS tx_count,
+            maxMerge(last_activity) AS last_activity
+          FROM address_summary_agg
+          GROUP BY address
+          HAVING balance > 0
+          ORDER BY balance DESC
+          LIMIT ${pageSize}
+          OFFSET ${offset}
+        ) a
+        LEFT JOIN live_fluxnodes fn ON a.address = fn.address
+      `);
 
-      // Get current block height for metadata
-      const syncState = await this.db.query('SELECT current_height, chain_height FROM sync_state WHERE id = 1');
-      const currentHeight = syncState.rows[0]?.current_height || 0;
+      // Cache-friendly: separate count query (can be cached longer)
+      const totalResult = await this.ch.queryOne<{ count: number; total: string }>(`
+        SELECT count() as count, toString(sum(balance)) as total
+        FROM (
+          SELECT sumMerge(balance) AS balance
+          FROM address_summary_agg
+          GROUP BY address
+          HAVING balance > 0
+        )
+      `);
 
-      // Format addresses
-      const addresses = richListQuery.rows.map((row, index) => ({
-        rank: offset + index + 1,
-        address: row.address,
-        balance: row.balance ? row.balance.toString() : '0',
-        txCount: row.tx_count,
-        cumulusCount: row.cumulus_count || 0,
-        nimbusCount: row.nimbus_count || 0,
-        stratusCount: row.stratus_count || 0,
-        receivedTotal: row.received_total ? row.received_total.toString() : '0',
-        sentTotal: row.sent_total ? row.sent_total.toString() : '0',
-        unspentCount: row.unspent_count,
-        firstSeen: row.first_seen,
-        lastActivity: row.last_activity,
-      }));
+      // Get latest block for lastBlockHeight - use ORDER BY LIMIT 1 instead of FINAL with max()
+      const latestBlock = await this.ch.queryOne<{ height: number }>(`
+        SELECT height FROM blocks WHERE is_valid = 1 ORDER BY height DESC LIMIT 1
+      `);
 
+      const totalAddresses = Number(totalResult?.count ?? 0);
+      const totalSupplySat = Number(totalResult?.total ?? 0);
+
+      // Return format expected by flux-explorer frontend
       res.json({
         lastUpdate: new Date().toISOString(),
-        lastBlockHeight: currentHeight,
-        totalSupply: supplyStats.totalSupply,
-        totalAddresses: supplyStats.totalAddresses,
+        lastBlockHeight: Number(latestBlock?.height ?? 0),
+        totalSupply: totalSupplySat.toString(), // Keep as string in satoshis for explorer compatibility
+        totalAddresses,
         page,
         pageSize,
-        totalPages: Math.ceil(supplyStats.totalAddresses / pageSize),
-        addresses,
+        totalPages: Math.ceil(totalAddresses / pageSize),
+        addresses: addresses.map((a: any, idx: number) => ({
+          rank: offset + idx + 1,
+          address: a.address,
+          balance: a.balance.toString(), // Keep as string in satoshis
+          txCount: Number(a.tx_count),
+          cumulusCount: Number(a.cumulus_count) || 0,
+          nimbusCount: Number(a.nimbus_count) || 0,
+          stratusCount: Number(a.stratus_count) || 0,
+        })),
+        // Also include pagination format for backwards compatibility
+        pagination: {
+          total: totalAddresses,
+          limit: pageSize,
+          offset,
+        },
+        totalSupplyFlux: totalSupplySat / 1e8, // Also include FLUX value for convenience
       });
     } catch (error: any) {
-      logger.error('Failed to get rich list', { error: error.message });
       res.status(500).json({ error: error.message });
     }
   }
+
+  // ========== Supply Stats ==========
 
   /**
    * Calculate mainchain-only supply (without parallel asset distributions)
@@ -2361,235 +1396,521 @@ export class APIServer {
     return BigInt(Math.floor(coins * 100000000));
   }
 
-  /**
-   * GET /api/v1/supply
-   * Get supply statistics (transparent, shielded, circulating, total, max)
-   */
-  private async getSupplyStats(req: Request, res: Response): Promise<void> {
+  private async getSupplyStats(_req: Request, res: Response): Promise<void> {
     try {
-      // Get current block height
-      const syncState = await this.db.query('SELECT current_height FROM sync_state WHERE id = 1');
-      const currentHeight = syncState.rows[0]?.current_height || 0;
-
-      if (currentHeight === 0) {
-        res.status(503).json({
-          error: 'Indexer not synced',
-          message: 'Supply statistics are not yet available',
-        });
-        return;
-      }
-
-      // Get latest supply stats (shielded pool)
-      const supplyQuery = await this.db.query(`
-        SELECT
-          block_height,
-          shielded_pool,
-          updated_at
-        FROM supply_stats
+      // FINAL needed for ReplacingMergeTree deduplication
+      const stats = await this.ch.queryOne<any>(`
+        SELECT block_height, transparent_supply, shielded_pool, total_supply
+        FROM supply_stats FINAL
         ORDER BY block_height DESC
         LIMIT 1
       `);
 
-      if (supplyQuery.rows.length === 0) {
-        res.status(503).json({
-          error: 'Supply data not available',
-          message: 'Supply statistics have not been calculated yet',
+      if (!stats) {
+        res.json({
+          blockHeight: 0,
+          transparentSupply: 0,
+          shieldedPool: 0,
+          circulatingSupply: 0,
+          totalSupply: 0,
+          maxSupply: 560000000,
         });
         return;
       }
 
-      const stats = supplyQuery.rows[0];
-
-      // Calculate transparent supply using address_summary balances
-      // 13x faster than summing all UTXOs (127ms vs 1735ms)
-      const transparentQuery = await this.db.query(`
-        SELECT COALESCE(SUM(balance), 0) as transparent_supply
-        FROM address_summary
-        WHERE balance > 0
-      `);
-
-      // Database stores values in zatoshis (integers), but PostgreSQL numeric type may have decimals
-      // Convert to string and remove any decimal places
-      const transparentSupplyRaw = String(transparentQuery.rows[0]?.transparent_supply || '0');
-      const shieldedPoolRaw = String(stats.shielded_pool || '0');
-
-      // Remove decimal point and fractional part if present (convert to zatoshis)
-      const transparentSupply = BigInt(transparentSupplyRaw.split('.')[0]);
-      const shieldedPool = BigInt(shieldedPoolRaw.split('.')[0]);
+      const blockHeight = Number(stats.block_height);
+      const transparentSupply = BigInt(stats.transparent_supply);
+      const shieldedPool = BigInt(stats.shielded_pool);
       const totalSupply = transparentSupply + shieldedPool;
 
       // Calculate circulating supply
       // Circulating = Total supply - Locked parallel assets
       // Where locked = theoretical mainchain supply - theoretical distributed to parallel chains
-      const theoreticalMainchain = this.calculateMainchainSupply(stats.block_height);
-      const theoreticalAllChains = this.calculateCirculatingSupplyAllChains(stats.block_height);
+      const theoreticalMainchain = this.calculateMainchainSupply(blockHeight);
+      const theoreticalAllChains = this.calculateCirculatingSupplyAllChains(blockHeight);
       const lockedParallelAssets = theoreticalMainchain - theoreticalAllChains;
       const circulatingSupply = totalSupply - lockedParallelAssets;
 
       // Max supply is 560 million FLUX
       const maxSupply = BigInt(560000000) * BigInt(100000000); // in zatoshis
 
-      // Helper function to convert zatoshis to FLUX with decimal places
+      // Helper function to convert zatoshis to FLUX
       const toFlux = (zatoshis: bigint): string => {
         const flux = Number(zatoshis) / 100000000;
         return flux.toString();
       };
 
       res.json({
-        blockHeight: stats.block_height,
+        blockHeight,
         transparentSupply: toFlux(transparentSupply),
         shieldedPool: toFlux(shieldedPool),
         circulatingSupply: toFlux(circulatingSupply),
         totalSupply: toFlux(totalSupply),
         maxSupply: toFlux(maxSupply),
-        lastUpdate: stats.updated_at,
         timestamp: new Date().toISOString(),
       });
     } catch (error: any) {
-      logger.error('Failed to get supply stats', { error: error.message });
       res.status(500).json({ error: error.message });
     }
   }
 
-  /**
-   * GET /api/v1/nodes - Get FluxNode list
-   */
-  private async getFluxNodes(req: Request, res: Response): Promise<void> {
+  // ========== Producers ==========
+
+  private async getProducers(req: Request, res: Response): Promise<void> {
     try {
-      const filter = (req.query.filter as string) || 'all'; // all, confirmed, starting
+      const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
+      const offset = parseInt(req.query.offset as string) || 0;
 
-      const nodeList = await this.rpc.getFluxNodeList();
+      // Use GROUP BY to deduplicate without expensive FINAL
+      const producers = await this.ch.query<any>(`
+        SELECT fluxnode, blocks_produced, first_block, last_block, total_rewards
+        FROM producers
+        GROUP BY fluxnode, blocks_produced, first_block, last_block, total_rewards
+        ORDER BY blocks_produced DESC
+        LIMIT ${limit}
+        OFFSET ${offset}
+      `);
 
-      // Filter nodes if requested
-      let filteredNodes = nodeList;
-      if (filter !== 'all' && Array.isArray(nodeList)) {
-        filteredNodes = nodeList.filter((node: any) => node.status === filter);
-      }
+      // Use uniqExact() for accurate count without expensive FINAL
+      const totalResult = await this.ch.queryOne<{ count: number }>('SELECT uniqExact(fluxnode) as count FROM producers');
 
       res.json({
-        nodes: filteredNodes,
-        total: Array.isArray(filteredNodes) ? filteredNodes.length : 0,
-        filter,
-        timestamp: new Date().toISOString(),
+        producers: producers.map((p, idx) => ({
+          rank: offset + idx + 1,
+          fluxnode: p.fluxnode,
+          blocksProduced: Number(p.blocks_produced),
+          firstBlock: Number(p.first_block),
+          lastBlock: Number(p.last_block),
+          totalRewards: Number(p.total_rewards) / 1e8,
+        })),
+        pagination: {
+          total: Number(totalResult?.count ?? 0),
+          limit,
+          offset,
+        },
       });
     } catch (error: any) {
-      logger.error('Failed to get FluxNode list', { error: error.message });
       res.status(500).json({ error: error.message });
     }
   }
 
-  /**
-   * GET /api/v1/nodes/:ip - Get FluxNode status
-   */
+  private async getProducer(req: Request, res: Response): Promise<void> {
+    try {
+      const { identifier } = req.params;
+
+      // Single-row lookup - use LIMIT 1 instead of FINAL
+      const producer = await this.ch.queryOne<any>(`
+        SELECT fluxnode, blocks_produced, first_block, last_block, total_rewards
+        FROM producers
+        WHERE fluxnode = {identifier:String}
+        LIMIT 1
+      `, { identifier });
+
+      if (!producer) {
+        res.status(404).json({ error: 'Producer not found' });
+        return;
+      }
+
+      // Get recent blocks - use GROUP BY to deduplicate without expensive FINAL
+      const recentBlocks = await this.ch.query<any>(`
+        SELECT height, hash, timestamp, tx_count
+        FROM blocks
+        WHERE producer = {identifier:String} AND is_valid = 1
+        GROUP BY height, hash, timestamp, tx_count
+        ORDER BY height DESC
+        LIMIT 10
+      `, { identifier });
+
+      res.json({
+        fluxnode: producer.fluxnode,
+        blocksProduced: producer.blocks_produced,
+        firstBlock: producer.first_block,
+        lastBlock: producer.last_block,
+        totalRewards: Number(producer.total_rewards) / 1e8,
+        recentBlocks,
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  // ========== FluxNode Endpoints ==========
+
+  private async getFluxNodes(req: Request, res: Response): Promise<void> {
+    try {
+      const limit = Math.min(parseInt(req.query.limit as string) || 100, 1000);
+      const offset = parseInt(req.query.offset as string) || 0;
+      const tier = req.query.tier as string;
+
+      // Validate tier to prevent SQL injection and build WHERE clause
+      const validTiers = ['CUMULUS', 'NIMBUS', 'STRATUS'];
+      let tierFilter = '';
+      if (tier && validTiers.includes(tier.toUpperCase())) {
+        tierFilter = `AND benchmark_tier = '${tier.toUpperCase()}'`;
+      }
+
+      // Use GROUP BY to deduplicate without expensive FINAL
+      // Filter by is_valid = 1 for reorg handling
+      const nodes = await this.ch.query<any>(`
+        SELECT txid, block_height, block_time, type, ip_address, public_key,
+               benchmark_tier, p2sh_address
+        FROM fluxnode_transactions
+        WHERE is_valid = 1 ${tierFilter}
+        GROUP BY txid, block_height, block_time, type, ip_address, public_key,
+                 benchmark_tier, p2sh_address
+        ORDER BY block_height DESC
+        LIMIT ${limit}
+        OFFSET ${offset}
+      `);
+
+      // Use uniqExact() for accurate count without expensive FINAL
+      const totalResult = await this.ch.queryOne<{ count: number }>(`
+        SELECT uniqExact(txid, block_height) as count
+        FROM fluxnode_transactions
+        WHERE is_valid = 1 ${tierFilter}
+      `);
+
+      res.json({
+        nodes: nodes.map(n => ({
+          ...n,
+          txid: n.txid,  // Keep full 64-char txid
+        })),
+        pagination: {
+          total: Number(totalResult?.count ?? 0),
+          limit,
+          offset,
+        },
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
   private async getFluxNodeStatus(req: Request, res: Response): Promise<void> {
     try {
       const { ip } = req.params;
 
-      const nodeStatus = await this.rpc.getFluxNodeStatus(ip);
+      // Single-row lookup with ORDER BY LIMIT 1 - no FINAL needed
+      // Filter by is_valid = 1 for reorg handling
+      const node = await this.ch.queryOne<any>(`
+        SELECT txid, block_height, block_time, type, ip_address, public_key,
+               benchmark_tier, p2sh_address, collateral_hash, collateral_index
+        FROM fluxnode_transactions
+        WHERE ip_address = {ip:String} AND is_valid = 1
+        ORDER BY block_height DESC
+        LIMIT 1
+      `, { ip });
 
-      res.json({
-        ip,
-        status: nodeStatus,
-        timestamp: new Date().toISOString(),
-      });
-    } catch (error: any) {
-      logger.error('Failed to get FluxNode status', { error: error.message, ip: req.params.ip });
-      res.status(500).json({ error: error.message });
-    }
-  }
-
-  /**
-   * GET /api/v1/network - Get network information
-   */
-  private async getNetworkInfo(req: Request, res: Response): Promise<void> {
-    try {
-      const networkInfo = await this.rpc.getNetworkInfo();
-      const blockchainInfo = await this.rpc.getBlockchainInfo();
-
-      res.json({
-        network: {
-          version: networkInfo.subversion,
-          protocolVersion: networkInfo.protocolversion,
-          connections: networkInfo.connections,
-          relayfee: networkInfo.relayfee,
-          localServices: networkInfo.localservices,
-          networks: networkInfo.networks,
-        },
-        blockchain: {
-          chain: blockchainInfo.chain,
-          blocks: blockchainInfo.blocks,
-          headers: blockchainInfo.headers,
-          bestBlockHash: blockchainInfo.bestblockhash,
-          difficulty: blockchainInfo.difficulty,
-          medianTime: blockchainInfo.mediantime,
-          verificationProgress: blockchainInfo.verificationprogress,
-          chainwork: blockchainInfo.chainwork,
-          pruned: blockchainInfo.pruned,
-          consensus: 'PoN',
-        },
-        timestamp: new Date().toISOString(),
-      });
-    } catch (error: any) {
-      logger.error('Failed to get network info', { error: error.message });
-      res.status(500).json({ error: error.message });
-    }
-  }
-
-  /**
-   * GET /api/v1/mempool - Get mempool information
-   */
-  private async getMempoolInfo(req: Request, res: Response): Promise<void> {
-    try {
-      const includeTxs = req.query.includeTxs === 'true';
-
-      const mempoolInfo = await this.rpc.getMempoolInfo();
-      let transactions = [];
-
-      if (includeTxs) {
-        const rawMempool = await this.rpc.getRawMempool(true);
-        transactions = Array.isArray(rawMempool) ? rawMempool : Object.keys(rawMempool);
+      if (!node) {
+        res.status(404).json({ error: 'FluxNode not found' });
+        return;
       }
 
       res.json({
-        size: mempoolInfo.size,
-        bytes: mempoolInfo.bytes,
-        usage: mempoolInfo.usage,
-        maxmempool: mempoolInfo.maxmempool,
-        mempoolminfee: mempoolInfo.mempoolminfee,
-        ...(includeTxs && { transactions }),
-        timestamp: new Date().toISOString(),
+        ...node,
+        txid: node.txid,  // Keep full 64-char txid
       });
     } catch (error: any) {
-      logger.error('Failed to get mempool info', { error: error.message });
       res.status(500).json({ error: error.message });
     }
   }
 
-  /**
-   * Start API server
-   */
+  // ========== Network ==========
+
+  private async getNetworkInfo(_req: Request, res: Response): Promise<void> {
+    try {
+      const [chainInfo, networkInfo] = await Promise.all([
+        this.rpc.getBlockchainInfo(),
+        this.rpc.getNetworkInfo(),
+      ]);
+
+      res.json({
+        chain: chainInfo.chain,
+        blocks: chainInfo.blocks,
+        headers: chainInfo.headers,
+        bestBlockHash: chainInfo.bestblockhash,
+        difficulty: chainInfo.difficulty,
+        version: networkInfo.version,
+        subversion: networkInfo.subversion,
+        protocolVersion: networkInfo.protocolversion,
+        connections: networkInfo.connections,
+      });
+    } catch (error: any) {
+      // Return unavailable status instead of 500 when daemon is not ready
+      logger.debug('Network info unavailable', { error: error.message });
+      res.json({
+        status: 'unavailable',
+        message: 'Daemon not ready',
+        chain: 'mainnet',
+        blocks: 0,
+        headers: 0,
+        connections: 0,
+      });
+    }
+  }
+
+  private async getMempoolInfo(_req: Request, res: Response): Promise<void> {
+    try {
+      const mempoolInfo = await this.rpc.getMempoolInfo();
+      res.json(mempoolInfo);
+    } catch (error: any) {
+      // Return unavailable status instead of 500 when daemon is not ready
+      logger.debug('Mempool info unavailable', { error: error.message });
+      res.json({
+        status: 'unavailable',
+        message: 'Daemon not ready',
+        size: 0,
+        bytes: 0,
+        usage: 0,
+      });
+    }
+  }
+
+  private async getDashboardStats(_req: Request, res: Response): Promise<void> {
+    try {
+      const now = Date.now();
+      if (this.statsCache.data && (now - this.statsCache.timestamp) < ClickHouseAPIServer.STATS_CACHE_TTL) {
+        res.json(this.statsCache.data);
+        return;
+      }
+
+      const nowSeconds = Math.floor(now / 1000);
+
+      // Phase 1: Get latest blocks and general stats in parallel
+      // The latest 5 blocks query is very fast (uses primary key ORDER BY)
+      const [latestBlocks, avgBlockTime, tx24h] = await Promise.all([
+        // Get latest 5 blocks - fast primary key scan
+        this.ch.query<any>(`
+          SELECT height, hash, timestamp
+          FROM blocks
+          WHERE is_valid = 1
+          ORDER BY height DESC
+          LIMIT 5
+        `),
+        this.ch.queryOne<{ avg_interval: number }>(`
+          WITH recent AS (
+            SELECT height, timestamp, lagInFrame(timestamp) OVER (ORDER BY height) AS prev_timestamp
+            FROM blocks
+            WHERE is_valid = 1
+            GROUP BY height, timestamp
+            ORDER BY height DESC
+            LIMIT 121
+          )
+          SELECT avg(timestamp - prev_timestamp) as avg_interval
+          FROM recent
+          WHERE prev_timestamp > 0
+        `),
+        this.ch.queryOne<{ tx_24h: string }>(`
+          SELECT toString(sum(tx_count)) as tx_24h
+          FROM (
+            SELECT height, tx_count
+            FROM blocks
+            WHERE is_valid = 1 AND timestamp >= ${nowSeconds - 86400}
+            GROUP BY height, tx_count
+          )
+        `),
+      ]);
+
+      const latestBlock = latestBlocks[0] || null;
+
+      // Phase 2: Get coinbase transactions and their outputs for just those 5 block heights
+      // This uses block_height partition key for efficient filtering instead of scanning all coinbase txs
+      let recentCoinbaseTxs: any[] = [];
+      let outputsByTxid = new Map<string, Array<{ address: string; value: bigint }>>();
+
+      if (latestBlocks.length > 0) {
+        const heights = latestBlocks.map((b: any) => b.height);
+        const heightList = heights.join(',');
+
+        // Get coinbase transactions for just these specific heights (partition-efficient)
+        const coinbaseTxs = await this.ch.query<any>(`
+          SELECT txid, block_height, output_total
+          FROM transactions
+          WHERE block_height IN (${heightList}) AND is_coinbase = 1 AND is_valid = 1
+        `);
+
+        // Build block lookup map
+        const blockMap = new Map(latestBlocks.map((b: any) => [b.height, b]));
+
+        // Merge block info with coinbase transactions
+        recentCoinbaseTxs = coinbaseTxs.map((t: any) => {
+          const block = blockMap.get(t.block_height);
+          return {
+            height: t.block_height,
+            hash: block?.hash,
+            timestamp: block?.timestamp,
+            txid: t.txid,
+            output_total: t.output_total,
+          };
+        }).sort((a: any, b: any) => b.height - a.height);
+
+        // Get outputs for coinbase transactions
+        if (coinbaseTxs.length > 0) {
+          const txidList = coinbaseTxs.map((t: any) => `'${t.txid}'`).join(',');
+          const outputs = await this.ch.query<{ txid: string; address: string; value: string }>(`
+            SELECT txid, address, value
+            FROM utxos
+            WHERE txid IN (${txidList})
+            ORDER BY txid, vout
+          `);
+
+          for (const out of outputs) {
+            const existing = outputsByTxid.get(out.txid) || [];
+            existing.push({ address: out.address, value: BigInt(out.value) });
+            outputsByTxid.set(out.txid, existing);
+          }
+        }
+      }
+
+      // Build response format expected by frontend (DashboardStats)
+      const payload = {
+        latestBlock: {
+          height: latestBlock?.height ?? 0,
+          hash: latestBlock?.hash ?? null,  // Keep full 64-char hash
+          timestamp: latestBlock?.timestamp ?? null,
+        },
+        averages: {
+          blockTimeSeconds: avgBlockTime?.avg_interval ?? 120,
+        },
+        transactions24h: parseInt(tx24h?.tx_24h ?? '0'),
+        latestRewards: recentCoinbaseTxs.map((r: any) => {
+          const outputs = outputsByTxid.get(r.txid) || [];
+          const totalRewardSat = Number(r.output_total);
+
+          return {
+            height: r.height,
+            hash: r.hash,  // Keep full 64-char hash
+            timestamp: r.timestamp,
+            txid: r.txid,  // Keep full 64-char txid
+            totalRewardSat,
+            totalReward: totalRewardSat / 1e8,
+            outputs: outputs.map(o => ({
+              address: o.address !== 'SHIELDED_OR_NONSTANDARD' ? o.address : null,
+              valueSat: Number(o.value),
+              value: Number(o.value) / 1e8,
+            })),
+          };
+        }),
+        generatedAt: new Date().toISOString(),
+      };
+
+      this.statsCache = { data: payload, timestamp: now };
+      res.json(payload);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  // ========== Analytics (Materialized Views) ==========
+
+  private async getTxVolumeHistory(req: Request, res: Response): Promise<void> {
+    try {
+      const days = Math.min(parseInt(req.query.days as string) || 30, 365);
+      const cutoff = Math.floor(Date.now() / 1000) - (days * 86400);
+
+      // Leverages mv_hourly_tx_count materialized view for instant aggregation
+      const hourlyData = await this.ch.query<{
+        hour: string;
+        tx_count: string;
+        block_count: number;
+      }>(`
+        SELECT
+          hour,
+          toString(tx_count) as tx_count,
+          block_count
+        FROM mv_hourly_tx_count
+        WHERE hour >= toDateTime(${cutoff})
+        ORDER BY hour DESC
+        LIMIT ${days * 24}
+      `);
+
+      // Also get daily aggregates
+      const dailyData = await this.ch.query<{
+        day: string;
+        tx_count: string;
+        block_count: string;
+      }>(`
+        SELECT
+          toDate(hour) as day,
+          toString(sum(tx_count)) as tx_count,
+          toString(sum(block_count)) as block_count
+        FROM mv_hourly_tx_count
+        WHERE hour >= toDateTime(${cutoff})
+        GROUP BY day
+        ORDER BY day DESC
+      `);
+
+      res.json({
+        hourly: hourlyData.map(h => ({
+          hour: h.hour,
+          txCount: parseInt(h.tx_count),
+          blockCount: h.block_count,
+        })),
+        daily: dailyData.map(d => ({
+          day: d.day,
+          txCount: parseInt(d.tx_count),
+          blockCount: parseInt(d.block_count),
+        })),
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  private async getSupplyHistory(req: Request, res: Response): Promise<void> {
+    try {
+      const days = Math.min(parseInt(req.query.days as string) || 90, 365);
+
+      // Leverages mv_daily_supply materialized view
+      const data = await this.ch.query<{
+        day: string;
+        max_height: number;
+        transparent_supply: string;
+        shielded_pool: string;
+        total_supply: string;
+      }>(`
+        SELECT
+          day,
+          max_height,
+          toString(transparent_supply) as transparent_supply,
+          toString(shielded_pool) as shielded_pool,
+          toString(total_supply) as total_supply
+        FROM mv_daily_supply
+        ORDER BY day DESC
+        LIMIT ${days}
+      `);
+
+      res.json({
+        history: data.map(d => ({
+          day: d.day,
+          height: d.max_height,
+          transparentSupply: Number(d.transparent_supply) / 1e8,
+          shieldedPool: Number(d.shielded_pool) / 1e8,
+          totalSupply: Number(d.total_supply) / 1e8,
+        })),
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  // ========== Server Control ==========
+
   async start(): Promise<void> {
     return new Promise((resolve) => {
       this.server = this.app.listen(this.port, () => {
-        logger.info(`API server listening on port ${this.port}`);
+        logger.info(`ClickHouse API server listening on port ${this.port}`);
         resolve();
       });
     });
   }
 
-  /**
-   * Stop API server
-   */
   async stop(): Promise<void> {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       if (this.server) {
-        this.server.close((err: Error) => {
-          if (err) {
-            reject(err);
-          } else {
-            logger.info('API server stopped');
-            resolve();
-          }
+        this.server.close(() => {
+          logger.info('ClickHouse API server stopped');
+          resolve();
         });
       } else {
         resolve();

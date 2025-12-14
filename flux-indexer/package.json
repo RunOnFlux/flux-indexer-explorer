@@ -7,8 +7,6 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
-    "db:migrate": "node dist/database/migrate.js",
-    "db:reset": "node dist/database/reset.js",
     "test": "jest",
     "debug:block": "tsx src/scripts/debug-block-parser.ts",
     "inspect:block": "tsx src/scripts/inspect-block.ts"
@@ -18,19 +16,28 @@
     "blockchain",
     "indexer",
     "pon",
-    "cryptocurrency"
+    "cryptocurrency",
+    "clickhouse",
+    "explorer"
   ],
-  "author": "",
+  "author": "Sikbik",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sikbik/flux-blockchain-explorer.git"
+  },
+  "homepage": "https://github.com/Sikbik/flux-blockchain-explorer#readme",
+  "bugs": {
+    "url": "https://github.com/Sikbik/flux-blockchain-explorer/issues"
+  },
   "dependencies": {
+    "@clickhouse/client": "^1.8.1",
     "@types/compression": "^1.8.1",
     "compression": "^1.8.1",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "node-fetch": "^2.7.0",
-    "pg": "^8.11.3",
-    "pg-copy-streams": "^7.0.0",
     "winston": "^3.11.0"
   },
   "devDependencies": {
@@ -39,8 +46,6 @@
     "@types/jest": "^29.5.11",
     "@types/node": "^20.10.5",
     "@types/node-fetch": "^2.6.13",
-    "@types/pg": "^8.10.9",
-    "@types/pg-copy-streams": "^1.2.5",
     "jest": "^29.7.0",
     "tsx": "^4.7.0",
     "typescript": "^5.3.3"

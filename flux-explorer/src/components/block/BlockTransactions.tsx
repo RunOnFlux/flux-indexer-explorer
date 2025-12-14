@@ -2,15 +2,12 @@
 
 import { useState, useMemo, useEffect } from "react";
 import Link from "next/link";
-import { Block, BlockTransactionDetail, Transaction } from "@/types/flux-api";
-import { useTransactionsBatch } from "@/lib/api/hooks/useTransactions";
+import { Block, BlockTransactionDetail } from "@/types/flux-api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
 import { Badge } from "@/components/ui/badge";
-import { Skeleton } from "@/components/ui/skeleton";
 import { ArrowRight, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, FileText, Server } from "lucide-react";
-import { getRewardLabel } from "@/lib/block-rewards";
 
 interface BlockTransactionsProps {
   block: Block;
@@ -105,21 +102,7 @@ export function BlockTransactions({ block }: BlockTransactionsProps) {
     }
   }, [totalPages, currentPage]);
 
-  // Use batch endpoint - single HTTP request for all transactions on the page
-  const txids = currentDetails.map((detail) => detail.txid);
-  const { data: batchTransactions, isLoading } = useTransactionsBatch(txids, block.height);
-
-  // Create a map for quick lookup by txid
-  const transactionMap = useMemo(() => {
-    const map = new Map<string, Transaction>();
-    if (batchTransactions) {
-      batchTransactions.forEach((tx) => {
-        if (tx.txid) map.set(tx.txid, tx);
-      });
-    }
-    return map;
-  }, [batchTransactions]);
-
+  // No batch API call needed - txDetails now includes fromAddr/toAddr directly
   const counts = useMemo(() => summarizeCounts(block), [block]);
 
   const goToPage = (page: number) => {
@@ -165,25 +148,9 @@ export function BlockTransactions({ block }: BlockTransactionsProps) {
         </div>
       </CardHeader>
       <CardContent className="space-y-3 w-full max-w-full overflow-x-hidden">
-        {isLoading && currentDetails.length === 0 ? (
-          Array.from({ length: TRANSACTIONS_PER_PAGE }).map((_, i) => (
-            <div key={i} className="flex items-center gap-3 rounded-lg border bg-card p-3">
-              <Skeleton className="h-8 w-8 rounded-full" />
-              <div className="flex-1 space-y-2">
-                <Skeleton className="h-4 w-3/4" />
-                <Skeleton className="h-3 w-1/2" />
-              </div>
-              <Skeleton className="h-8 w-8" />
-            </div>
-          ))
-        ) : (
-          currentDetails.map((detail, index) => {
-            // Get transaction from batch map (single request loaded all at once)
-            const tx = transactionMap.get(detail.txid);
+        {currentDetails.map((detail, index) => {
             const globalIndex = startIndex + index;
-            const detailSize = detail.size && detail.size > 0 ? detail.size : null;
-            const txSize = tx && tx.size && tx.size > 0 ? tx.size : null;
-            const sizeBytes = detailSize ?? txSize ?? null;
+            const sizeBytes = detail.size && detail.size > 0 ? detail.size : null;
 
             const badge = () => {
               if (detail.kind === "coinbase") {
@@ -208,77 +175,59 @@ export function BlockTransactions({ block }: BlockTransactionsProps) {
 
             const description = () => {
               if (detail.kind === "coinbase") {
-                // Show breakdown of reward distribution
-                const outputs = tx?.vout || [];
-                const rewardBreakdown = outputs
-                  .filter((output) => parseFloat(String(output.value)) > 0)
-                  .map((output, idx) => {
-                    const amount = parseFloat(String(output.value));
-                    const label = getRewardLabel(amount, block.height);
-                    const address = output.scriptPubKey?.addresses?.[0] || "Unknown";
-                    return (
-                      <div key={idx} className="flex items-center justify-between text-xs py-1">
-                        <div className="flex items-center gap-2">
-                          <Badge
-                            variant="outline"
-                            className={`text-[10px] px-1.5 py-0 ${label.color.replace('bg-', 'text-')} border-${label.color.replace('bg-', '')}/20 bg-${label.color.replace('bg-', '')}/10`}
-                          >
-                            {label.type}
-                          </Badge>
-                          <Link
-                            href={`/address/${address}`}
-                            className="font-mono text-muted-foreground hover:text-primary hover:underline truncate max-w-[120px]"
-                            title={address}
-                          >
-                            {address.slice(0, 8)}...{address.slice(-6)}
-                          </Link>
-                        </div>
-                        <span className="font-medium">{formatFlux(amount)} FLUX</span>
-                      </div>
-                    );
-                  });
-
+                // Show coinbase reward (simplified - no breakdown for faster loading)
                 return (
                   <div className="space-y-1">
                     <div className="font-medium">Block reward: {formatFlux(detail.value)} FLUX</div>
-                    {rewardBreakdown.length > 0 && (
-                      <div className="pl-2 border-l-2 border-muted space-y-0.5">
-                        {rewardBreakdown}
-                      </div>
-                    )}
                     {renderSize()}
                   </div>
                 );
               }
               if (detail.kind === "transfer") {
-                if (tx) {
-                  const fromAddr = tx.vin?.[0]?.addr;
-                  const toAddr = tx.vout?.[0]?.scriptPubKey?.addresses?.[0];
-                  return (
-                    <div className="space-y-1">
-                      <div className="flex items-center gap-1 text-xs text-muted-foreground">
-                        {fromAddr ? (
-                          <Link href={`/address/${fromAddr}`} className="truncate max-w-[140px] hover:underline" title={fromAddr}>
-                            {fromAddr.slice(0, 8)}...{fromAddr.slice(-6)}
-                          </Link>
-                        ) : (
-                          <span>Shielded pool</span>
-                        )}
-                        <ArrowRight className="h-3 w-3" />
-                        {toAddr ? (
-                          <Link href={`/address/${toAddr}`} className="truncate max-w-[140px] hover:underline" title={toAddr}>
-                            {toAddr.slice(0, 8)}...{toAddr.slice(-6)}
-                          </Link>
-                        ) : (
-                          <span>Shielded pool</span>
-                        )}
-                        <span className="ml-2 font-medium text-foreground">{formatFlux(tx.valueOut)} FLUX</span>
-                      </div>
-                      {renderSize()}
+                // Use fromAddr/toAddr directly from txDetails (no batch API needed)
+                const fromAddr = detail.fromAddr;
+                const toAddr = detail.toAddr;
+
+                // Calculate display amount - for shielded txs, show the appropriate value
+                // Shielded → Transparent: value (output) is the deshielded amount
+                // Transparent → Shielded: calculate shieldedAmount = valueIn - value - fee
+                const isShieldedCapable = detail.version === 2 || detail.version === 4;
+                const valueIn = detail.valueIn || 0;
+                const valueOut = detail.value || 0;
+                const fee = detail.fee || 0;
+
+                // Determine if this is a shielding tx (transparent → shielded)
+                const isShieldingTx = isShieldedCapable && !toAddr && fromAddr && valueIn > valueOut;
+                const shieldedAmount = isShieldingTx ? valueIn - valueOut - fee : 0;
+
+                // Choose the display amount
+                const displayAmount = isShieldingTx && shieldedAmount > 0
+                  ? shieldedAmount  // Show shielded amount for transparent→shielded
+                  : valueOut;       // Show output for normal/deshielding txs
+
+                return (
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                      {fromAddr ? (
+                        <Link href={`/address/${fromAddr}`} className="truncate max-w-[140px] hover:underline" title={fromAddr}>
+                          {fromAddr.slice(0, 8)}...{fromAddr.slice(-6)}
+                        </Link>
+                      ) : (
+                        <span>Shielded pool</span>
+                      )}
+                      <ArrowRight className="h-3 w-3" />
+                      {toAddr ? (
+                        <Link href={`/address/${toAddr}`} className="truncate max-w-[140px] hover:underline" title={toAddr}>
+                          {toAddr.slice(0, 8)}...{toAddr.slice(-6)}
+                        </Link>
+                      ) : (
+                        <span>Shielded pool</span>
+                      )}
+                      <span className="ml-2 font-medium text-foreground">{formatFlux(displayAmount)} FLUX</span>
                     </div>
-                  );
-                }
-                return renderSize() ?? "Transfer";
+                    {renderSize()}
+                  </div>
+                );
               }
               if (detail.kind === "fluxnode_confirm") {
                 return (
@@ -312,7 +261,7 @@ export function BlockTransactions({ block }: BlockTransactionsProps) {
                     {badge()}
                   </div>
                   <div className="text-xs text-muted-foreground" aria-live="polite">
-                    {isLoading && !tx ? <Skeleton className="h-3 w-40" /> : description()}
+                    {description()}
                   </div>
                 </div>
                 <div className="flex items-center gap-1 flex-shrink-0">
@@ -325,8 +274,7 @@ export function BlockTransactions({ block }: BlockTransactionsProps) {
                 </div>
               </div>
             );
-          })
-        )}
+          })}
 
         {totalPages > 1 && (
           <div className="w-full">

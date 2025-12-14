@@ -1,89 +1,135 @@
 /**
- * FluxIndexer - Main Entry Point
+ * FluxIndexer - ClickHouse Entry Point
  *
  * Custom blockchain indexer for Flux v9.0.0+ PoN consensus
+ * Using ClickHouse for high-performance storage
  */
 
 import { config } from './config';
 import { FluxRPCClient } from './rpc/flux-rpc-client';
-import { DatabaseConnection } from './database/connection';
-import { SyncEngine } from './indexer/sync-engine';
-import { APIServer } from './api/server';
-import { runMigration } from './database/migrate';
+import { ClickHouseConnection, getClickHouse, closeClickHouse } from './database/connection';
+import { ClickHouseSyncEngine } from './indexer/sync-engine';
+import { ClickHouseAPIServer } from './api/server';
+import { ClickHouseFluxNodeSyncService } from './services/fluxnode-sync';
 import { logger, printStartupBanner } from './utils/logger';
-import { BootstrapImporter } from './bootstrap/importer';
-import { FluxNodeSyncService } from './services/fluxnode-sync';
+import * as fs from 'fs';
+import * as path from 'path';
 
-class FluxIndexer {
+class ClickHouseFluxIndexer {
   private rpc!: FluxRPCClient;
-  private db!: DatabaseConnection;
-  private syncEngine!: SyncEngine;
-  private apiServer!: APIServer;
-  private fluxNodeSync!: FluxNodeSyncService;
+  private ch!: ClickHouseConnection;
+  private syncEngine!: ClickHouseSyncEngine;
+  private apiServer!: ClickHouseAPIServer;
+  private fluxNodeSync!: ClickHouseFluxNodeSyncService;
   private isShuttingDown = false;
 
   /**
-   * Initialize FluxIndexer
+   * Initialize FluxIndexer with ClickHouse
    */
   async initialize(): Promise<void> {
-    logger.info('Initializing FluxIndexer...');
+    logger.info('Initializing FluxIndexer with ClickHouse...');
     logger.info('Configuration', {
       rpcUrl: config.rpc.url,
-      dbHost: config.database.host,
-      dbName: config.database.database,
+      clickhouseHost: config.clickhouse.host,
+      clickhousePort: config.clickhouse.port,
+      clickhouseDb: config.clickhouse.database,
       apiPort: config.api.port,
       batchSize: config.indexer.batchSize,
       pollingInterval: config.indexer.pollingInterval,
     });
 
-    // Initialize RPC client (but don't block on connection)
+    // Initialize RPC client
     this.rpc = new FluxRPCClient(config.rpc);
     logger.info('RPC client initialized');
 
-    // Initialize database connection
-    this.db = new DatabaseConnection(config.database);
-    await this.db.connect();
-    logger.info('Database connected');
+    // Initialize ClickHouse connection with retry logic
+    // ClickHouse may still be bootstrapping/restoring data on first deploy
+    // Retry every 10 seconds for up to 30 minutes (180 attempts)
+    this.ch = getClickHouse(config.clickhouse);
+    await this.ch.connectWithRetry(180, 10000);
+    logger.info('ClickHouse connected');
 
-    // Run migrations
-    if (process.env.SKIP_MIGRATIONS !== 'true') {
-      logger.info('Running database migrations...');
-      await runMigration(this.db);
-      logger.info('Migrations complete');
-    }
+    // Initialize schema if needed
+    await this.initializeSchema();
 
-    // Check and import bootstrap if needed
-    const bootstrapImporter = new BootstrapImporter(this.db.getPool());
-    const bootstrapImported = await bootstrapImporter.checkAndImport();
-    if (bootstrapImported) {
-      logger.info('Bootstrap import completed, database is ready');
-    }
-
-    // Initialize sync engine (will start when RPC is ready)
-    this.syncEngine = new SyncEngine(this.rpc, this.db, {
+    // Initialize sync engine
+    this.syncEngine = new ClickHouseSyncEngine(this.rpc, this.ch, {
       batchSize: config.indexer.batchSize,
       pollingInterval: config.indexer.pollingInterval,
       startHeight: config.indexer.startHeight,
       maxReorgDepth: config.indexer.maxReorgDepth,
     });
-    logger.info('Sync engine initialized');
+    logger.info('ClickHouse sync engine initialized');
 
     // Initialize FluxNode sync service
-    this.fluxNodeSync = new FluxNodeSyncService(this.db.getPool(), this.rpc);
+    this.fluxNodeSync = new ClickHouseFluxNodeSyncService(this.ch, this.rpc);
     logger.info('FluxNode sync service initialized');
 
     // Initialize API server
-    this.apiServer = new APIServer(this.db, this.rpc, this.syncEngine, config.api.port);
-    logger.info('API server initialized');
+    this.apiServer = new ClickHouseAPIServer(this.ch, this.rpc, this.syncEngine, config.api.port);
+    logger.info('ClickHouse API server initialized');
 
     logger.info('FluxIndexer initialization complete');
+  }
+
+  /**
+   * Initialize ClickHouse schema from file
+   */
+  private async initializeSchema(): Promise<void> {
+    const schemaPath = path.join(__dirname, 'database', 'schema.sql');
+
+    if (!fs.existsSync(schemaPath)) {
+      logger.warn('Schema file not found, assuming schema already exists', { path: schemaPath });
+      return;
+    }
+
+    logger.info('Checking ClickHouse schema...');
+
+    // Check if tables exist
+    const blocksExist = await this.ch.tableExists('blocks');
+
+    if (blocksExist) {
+      logger.info('ClickHouse schema already initialized');
+      return;
+    }
+
+    logger.info('Initializing ClickHouse schema...');
+    const schemaSQL = fs.readFileSync(schemaPath, 'utf-8');
+    await this.ch.executeSchema(schemaSQL);
+    logger.info('ClickHouse schema initialized');
+  }
+
+  /**
+   * Validate data consistency on startup and repair if needed
+   */
+  private async validateAndRepairOnStartup(): Promise<void> {
+    logger.info('🔍 Running startup data consistency checks...');
+
+    // Check address_summary consistency with UTXOs
+    const isConsistent = await this.syncEngine.getBlockIndexer().validateAddressSummaryConsistency();
+
+    if (!isConsistent) {
+      logger.warn('⚠️ address_summary inconsistency detected, rebuilding from UTXOs...');
+      await this.syncEngine.getBlockIndexer().rebuildAddressSummaryFromUtxos();
+
+      // Verify after rebuild
+      const isNowConsistent = await this.syncEngine.getBlockIndexer().validateAddressSummaryConsistency();
+      if (!isNowConsistent) {
+        logger.error('❌ address_summary still inconsistent after rebuild - manual intervention may be needed');
+      }
+    }
+
+    logger.info('✅ Startup data consistency checks complete');
   }
 
   /**
    * Start FluxIndexer
    */
   async start(): Promise<void> {
-    logger.info('Starting FluxIndexer...');
+    logger.info('Starting FluxIndexer with ClickHouse...');
+
+    // Validate and repair data consistency before starting sync
+    await this.validateAndRepairOnStartup();
 
     // Start API server
     await this.apiServer.start();
@@ -97,7 +143,7 @@ class FluxIndexer {
     this.fluxNodeSync.start();
     logger.info('FluxNode sync service started');
 
-    logger.info('FluxIndexer is running');
+    logger.info('FluxIndexer is running with ClickHouse backend');
     logger.info(`API available at http://${config.api.host}:${config.api.port}/api/v1`);
   }
 
@@ -130,42 +176,48 @@ class FluxIndexer {
       logger.info('API server stopped');
     }
 
-    // Close database connection
-    if (this.db) {
-      await this.db.close();
-      logger.info('Database connection closed');
-    }
+    // Close ClickHouse connection
+    await closeClickHouse();
+    logger.info('ClickHouse connection closed');
 
     logger.info('FluxIndexer stopped');
   }
 
   /**
-   * Find missing blocks (gaps in block height sequence)
+   * Check for block gaps in ClickHouse
    */
   async findMissingBlocks(): Promise<number[]> {
-    const pool = this.db.getPool();
-
-    // Check if we have any blocks first
-    const countResult = await pool.query('SELECT COUNT(*) as count FROM blocks');
-    if (parseInt(countResult.rows[0].count) === 0) {
-      return []; // Empty database, no gaps
-    }
-
-    // Find all missing blocks
-    const result = await pool.query(`
-      WITH block_range AS (
-        SELECT generate_series(0, (SELECT MAX(height) FROM blocks)) as expected_height
-      ),
-      actual_blocks AS (
-        SELECT height FROM blocks
-      )
-      SELECT array_agg(expected_height ORDER BY expected_height) as missing_heights
-      FROM block_range br
-      LEFT JOIN actual_blocks ab ON br.expected_height = ab.height
-      WHERE ab.height IS NULL;
+    // Get max height and count - no FINAL for MergeTree tables
+    const maxResult = await this.ch.queryOne<{ max_height: string | number; block_count: string | number }>(`
+      SELECT max(height) as max_height, count() as block_count FROM blocks WHERE is_valid = 1
     `);
 
-    return result.rows[0]?.missing_heights || [];
+    const maxHeight = Number(maxResult?.max_height ?? -1);
+    const blockCount = Number(maxResult?.block_count ?? 0);
+
+    // Empty database - no blocks indexed yet
+    if (blockCount === 0 || isNaN(blockCount)) {
+      return [];
+    }
+
+    if (maxHeight < 0 || isNaN(maxHeight)) {
+      return []; // Empty database
+    }
+
+    // Find gaps using a range query - no FINAL for MergeTree tables
+    const gaps = await this.ch.query<{ missing: number }>(`
+      WITH numbers AS (
+        SELECT number FROM numbers(${maxHeight + 1})
+      )
+      SELECT number as missing
+      FROM numbers n
+      LEFT ANTI JOIN (
+        SELECT height FROM blocks WHERE is_valid = 1
+      ) b ON n.number = b.height
+      ORDER BY missing
+    `);
+
+    return gaps.map(g => g.missing);
   }
 
   /**
@@ -179,9 +231,8 @@ class FluxIndexer {
       return 0;
     }
 
-    logger.info(`Found ${missingHeights.length} missing blocks: ${missingHeights.join(', ')}`);
+    logger.info(`Found ${missingHeights.length} missing blocks`);
 
-    // Index each missing block
     const blockIndexer = this.syncEngine.getBlockIndexer();
     for (const height of missingHeights) {
       try {
@@ -202,11 +253,11 @@ class FluxIndexer {
   async getStatus(): Promise<any> {
     const chainInfo = await this.rpc.getBlockchainInfo();
     const syncStats = this.syncEngine.getSyncStats();
-    const poolStats = this.db.getPoolStats();
 
     return {
       indexer: {
-        version: '1.0.0',
+        version: '1.0.0-clickhouse',
+        backend: 'ClickHouse',
         uptime: syncStats.uptimeSeconds,
         isRunning: syncStats.isRunning,
         blocksIndexed: syncStats.blocksIndexed,
@@ -220,19 +271,16 @@ class FluxIndexer {
         difficulty: chainInfo.difficulty,
         consensus: 'PoN',
       },
-      database: {
-        pool: poolStats,
-      },
     };
   }
 }
 
 // Main execution
 async function main() {
-  // Show the awesome startup banner
   printStartupBanner();
+  logger.info('🚀 Starting FluxIndexer with ClickHouse backend');
 
-  const indexer = new FluxIndexer();
+  const indexer = new ClickHouseFluxIndexer();
 
   // Handle shutdown signals
   const shutdown = async (signal: string) => {
@@ -244,7 +292,6 @@ async function main() {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  // Handle uncaught errors
   process.on('uncaughtException', (error) => {
     logger.error('Uncaught exception', { error: error.message, stack: error.stack });
     shutdown('uncaughtException');
@@ -258,40 +305,33 @@ async function main() {
   try {
     await indexer.initialize();
 
-    // ALWAYS check for block gaps on startup
-    // Gaps indicate data corruption - cumulative stats like supply_stats will be wrong
+    // Check for block gaps
     logger.info('Checking for block gaps...');
     const gaps = await indexer.findMissingBlocks();
     if (gaps.length > 0) {
       logger.error(`❌ BLOCK GAPS DETECTED: ${gaps.slice(0, 10).join(', ')}${gaps.length > 10 ? ` (and ${gaps.length - 10} more)` : ''}`);
-      logger.error('Cumulative stats (supply_stats) are likely corrupted.');
-      logger.error('Options:');
-      logger.error('  1. Run with BACKFILL_GAPS=true to attempt repair (WARNING: may not fix cumulative stats)');
-      logger.error('  2. Truncate database and resync from block 0 (RECOMMENDED for data integrity)');
 
       if (process.env.BACKFILL_GAPS === 'true') {
         logger.warn('BACKFILL_GAPS=true - Attempting to backfill gaps...');
         const backfilled = await indexer.backfillMissingBlocks();
-        logger.warn(`Backfilled ${backfilled} blocks. ⚠️  WARNING: supply_stats is likely still incorrect!`);
+        logger.warn(`Backfilled ${backfilled} blocks.`);
       } else {
-        logger.error('Refusing to start with block gaps. Set BACKFILL_GAPS=true to override (not recommended).');
+        logger.error('Refusing to start with block gaps. Set BACKFILL_GAPS=true to override.');
         process.exit(1);
       }
     }
 
     await indexer.start();
 
-    // Log status periodically (less frequently during heavy sync)
+    // Log status periodically
     setInterval(async () => {
       try {
         const status = await indexer.getStatus();
         logger.info('Status', status);
       } catch (error: any) {
-        // During heavy sync, RPC might be too busy - log as debug, not error
-        // This prevents noisy logs when parallel fetcher is overwhelming the daemon
-        logger.debug('Status check failed (daemon busy during sync)', { error: error.message });
+        logger.debug('Status check failed', { error: error.message });
       }
-    }, 60000); // Every minute
+    }, 60000);
   } catch (error: any) {
     logger.error('Failed to start FluxIndexer', { error: error.message, stack: error.stack });
     process.exit(1);
@@ -306,4 +346,4 @@ if (require.main === module) {
   });
 }
 
-export { FluxIndexer };
+export { ClickHouseFluxIndexer };

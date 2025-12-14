@@ -26,7 +26,7 @@ export const revalidate = CACHE_DURATION;
  * Request Coalescing for Concurrent Load Protection
  *
  * Problem: If 50 users hit /api/rich-list simultaneously, that's 50 database queries
- * scanning 1.5M addresses, which could overload PostgreSQL.
+ * scanning 1.5M addresses, which could overload the database.
  *
  * Solution: Share the same Promise across concurrent requests. Only the first request
  * triggers the database query; others wait for and share the same result.

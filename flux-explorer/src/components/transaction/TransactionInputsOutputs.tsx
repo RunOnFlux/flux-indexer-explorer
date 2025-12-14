@@ -12,34 +12,17 @@ interface TransactionInputsOutputsProps {
 }
 
 export function TransactionInputsOutputs({ transaction }: TransactionInputsOutputsProps) {
-  const hasNoInputs = transaction.vin.length === 0 || (!transaction.vin[0]?.txid);
+  // Coinbase transactions have a 'coinbase' property on the first input
+  const isCoinbase = transaction.vin.length > 0 && !!transaction.vin[0]?.coinbase;
+
+  const hasNoInputs = transaction.vin.length === 0 || (!transaction.vin[0]?.txid && !isCoinbase);
 
   // Check if this is a FluxNode transaction (version 5 or 6, or has nType field)
   const isFluxNode = transaction.version === 5 || transaction.version === 6 || transaction.nType !== undefined;
 
-  // Distinguish between coinbase and shielded deshielding transactions
-  // Coinbase transactions will have outputs that match expected mining rewards
-  // Shielded transactions will have arbitrary amounts
-  const isLikelyCoinbase = hasNoInputs && transaction.vout.some(out => {
-    const amount = parseFloat(String(out.value));
-    // Check if any output amount matches common mining reward patterns
-    // Mining rewards are typically: 150, 75, 37.5, or PON tier amounts (1, 3.5, 9, 0.5+)
-    return amount > 0.5 && (
-      Math.abs(amount - 150) < 0.01 ||
-      Math.abs(amount - 75) < 0.01 ||
-      Math.abs(amount - 37.5) < 0.01 ||
-      Math.abs(amount - 112.5) < 0.01 ||
-      Math.abs(amount - 56.25) < 0.01 ||
-      Math.abs(amount - 28.125) < 0.01 ||
-      Math.abs(amount - 9) < 0.01 ||
-      Math.abs(amount - 3.5) < 0.01 ||
-      Math.abs(amount - 1) < 0.01
-    );
-  });
-
-  const isCoinbase = hasNoInputs && isLikelyCoinbase;
   // FluxNode transactions are NOT shielded - they have no inputs but are a special on-chain message
-  const isShielded = hasNoInputs && !isLikelyCoinbase && !isFluxNode;
+  // Shielded transactions have no transparent inputs and are not coinbase or FluxNode
+  const isShielded = hasNoInputs && !isCoinbase && !isFluxNode;
 
   return (
     <Card>
@@ -50,26 +33,44 @@ export function TransactionInputsOutputs({ transaction }: TransactionInputsOutpu
         <div className="grid gap-6 md:grid-cols-[1fr_auto_1fr] items-start">
           {/* INPUTS */}
           <div className="space-y-3">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold">
-                Inputs ({transaction.vin.length})
-              </h3>
-              {!isCoinbase && (
-                <Badge variant="outline">{transaction.valueIn.toFixed(8)} FLUX</Badge>
-              )}
-            </div>
+            {(() => {
+              // Calculate if funds are coming from shielded pool
+              // For v2/v4 transactions: shieldedAmount = valueOut + fees - valueIn (transparent)
+              const isShieldedCapable = transaction.version === 2 || transaction.version === 4;
+              const shieldedInputAmount = isShieldedCapable && !isCoinbase && isShielded
+                ? transaction.valueOut + (transaction.fees || 0) - transaction.valueIn
+                : 0;
+              const hasShieldedInput = shieldedInputAmount > 0.00000001;
+              const inputCount = isCoinbase ? 1 : (hasShieldedInput ? 1 : transaction.vin.length);
+              const totalInputValue = hasShieldedInput
+                ? transaction.valueIn + shieldedInputAmount
+                : transaction.valueIn;
 
-            {isCoinbase ? (
-              <CoinbaseInput />
-            ) : isFluxNode ? (
-              <FluxNodeInput transaction={transaction} />
-            ) : isShielded ? (
-              <ShieldedInput />
-            ) : (
-              transaction.vin.map((input, index) => (
-                <InputCard key={`${input.txid}-${input.vout}`} input={input} index={index} />
-              ))
-            )}
+              return (
+                <>
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-lg font-semibold">
+                      Inputs ({inputCount})
+                    </h3>
+                    {!isCoinbase && (
+                      <Badge variant="outline">{totalInputValue.toFixed(8)} FLUX</Badge>
+                    )}
+                  </div>
+
+                  {isCoinbase ? (
+                    <CoinbaseInput />
+                  ) : isFluxNode ? (
+                    <FluxNodeInput transaction={transaction} />
+                  ) : hasShieldedInput ? (
+                    <ShieldedInput amount={shieldedInputAmount} />
+                  ) : (
+                    transaction.vin.map((input, index) => (
+                      <InputCard key={`${input.txid}-${input.vout}`} input={input} index={index} />
+                    ))
+                  )}
+                </>
+              );
+            })()}
           </div>
 
           {/* ARROW - Hidden on mobile, shown on md+ */}
@@ -81,22 +82,43 @@ export function TransactionInputsOutputs({ transaction }: TransactionInputsOutpu
 
           {/* OUTPUTS */}
           <div className="space-y-3">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold">
-                Outputs ({transaction.vout.length})
-              </h3>
-              <Badge variant="outline">{transaction.valueOut.toFixed(8)} FLUX</Badge>
-            </div>
+            {(() => {
+              // Calculate if funds are going to shielded pool
+              // For v2/v4 transactions: shieldedAmount = valueIn - valueOut - fees
+              const isShieldedCapable = transaction.version === 2 || transaction.version === 4;
+              const shieldedOutputAmount = isShieldedCapable && !isCoinbase
+                ? transaction.valueIn - transaction.valueOut - (transaction.fees || 0)
+                : 0;
+              const hasShieldedOutput = shieldedOutputAmount > 0.00000001; // Account for floating point
+              const outputCount = transaction.vout.length + (hasShieldedOutput ? 1 : 0);
 
-            {transaction.vout.map((output, index) => (
-              <OutputCard
-                key={`${output.n}`}
-                output={output}
-                index={index}
-                isCoinbase={isCoinbase}
-                blockHeight={transaction.blockheight}
-              />
-            ))}
+              return (
+                <>
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-lg font-semibold">
+                      Outputs ({outputCount})
+                    </h3>
+                    <Badge variant="outline">
+                      {(transaction.valueOut + (hasShieldedOutput ? shieldedOutputAmount : 0)).toFixed(8)} FLUX
+                    </Badge>
+                  </div>
+
+                  {transaction.vout.map((output, index) => (
+                    <OutputCard
+                      key={`${output.n}`}
+                      output={output}
+                      index={index}
+                      isCoinbase={isCoinbase}
+                      blockHeight={transaction.blockheight}
+                    />
+                  ))}
+
+                  {hasShieldedOutput && (
+                    <ShieldedOutput amount={shieldedOutputAmount} index={transaction.vout.length} />
+                  )}
+                </>
+              );
+            })()}
           </div>
         </div>
       </CardContent>
@@ -125,22 +147,80 @@ function CoinbaseInput() {
   );
 }
 
-function ShieldedInput() {
+interface ShieldedInputProps {
+  amount: number;
+}
+
+function ShieldedInput({ amount }: ShieldedInputProps) {
   return (
     <div className="p-4 rounded-lg border bg-card hover:bg-muted/50 transition-colors border-purple-500/20">
-      <div className="flex items-center gap-3 mb-3">
-        <div className="flex h-10 w-10 items-center justify-center rounded-full bg-purple-500/10">
-          <Lock className="h-5 w-5 text-purple-500" />
+      <div className="space-y-2">
+        {/* Index and Value */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Badge variant="secondary">#0</Badge>
+            <Badge variant="outline" className="gap-1 text-xs border-purple-500 text-purple-500">
+              <Lock className="h-3 w-3" />
+              Shielded
+            </Badge>
+          </div>
+          <span className="font-mono text-sm font-semibold">
+            {amount.toFixed(8)} FLUX
+          </span>
         </div>
-        <div className="flex-1">
-          <div className="font-semibold text-base">Shielded Pool</div>
-          <p className="text-xs text-muted-foreground">From Privacy Pool</p>
+
+        {/* Shielded Pool Info */}
+        <div className="flex items-center gap-3 pt-2">
+          <div className="flex h-8 w-8 items-center justify-center rounded-full bg-purple-500/10">
+            <Lock className="h-4 w-4 text-purple-500" />
+          </div>
+          <div className="flex-1">
+            <div className="font-medium text-sm">From Shielded Pool</div>
+            <p className="text-xs text-muted-foreground">
+              Funds received from the privacy pool. The source address is hidden.
+            </p>
+          </div>
         </div>
       </div>
-      <div className="pt-3 border-t border-border/50">
-        <p className="text-sm text-muted-foreground leading-relaxed">
-          This transaction originated from the shielded pool. The source address is hidden for privacy.
-        </p>
+    </div>
+  );
+}
+
+interface ShieldedOutputProps {
+  amount: number;
+  index: number;
+}
+
+function ShieldedOutput({ amount, index }: ShieldedOutputProps) {
+  return (
+    <div className="p-4 rounded-lg border bg-card hover:bg-muted/50 transition-colors border-purple-500/20">
+      <div className="space-y-2">
+        {/* Index and Value */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Badge variant="secondary">#{index}</Badge>
+            <Badge variant="outline" className="gap-1 text-xs border-purple-500 text-purple-500">
+              <Lock className="h-3 w-3" />
+              Shielded
+            </Badge>
+          </div>
+          <span className="font-mono text-sm font-semibold">
+            {amount.toFixed(8)} FLUX
+          </span>
+        </div>
+
+        {/* Shielded Pool Info */}
+        <div className="flex items-center gap-3 pt-2">
+          <div className="flex h-8 w-8 items-center justify-center rounded-full bg-purple-500/10">
+            <Lock className="h-4 w-4 text-purple-500" />
+          </div>
+          <div className="flex-1">
+            <div className="font-medium text-sm">To Shielded Pool</div>
+            <p className="text-xs text-muted-foreground">
+              Funds sent to the privacy pool. The destination address is hidden.
+            </p>
+          </div>
+        </div>
       </div>
     </div>
   );

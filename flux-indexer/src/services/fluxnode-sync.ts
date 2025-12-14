@@ -1,52 +1,119 @@
 /**
- * FluxNode Synchronization Service
+ * ClickHouse FluxNode Synchronization Service
  *
- * Periodically queries the Flux daemon's FluxNode list and updates address_summary
- * with accurate FluxNode counts per address (Cumulus, Nimbus, Stratus).
+ * Periodically queries the Flux daemon's FluxNode list and updates live_fluxnodes
+ * table with accurate FluxNode counts per address (Cumulus, Nimbus, Stratus).
+ *
+ * Uses a separate table (live_fluxnodes) instead of address_summary because
+ * SummingMergeTree deletes rows where all summing columns are zero.
  */
 
-import { Pool } from 'pg';
+import { ClickHouseConnection } from '../database/connection';
 import { FluxRPCClient } from '../rpc/flux-rpc-client';
 import { logger } from '../utils/logger';
+
+// Collateral amounts in satoshis
+const CUMULUS_COLLATERAL = 1000_00000000;   // 1,000 FLUX
+const NIMBUS_COLLATERAL = 12500_00000000;   // 12,500 FLUX
+const STRATUS_COLLATERAL = 40000_00000000;  // 40,000 FLUX
 
 export interface FluxNodeCounts {
   address: string;
   cumulusCount: number;
   nimbusCount: number;
   stratusCount: number;
+  totalCollateral: bigint;
 }
 
-export class FluxNodeSyncService {
-  private db: Pool;
+export class ClickHouseFluxNodeSyncService {
+  private ch: ClickHouseConnection;
   private rpc: FluxRPCClient;
   private syncInterval: NodeJS.Timeout | null = null;
+  private daemonCheckInterval: NodeJS.Timeout | null = null;
   private isSyncing = false;
+  private daemonReady = false;
 
   // Sync every 10 minutes (FluxNode list changes slowly)
   private readonly SYNC_INTERVAL_MS = 10 * 60 * 1000;
+  // Check if daemon is ready every 30 seconds
+  private readonly DAEMON_CHECK_INTERVAL_MS = 30 * 1000;
 
-  constructor(db: Pool, rpc: FluxRPCClient) {
-    this.db = db;
+  constructor(ch: ClickHouseConnection, rpc: FluxRPCClient) {
+    this.ch = ch;
     this.rpc = rpc;
   }
 
   /**
    * Start periodic FluxNode synchronization
+   * Waits for daemon to be ready before starting the sync schedule
    */
   start(): void {
-    if (this.syncInterval) {
+    if (this.syncInterval || this.daemonCheckInterval) {
       logger.warn('FluxNode sync service already running');
       return;
     }
 
-    logger.info('Starting FluxNode sync service');
+    logger.info('Starting ClickHouse FluxNode sync service');
 
-    // Run immediately on start (use debug level since daemon may not be ready)
-    this.syncFluxNodes().catch((error) => {
-      logger.debug('Initial FluxNode sync failed (daemon may not be ready)', { error: error.message });
-    });
+    // Start checking if daemon is ready
+    this.checkDaemonAndStartSync();
+  }
 
-    // Then run periodically
+  /**
+   * Check if daemon is ready, then start sync schedule
+   */
+  private async checkDaemonAndStartSync(): Promise<void> {
+    // Try to sync immediately
+    try {
+      const nodeList = await this.rpc.getFluxNodeList();
+      if (Array.isArray(nodeList) && nodeList.length > 0) {
+        this.daemonReady = true;
+        logger.info('Daemon is ready, starting FluxNode sync');
+
+        // Do initial sync
+        await this.syncFluxNodes();
+
+        // Start periodic sync
+        this.startPeriodicSync();
+        return;
+      }
+    } catch (error: any) {
+      logger.debug('Daemon not ready yet', { error: error.message });
+    }
+
+    // Daemon not ready, check again later
+    logger.info('Waiting for daemon to be ready before starting FluxNode sync...');
+    this.daemonCheckInterval = setInterval(async () => {
+      try {
+        const nodeList = await this.rpc.getFluxNodeList();
+        if (Array.isArray(nodeList) && nodeList.length > 0) {
+          this.daemonReady = true;
+          logger.info('Daemon is now ready, starting FluxNode sync');
+
+          // Stop checking
+          if (this.daemonCheckInterval) {
+            clearInterval(this.daemonCheckInterval);
+            this.daemonCheckInterval = null;
+          }
+
+          // Do initial sync
+          await this.syncFluxNodes();
+
+          // Start periodic sync
+          this.startPeriodicSync();
+        }
+      } catch (error: any) {
+        logger.debug('Still waiting for daemon...', { error: error.message });
+      }
+    }, this.DAEMON_CHECK_INTERVAL_MS);
+  }
+
+  /**
+   * Start the periodic sync interval
+   */
+  private startPeriodicSync(): void {
+    if (this.syncInterval) return;
+
     this.syncInterval = setInterval(
       () => {
         this.syncFluxNodes().catch((error) => {
@@ -63,11 +130,15 @@ export class FluxNodeSyncService {
    * Stop periodic synchronization
    */
   stop(): void {
+    if (this.daemonCheckInterval) {
+      clearInterval(this.daemonCheckInterval);
+      this.daemonCheckInterval = null;
+    }
     if (this.syncInterval) {
       clearInterval(this.syncInterval);
       this.syncInterval = null;
-      logger.info('FluxNode sync service stopped');
     }
+    logger.info('FluxNode sync service stopped');
   }
 
   /**
@@ -95,165 +166,81 @@ export class FluxNodeSyncService {
       logger.info(`Fetched ${nodeList.length} FluxNodes from daemon`);
 
       // If no nodes were fetched, skip database update to preserve existing data
-      // This can happen if the daemon is not ready yet or listfluxnodes returns empty
       if (nodeList.length === 0) {
         logger.warn('No FluxNodes fetched from daemon, skipping database update to preserve existing data');
         return;
       }
 
-      // Step 2: Parse and count nodes per address
-      const nodeCounts = this.countNodesPerAddress(nodeList);
+      // Step 2: Aggregate counts by payment address
+      const addressCounts = new Map<string, FluxNodeCounts>();
 
-      logger.info(`Counted nodes for ${nodeCounts.size} unique addresses`);
+      for (const node of nodeList) {
+        // FluxNode objects have 'payment_address' and 'tier' fields
+        const address = node.payment_address || node.payee;
+        const tier = node.tier?.toUpperCase() || '';
 
-      // Step 3: Update database
-      await this.updateDatabase(nodeCounts);
+        if (!address) continue;
 
-      const duration = Date.now() - startTime;
-      logger.info(`FluxNode synchronization completed in ${duration}ms`);
-    } catch (error: any) {
-      logger.error('FluxNode synchronization failed', {
-        error: error.message,
-        stack: error.stack,
+        if (!addressCounts.has(address)) {
+          addressCounts.set(address, {
+            address,
+            cumulusCount: 0,
+            nimbusCount: 0,
+            stratusCount: 0,
+            totalCollateral: BigInt(0),
+          });
+        }
+
+        const counts = addressCounts.get(address)!;
+        if (tier === 'CUMULUS') {
+          counts.cumulusCount++;
+          counts.totalCollateral += BigInt(CUMULUS_COLLATERAL);
+        } else if (tier === 'NIMBUS') {
+          counts.nimbusCount++;
+          counts.totalCollateral += BigInt(NIMBUS_COLLATERAL);
+        } else if (tier === 'STRATUS') {
+          counts.stratusCount++;
+          counts.totalCollateral += BigInt(STRATUS_COLLATERAL);
+        }
+      }
+
+      logger.info(`Aggregated FluxNode counts for ${addressCounts.size} addresses`);
+
+      // Step 3: Truncate old data and insert fresh data
+      // This ensures addresses that no longer run FluxNodes are removed
+      const updates = Array.from(addressCounts.values());
+
+      if (updates.length > 0) {
+        // Truncate old data first (removes stale records from users who stopped running nodes)
+        await this.ch.command('TRUNCATE TABLE live_fluxnodes');
+
+        // Format date as 'YYYY-MM-DD HH:mm:ss' for ClickHouse DateTime
+        const now = new Date();
+        const lastSync = now.toISOString().slice(0, 19).replace('T', ' ');
+
+        const rows = updates.map(u => ({
+          address: u.address,
+          cumulus_count: u.cumulusCount,
+          nimbus_count: u.nimbusCount,
+          stratus_count: u.stratusCount,
+          total_collateral: u.totalCollateral.toString(),
+          last_sync: lastSync,
+        }));
+
+        await this.ch.insert('live_fluxnodes', rows);
+        logger.info(`Updated FluxNode counts for ${updates.length} addresses in live_fluxnodes`);
+      }
+
+      const elapsed = Date.now() - startTime;
+      logger.info(`FluxNode synchronization complete in ${elapsed}ms`, {
+        totalNodes: nodeList.length,
+        addressesUpdated: addressCounts.size,
       });
+    } catch (error: any) {
+      logger.error('FluxNode synchronization failed', { error: error.message });
       throw error;
     } finally {
       this.isSyncing = false;
     }
-  }
-
-  /**
-   * Count FluxNodes per address by tier
-   *
-   * Parses the response from `flux-cli listfluxnodes` which returns an array of objects with:
-   * - payment_address: The address receiving block rewards
-   * - tier: "CUMULUS", "NIMBUS", or "STRATUS"
-   */
-  private countNodesPerAddress(nodeList: any[]): Map<string, FluxNodeCounts> {
-    const counts = new Map<string, FluxNodeCounts>();
-
-    for (const node of nodeList) {
-      // Extract the payment address (reward recipient)
-      const address = node.payment_address;
-
-      if (!address || typeof address !== 'string') {
-        logger.debug('FluxNode entry missing payment_address field', { node });
-        continue;
-      }
-
-      // Extract the tier
-      const tier = (node.tier || '').toUpperCase();
-
-      if (!tier) {
-        logger.debug('FluxNode entry missing tier field', { node, address });
-        continue;
-      }
-
-      // Initialize counts for this address if not exists
-      if (!counts.has(address)) {
-        counts.set(address, {
-          address,
-          cumulusCount: 0,
-          nimbusCount: 0,
-          stratusCount: 0,
-        });
-      }
-
-      const addressCounts = counts.get(address)!;
-
-      // Increment the appropriate tier count
-      if (tier === 'CUMULUS') {
-        addressCounts.cumulusCount++;
-      } else if (tier === 'NIMBUS') {
-        addressCounts.nimbusCount++;
-      } else if (tier === 'STRATUS') {
-        addressCounts.stratusCount++;
-      } else {
-        logger.debug('Unknown FluxNode tier', { tier, address });
-      }
-    }
-
-    return counts;
-  }
-
-  /**
-   * Update address_summary with new FluxNode counts
-   */
-  private async updateDatabase(nodeCounts: Map<string, FluxNodeCounts>): Promise<void> {
-    const client = await this.db.connect();
-
-    try {
-      await client.query('BEGIN');
-
-      // Step 1: Reset all counts to 0 first (nodes that are no longer active)
-      await client.query(`
-        UPDATE address_summary
-        SET
-          cumulus_count = 0,
-          nimbus_count = 0,
-          stratus_count = 0,
-          fluxnode_last_sync = NOW()
-        WHERE cumulus_count > 0 OR nimbus_count > 0 OR stratus_count > 0
-      `);
-
-      logger.info('Reset existing FluxNode counts to 0');
-
-      // Step 2: Update counts for active nodes
-      if (nodeCounts.size > 0) {
-        // Prepare batch update using CASE statements for efficiency
-        const addresses = Array.from(nodeCounts.keys());
-        const addressPlaceholders = addresses.map((_, i) => `$${i + 1}`).join(', ');
-
-        // Build CASE statements for each tier
-        const cumulusCases = addresses
-          .map((addr, i) => {
-            const count = nodeCounts.get(addr)!.cumulusCount;
-            return `WHEN address = $${i + 1} THEN ${count}`;
-          })
-          .join(' ');
-
-        const nimbusCases = addresses
-          .map((addr, i) => {
-            const count = nodeCounts.get(addr)!.nimbusCount;
-            return `WHEN address = $${i + 1} THEN ${count}`;
-          })
-          .join(' ');
-
-        const stratusCases = addresses
-          .map((addr, i) => {
-            const count = nodeCounts.get(addr)!.stratusCount;
-            return `WHEN address = $${i + 1} THEN ${count}`;
-          })
-          .join(' ');
-
-        const updateQuery = `
-          UPDATE address_summary
-          SET
-            cumulus_count = CASE ${cumulusCases} ELSE 0 END,
-            nimbus_count = CASE ${nimbusCases} ELSE 0 END,
-            stratus_count = CASE ${stratusCases} ELSE 0 END,
-            fluxnode_last_sync = NOW()
-          WHERE address IN (${addressPlaceholders})
-        `;
-
-        await client.query(updateQuery, addresses);
-
-        logger.info(`Updated FluxNode counts for ${addresses.length} addresses`);
-      }
-
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Manually trigger a sync (useful for testing/debugging)
-   */
-  async triggerSync(): Promise<void> {
-    await this.syncFluxNodes();
   }
 }

@@ -71,7 +71,7 @@ export class ParallelBlockFetcher {
     this.totalDelivered = 0;
     this.fetchStartTime = Date.now();
 
-    logger.info('Parallel block fetcher started', {
+    logger.debug('Parallel block fetcher started', {
       startHeight,
       targetHeight,
       batchSize: this.config.batchSize,
@@ -92,7 +92,7 @@ export class ParallelBlockFetcher {
     const elapsed = (Date.now() - this.fetchStartTime) / 1000;
     const blocksPerSecond = elapsed > 0 ? this.totalDelivered / elapsed : 0;
 
-    logger.info('Parallel block fetcher stopped', {
+    logger.debug('Parallel block fetcher stopped', {
       totalFetched: this.totalFetched,
       totalDelivered: this.totalDelivered,
       elapsed: `${elapsed.toFixed(1)}s`,
@@ -273,8 +273,9 @@ export class ParallelBlockFetcher {
    */
   private async fetchBatch(heights: number[]): Promise<Block[]> {
     try {
-      // Include raw hex for shielded transaction parsing (vjoinsplit/valueBalance)
-      return await this.rpc.batchGetBlocks(heights, true);
+      // NOTE: Raw hex is fetched separately in indexBlocksBatch with proper retry logic
+      // Don't fetch it here as it doubles RPC load and the data isn't used anyway
+      return await this.rpc.batchGetBlocks(heights, false);
     } catch (error: any) {
       logger.warn('Batch fetch failed, retrying individually', {
         heights: `${heights[0]}-${heights[heights.length - 1]}`,

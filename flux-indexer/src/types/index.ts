@@ -408,15 +408,14 @@ export interface APIPagination {
 
 export interface IndexerConfig {
   rpc: FluxRPCConfig;
-  database: {
+  clickhouse: {
     host: string;
     port: number;
     database: string;
-    user: string;
+    username: string;
     password: string;
-    max?: number;
-    idleTimeoutMillis?: number;
-    connectionTimeoutMillis?: number;
+    requestTimeout?: number;
+    maxOpenConnections?: number;
   };
   indexer: {
     batchSize: number;

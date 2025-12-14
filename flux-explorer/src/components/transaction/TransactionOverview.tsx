@@ -20,20 +20,12 @@ interface TransactionOverviewProps {
 }
 
 export function TransactionOverview({ transaction }: TransactionOverviewProps) {
-  const hasNoInputs = transaction.vin.length === 0 || (!transaction.vin[0]?.txid);
+  // Coinbase transactions have a 'coinbase' property on the first input
+  const isCoinbase = transaction.vin.length > 0 && !!transaction.vin[0]?.coinbase;
+
   const timestamp = transaction.time || transaction.blocktime;
   const sizeBytes = transaction.size > 0 ? transaction.size : (transaction.vsize ?? 0);
   const vsizeBytes = transaction.vsize ?? sizeBytes;
-
-  // Distinguish between coinbase and shielded deshielding transactions
-  // Coinbase transactions will have outputs that match expected mining rewards
-  const isLikelyCoinbase = hasNoInputs && transaction.blockheight !== undefined && (() => {
-    const expectedReward = getExpectedBlockReward(transaction.blockheight!);
-    // Check if total output is close to expected block reward (within 100 FLUX for fees)
-    return transaction.valueOut >= expectedReward - 0.01 && transaction.valueOut <= expectedReward + 100;
-  })();
-
-  const isCoinbase = hasNoInputs && isLikelyCoinbase;
 
   // Calculate fees and block reward
   // The API now correctly calculates fees for coinbase transactions

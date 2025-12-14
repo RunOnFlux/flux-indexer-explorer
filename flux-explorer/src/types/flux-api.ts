@@ -47,9 +47,16 @@ export interface BlockTransactionDetail {
   fluxnodeSignature?: string | null;
   valueSat?: number;
   value?: number;
+  valueInSat?: number;
+  valueIn?: number;
   feeSat?: number;
   fee?: number;
   size?: number;
+  version?: number;
+  isShielded?: boolean;
+  // From/to addresses for transfer display (avoids separate batch API call)
+  fromAddr?: string | null;
+  toAddr?: string | null;
 }
 
 export interface BlockTransactionSummary {
@@ -130,6 +137,7 @@ export interface TransactionInput {
   valueSat: number;
   value: number;
   doubleSpentTxID?: string;
+  coinbase?: string; // Present on coinbase transactions
 }
 
 export interface TransactionOutput {

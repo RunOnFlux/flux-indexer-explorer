@@ -206,7 +206,8 @@ export function AddressTransactions({
                     ? "Received"
                     : "Sent";
                 const isExpanded = expandedRows.has(tx.txid);
-                const netPositive = tx.value >= 0;
+                // Use direction to determine if positive (received) or negative (sent)
+                const netPositive = isReceived;
                 const netFlux = formatFlux(Math.abs(tx.value));
                 const toggleExpanded = () => {
                   setExpandedRows((prev) => {

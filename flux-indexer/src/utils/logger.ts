@@ -7,7 +7,37 @@
 
 import winston from 'winston';
 
-// ANSI color codes for vibrant output
+// Detect if we're running in a TTY (interactive terminal)
+// When not in TTY (e.g., supervisor, docker logs), use simpler output to avoid buffer issues
+const isTTY = process.stdout.isTTY === true;
+
+// Add BigInt support to JSON.stringify to prevent serialization errors
+// This is used by the logger when stringifying metadata
+const originalStringify = JSON.stringify;
+(JSON as any).stringify = function(value: any, replacer?: any, space?: any) {
+  const bigIntReplacer = (_key: string, val: any) => {
+    if (typeof val === 'bigint') {
+      return val.toString();
+    }
+    return val;
+  };
+
+  // If a replacer is provided, chain it with our BigInt replacer
+  const combinedReplacer = replacer
+    ? (key: string, val: any) => {
+        const transformed = bigIntReplacer(key, val);
+        if (typeof replacer === 'function') {
+          return replacer(key, transformed);
+        }
+        return transformed;
+      }
+    : bigIntReplacer;
+
+  return originalStringify(value, combinedReplacer, space);
+};
+
+// ANSI color codes - these are safe ASCII escape sequences that work everywhere
+// Colors are always enabled - only Unicode symbols are disabled for non-TTY
 const c = {
   reset: '\x1b[0m',
   bright: '\x1b[1m',
@@ -46,8 +76,8 @@ const c = {
   bgWhite: '\x1b[47m',
 };
 
-// Cool symbols
-const sym = {
+// Cool symbols (use ASCII fallbacks when not in TTY)
+const sym = isTTY ? {
   flux: '⚡',
   block: '█',
   blockEmpty: '░',
@@ -76,10 +106,17 @@ const sym = {
   target: '🎯',
   sparkle: '✨',
   hourglass: '⏳',
+} : {
+  // ASCII fallbacks for non-TTY
+  flux: '*', block: '#', blockEmpty: '.', check: '+', cross: 'x', warn: '!',
+  info: 'i', arrow: '->', arrowRight: '>', bullet: '*', star: '*', diamond: '*',
+  circle: 'o', square: '#', triangle: '^', heart: '<3', lightning: '*',
+  fire: '*', rocket: '^', database: '[D]', clock: '[T]', chart: '[C]',
+  gear: '[G]', link: '[L]', box: '[B]', target: '[X]', sparkle: '*', hourglass: '[.]',
 };
 
-// Box drawing characters
-const box = {
+// Box drawing characters (use ASCII when not in TTY)
+const box = isTTY ? {
   topLeft: '╭',
   topRight: '╮',
   bottomLeft: '╰',
@@ -88,6 +125,9 @@ const box = {
   vertical: '│',
   horizontalBold: '━',
   verticalBold: '┃',
+} : {
+  topLeft: '+', topRight: '+', bottomLeft: '+', bottomRight: '+',
+  horizontal: '-', vertical: '|', horizontalBold: '=', verticalBold: '|',
 };
 
 // Create a beautiful progress bar
@@ -98,11 +138,11 @@ function createProgressBar(percent: number, width: number = 40): string {
   // Gradient effect using different block characters
   let bar = '';
   for (let i = 0; i < filled; i++) {
-    if (i < width * 0.3) bar += `${c.brightGreen}█`;
-    else if (i < width * 0.7) bar += `${c.brightCyan}█`;
-    else bar += `${c.brightMagenta}█`;
+    if (i < width * 0.3) bar += `${c.brightGreen}${sym.block}`;
+    else if (i < width * 0.7) bar += `${c.brightCyan}${sym.block}`;
+    else bar += `${c.brightMagenta}${sym.block}`;
   }
-  bar += `${c.dim}${'░'.repeat(empty)}${c.reset}`;
+  bar += `${c.dim}${sym.blockEmpty.repeat(empty)}${c.reset}`;
 
   return bar;
 }
@@ -172,9 +212,9 @@ const consoleFormat = winston.format.combine(
 
       const lines = [
         '',
-        `${c.dim}${'━'.repeat(70)}${c.reset}`,
+        `${c.dim}${box.horizontalBold.repeat(70)}${c.reset}`,
         `${c.bright}${c.brightCyan}  ${sym.lightning} FLUX INDEXER ${sym.lightning}${c.reset}  ${c.dim}${timestamp}${c.reset}`,
-        `${c.dim}${'─'.repeat(70)}${c.reset}`,
+        `${c.dim}${box.horizontal.repeat(70)}${c.reset}`,
         '',
         `  ${bar} ${c.bright}${c.brightWhite}${pctStr}%${c.reset}`,
         '',
@@ -199,7 +239,7 @@ const consoleFormat = winston.format.combine(
         lines.push(`  ${c.brightMagenta}${sym.chart} DB${c.reset}        ${c.dim}tx=${c.reset}${formatNumber(m.dbStats.transactions || 0)} ${c.dim}utxos=${c.reset}${formatNumber(m.dbStats.utxos || 0)} ${c.dim}addr=${c.reset}${formatNumber(m.dbStats.addresses || 0)}`);
       }
 
-      lines.push(`${c.dim}${'━'.repeat(70)}${c.reset}`);
+      lines.push(`${c.dim}${box.horizontalBold.repeat(70)}${c.reset}`);
       lines.push('');
 
       return lines.join('\n');
@@ -212,7 +252,7 @@ const consoleFormat = winston.format.combine(
       const height = m.height || m.blockHeight || 'N/A';
       const txCount = m.txCount || m.transactions || 0;
       const time = m.processingTime || m.time || '';
-      return `${c.dim}${timestamp}${c.reset} ${c.green}${sym.check}${c.reset} ${c.dim}Block${c.reset} ${c.bright}#${formatNumber(height)}${c.reset} ${c.dim}│${c.reset} ${c.cyan}${txCount}${c.reset} ${c.dim}txs${c.reset}${time ? ` ${c.dim}│${c.reset} ${c.yellow}${time}${c.reset}` : ''}`;
+      return `${c.dim}${timestamp}${c.reset} ${c.green}${sym.check}${c.reset} ${c.dim}Block${c.reset} ${c.bright}#${formatNumber(height)}${c.reset} ${c.dim}${box.vertical}${c.reset} ${c.cyan}${txCount}${c.reset} ${c.dim}txs${c.reset}${time ? ` ${c.dim}${box.vertical}${c.reset} ${c.yellow}${time}${c.reset}` : ''}`;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -222,7 +262,7 @@ const consoleFormat = winston.format.combine(
       const start = m.startBlock || 0;
       const end = m.endBlock || 0;
       const remaining = m.blocksToSync || 0;
-      return `${c.dim}${timestamp}${c.reset} ${c.brightCyan}${sym.arrowRight}${c.reset} ${c.bright}Batch${c.reset} ${c.cyan}${formatNumber(start)}${c.reset}${c.dim}→${c.reset}${c.cyan}${formatNumber(end)}${c.reset} ${c.dim}│${c.reset} ${c.yellow}${formatNumber(remaining)}${c.reset} ${c.dim}remaining${c.reset}`;
+      return `${c.dim}${timestamp}${c.reset} ${c.brightCyan}${sym.arrowRight}${c.reset} ${c.bright}Batch${c.reset} ${c.cyan}${formatNumber(start)}${c.reset}${c.dim}${sym.arrow}${c.reset}${c.cyan}${formatNumber(end)}${c.reset} ${c.dim}${box.vertical}${c.reset} ${c.yellow}${formatNumber(remaining)}${c.reset} ${c.dim}remaining${c.reset}`;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -232,7 +272,7 @@ const consoleFormat = winston.format.combine(
       const blocks = m.blocks || m.blockCount || 0;
       const speed = m.blocksPerSecond || '';
       const time = m.time || m.duration || '';
-      return `${c.dim}${timestamp}${c.reset} ${c.brightGreen}${sym.sparkle}${c.reset} ${c.bright}Batch Done${c.reset} ${c.dim}│${c.reset} ${c.cyan}${formatNumber(blocks)}${c.reset} ${c.dim}blocks${c.reset} ${c.dim}│${c.reset} ${c.magenta}${speed}${c.reset} ${c.dim}blk/s${c.reset}${time ? ` ${c.dim}│${c.reset} ${c.yellow}${time}${c.reset}` : ''}`;
+      return `${c.dim}${timestamp}${c.reset} ${c.brightGreen}${sym.sparkle}${c.reset} ${c.bright}Batch Done${c.reset} ${c.dim}${box.vertical}${c.reset} ${c.cyan}${formatNumber(blocks)}${c.reset} ${c.dim}blocks${c.reset} ${c.dim}${box.vertical}${c.reset} ${c.magenta}${speed}${c.reset} ${c.dim}blk/s${c.reset}${time ? ` ${c.dim}${box.vertical}${c.reset} ${c.yellow}${time}${c.reset}` : ''}`;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -279,35 +319,36 @@ const consoleFormat = winston.format.combine(
     // SUPPLY VERIFICATION
     // ═══════════════════════════════════════════════════════════════════════════
     if (text.includes('Supply') && (text.includes('verified') || text.includes('match'))) {
-      return `${c.dim}${timestamp}${c.reset} ${c.brightGreen}${sym.check}${c.reset} ${c.green}Supply Verified${c.reset} ${c.dim}at height${c.reset} ${c.bright}${m.height || ''}${c.reset} ${c.dim}│${c.reset} ${c.cyan}${m.supply || m.transparent || ''}${c.reset} ${c.dim}FLUX${c.reset}`;
+      return `${c.dim}${timestamp}${c.reset} ${c.brightGreen}${sym.check}${c.reset} ${c.green}Supply Verified${c.reset} ${c.dim}at height${c.reset} ${c.bright}${m.height || ''}${c.reset} ${c.dim}${box.vertical}${c.reset} ${c.cyan}${m.supply || m.transparent || ''}${c.reset} ${c.dim}FLUX${c.reset}`;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // ERRORS - Make them VERY visible!
     // ═══════════════════════════════════════════════════════════════════════════
     if (level.includes('error')) {
+      const hLine = box.horizontal.repeat(68);
       const errorBox = [
         '',
-        `${c.brightRed}╔${'═'.repeat(68)}╗${c.reset}`,
-        `${c.brightRed}║${c.reset} ${c.bright}${c.bgRed}${c.white} ${sym.cross} ERROR ${c.reset}${' '.repeat(57)}${c.brightRed}║${c.reset}`,
-        `${c.brightRed}╠${'═'.repeat(68)}╣${c.reset}`,
-        `${c.brightRed}║${c.reset} ${c.bright}${text.substring(0, 66).padEnd(66)}${c.reset} ${c.brightRed}║${c.reset}`,
+        `${c.brightRed}${box.topLeft}${hLine}${box.topRight}${c.reset}`,
+        `${c.brightRed}${box.vertical}${c.reset} ${c.bright}${c.bgRed}${c.white} ${sym.cross} ERROR ${c.reset}${' '.repeat(57)}${c.brightRed}${box.vertical}${c.reset}`,
+        `${c.brightRed}${box.vertical}${hLine}${box.vertical}${c.reset}`,
+        `${c.brightRed}${box.vertical}${c.reset} ${c.bright}${text.substring(0, 66).padEnd(66)}${c.reset} ${c.brightRed}${box.vertical}${c.reset}`,
       ];
 
       if (m.error || m.message) {
         const errMsg = String(m.error || m.message).substring(0, 66);
-        errorBox.push(`${c.brightRed}║${c.reset} ${c.red}${errMsg.padEnd(66)}${c.reset} ${c.brightRed}║${c.reset}`);
+        errorBox.push(`${c.brightRed}${box.vertical}${c.reset} ${c.red}${errMsg.padEnd(66)}${c.reset} ${c.brightRed}${box.vertical}${c.reset}`);
       }
 
       if (m.stack) {
-        errorBox.push(`${c.brightRed}╟${'─'.repeat(68)}╢${c.reset}`);
+        errorBox.push(`${c.brightRed}${box.vertical}${hLine}${box.vertical}${c.reset}`);
         const stackLines = String(m.stack).split('\n').slice(0, 5);
         for (const line of stackLines) {
-          errorBox.push(`${c.brightRed}║${c.reset} ${c.dim}${line.substring(0, 66).padEnd(66)}${c.reset} ${c.brightRed}║${c.reset}`);
+          errorBox.push(`${c.brightRed}${box.vertical}${c.reset} ${c.dim}${line.substring(0, 66).padEnd(66)}${c.reset} ${c.brightRed}${box.vertical}${c.reset}`);
         }
       }
 
-      errorBox.push(`${c.brightRed}╚${'═'.repeat(68)}╝${c.reset}`);
+      errorBox.push(`${c.brightRed}${box.bottomLeft}${hLine}${box.bottomRight}${c.reset}`);
       errorBox.push('');
 
       return errorBox.join('\n');
@@ -317,17 +358,18 @@ const consoleFormat = winston.format.combine(
     // WARNINGS - Also make visible but less dramatic
     // ═══════════════════════════════════════════════════════════════════════════
     if (level.includes('warn')) {
+      const hLine = box.horizontal.repeat(68);
       const warnLines = [
-        `${c.brightYellow}┌${'─'.repeat(68)}┐${c.reset}`,
-        `${c.brightYellow}│${c.reset} ${c.bgYellow}${c.black} ${sym.warn} WARNING ${c.reset} ${c.yellow}${text.substring(0, 54).padEnd(54)}${c.reset} ${c.brightYellow}│${c.reset}`,
+        `${c.brightYellow}${box.topLeft}${hLine}${box.topRight}${c.reset}`,
+        `${c.brightYellow}${box.vertical}${c.reset} ${c.bgYellow}${c.black} ${sym.warn} WARNING ${c.reset} ${c.yellow}${text.substring(0, 54).padEnd(54)}${c.reset} ${c.brightYellow}${box.vertical}${c.reset}`,
       ];
 
       if (Object.keys(meta).length > 0) {
         const metaStr = JSON.stringify(meta).substring(0, 64);
-        warnLines.push(`${c.brightYellow}│${c.reset} ${c.dim}${metaStr.padEnd(66)}${c.reset} ${c.brightYellow}│${c.reset}`);
+        warnLines.push(`${c.brightYellow}${box.vertical}${c.reset} ${c.dim}${metaStr.padEnd(66)}${c.reset} ${c.brightYellow}${box.vertical}${c.reset}`);
       }
 
-      warnLines.push(`${c.brightYellow}└${'─'.repeat(68)}┘${c.reset}`);
+      warnLines.push(`${c.brightYellow}${box.bottomLeft}${hLine}${box.bottomRight}${c.reset}`);
 
       return warnLines.join('\n');
     }
@@ -424,7 +466,8 @@ logger.add(
 // STARTUP BANNER
 // ═══════════════════════════════════════════════════════════════════════════════
 export function printStartupBanner(): void {
-  const banner = `
+  if (isTTY) {
+    const banner = `
 ${c.brightCyan}
     ███████╗██╗     ██╗   ██╗██╗  ██╗    ██╗███╗   ██╗██████╗ ███████╗██╗  ██╗███████╗██████╗
     ██╔════╝██║     ██║   ██║╚██╗██╔╝    ██║████╗  ██║██╔══██╗██╔════╝╚██╗██╔╝██╔════╝██╔══██╗
@@ -434,12 +477,20 @@ ${c.brightCyan}
     ╚═╝     ╚══════╝ ╚═════╝ ╚═╝  ╚═╝    ╚═╝╚═╝  ╚═══╝╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝
 ${c.reset}
 ${c.dim}    ════════════════════════════════════════════════════════════════════════════════════${c.reset}
-${c.brightMagenta}    ⚡${c.reset} ${c.bright}High-Performance Blockchain Indexer${c.reset}          ${c.dim}Phase 3 Optimized${c.reset}
-${c.brightGreen}    ✓${c.reset} ${c.dim}Address Normalization${c.reset}  ${c.brightGreen}✓${c.reset} ${c.dim}BYTEA txids${c.reset}  ${c.brightGreen}✓${c.reset} ${c.dim}TimescaleDB Ready${c.reset}
+${c.brightMagenta}    ⚡${c.reset} ${c.bright}High-Performance Blockchain Indexer${c.reset}          ${c.dim}ClickHouse Edition${c.reset}
+${c.brightGreen}    ✓${c.reset} ${c.dim}Columnar Storage${c.reset}  ${c.brightGreen}✓${c.reset} ${c.dim}Bulk Inserts${c.reset}  ${c.brightGreen}✓${c.reset} ${c.dim}Real-time Analytics${c.reset}
 ${c.dim}    ════════════════════════════════════════════════════════════════════════════════════${c.reset}
 `;
-  console.log(banner);
+    console.log(banner);
+  } else {
+    // Simple ASCII banner for non-TTY environments
+    console.log('');
+    console.log('='.repeat(70));
+    console.log('  FLUX INDEXER - High-Performance Blockchain Indexer (ClickHouse)');
+    console.log('='.repeat(70));
+    console.log('');
+  }
 }
 
 // Export colors and symbols for use elsewhere
-export { c as colors, sym as symbols };
+export { c as colors, sym as symbols, isTTY };

@@ -43,24 +43,24 @@ function getEnvBoolean(key: string, defaultValue: boolean): boolean {
 
 export const config: IndexerConfig = {
   rpc: {
-    url: getEnv('FLUX_RPC_URL', 'http://localhost:16124'),
+    url: getEnv('FLUX_RPC_URL', 'http://127.0.0.1:16124'),
     username: process.env.FLUX_RPC_USER,
     password: process.env.FLUX_RPC_PASSWORD,
     timeout: getEnvNumber('FLUX_RPC_TIMEOUT', 30000),
   },
-  database: {
-    host: getEnv('DB_HOST', 'localhost'),
-    port: getEnvNumber('DB_PORT', 5432),
-    database: getEnv('DB_NAME', 'fluxindexer'),
-    user: getEnv('DB_USER', 'flux'),
-    password: getEnv('DB_PASSWORD', ''),
-    max: getEnvNumber('DB_POOL_MAX', 100), // Increased to 100 to handle high concurrent load (1000+ users)
-    idleTimeoutMillis: getEnvNumber('DB_IDLE_TIMEOUT', 30000),
-    connectionTimeoutMillis: getEnvNumber('DB_CONNECTION_TIMEOUT', 30000), // Increased to 30s to handle temporary load spikes
+  clickhouse: {
+    host: getEnv('CH_HOST', '127.0.0.1'),
+    // CH_HTTP_PORT for indexer app (HTTP protocol), CH_PORT is for clickhouse-client (native protocol)
+    port: getEnvNumber('CH_HTTP_PORT', getEnvNumber('CH_PORT', 8123)),
+    database: getEnv('CH_DATABASE', 'fluxindexer'),
+    username: getEnv('CH_USER', 'default'),
+    password: getEnv('CH_PASSWORD', ''),
+    requestTimeout: getEnvNumber('CH_REQUEST_TIMEOUT', 300000), // 5 min for large queries
+    maxOpenConnections: getEnvNumber('CH_MAX_CONNECTIONS', 10),
   },
   indexer: {
     batchSize: getEnvNumber('INDEXER_BATCH_SIZE', 100),
-    pollingInterval: getEnvNumber('INDEXER_POLLING_INTERVAL', 5000), // 5 seconds
+    pollingInterval: getEnvNumber('INDEXER_POLLING_INTERVAL', 5000),
     startHeight: process.env.INDEXER_START_HEIGHT
       ? parseInt(process.env.INDEXER_START_HEIGHT)
       : undefined,

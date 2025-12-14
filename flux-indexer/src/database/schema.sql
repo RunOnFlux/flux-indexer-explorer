@@ -1,574 +1,460 @@
--- FluxIndexer Database Schema
--- PostgreSQL 15+ with TimescaleDB
--- Optimized for Flux blockchain with time-series compression
+-- ============================================================================
+-- FluxIndexer ClickHouse Schema - ULTIMATE EDITION v2
+-- ============================================================================
+-- OPTIMIZATIONS:
+--   1. Compression codecs (Delta for sequential, ZSTD(3) for balanced compression)
+--   2. Projections for alternative query patterns (10-100x faster queries)
+--      - Projections use ONLY needed columns (no SELECT * waste)
+--   3. LowCardinality for repeated strings (dictionary encoding)
+--   4. Optimized ORDER BY for each table's primary access pattern
+--   5. PREWHERE-friendly column ordering (filter columns first in ORDER BY)
+--   6. Tuned index_granularity per table based on query patterns
+--   7. Lightweight delete support for efficient reorg handling
+--   8. TTL RECOMPRESS: New data uses fast ZSTD(3), old data auto-compresses to ZSTD(9)
+-- ============================================================================
+
+SET allow_experimental_lightweight_delete = 1;
+
+-- ============================================================================
+-- BLOCKS TABLE
+-- Primary access: by height (range scans), by hash (point lookup), by producer
+-- Using ReplacingMergeTree to deduplicate on re-indexing (version = insert timestamp)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS blocks (
+    height UInt32 CODEC(Delta(4), ZSTD(3)),
+    hash FixedString(64) CODEC(ZSTD(3)),
+    prev_hash FixedString(64) CODEC(ZSTD(3)),
+    merkle_root FixedString(64) CODEC(ZSTD(3)),
+    timestamp UInt32 CODEC(Delta(4), ZSTD(3)),
+    bits String CODEC(LZ4),
+    nonce String CODEC(LZ4),
+    version UInt32 CODEC(LZ4),
+    size UInt32 CODEC(LZ4),
+    tx_count UInt16 CODEC(LZ4),
+    producer LowCardinality(String) DEFAULT '' CODEC(LZ4),
+    producer_reward UInt64 CODEC(LZ4),
+    difficulty Float64 CODEC(Gorilla),
+    chainwork String CODEC(ZSTD(3)),
+    is_valid UInt8 DEFAULT 1,                         -- For reorg handling (soft delete)
+    _version UInt64 DEFAULT toUnixTimestamp64Milli(now64()) CODEC(Delta(8), ZSTD(3))  -- For deduplication
+) ENGINE = ReplacingMergeTree(_version)
+ORDER BY (height)
+PARTITION BY intDiv(height, 100000)
+SETTINGS index_granularity = 8192,
+         min_bytes_for_wide_part = 0,
+         min_rows_for_wide_part = 0;
+
+-- Projection for hash lookups (O(1) instead of O(log n))
+ALTER TABLE blocks ADD PROJECTION IF NOT EXISTS proj_by_hash (
+    SELECT * ORDER BY hash
+);
+
+-- Projection for producer queries (rich list of producers)
+-- Note: DESC not supported in projections, use ASC and reverse in query
+ALTER TABLE blocks ADD PROJECTION IF NOT EXISTS proj_by_producer (
+    SELECT producer, height, hash, timestamp, producer_reward
+    ORDER BY producer, height
+);
+
+-- Skip indexes
+ALTER TABLE blocks ADD INDEX IF NOT EXISTS idx_hash (hash) TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE blocks ADD INDEX IF NOT EXISTS idx_timestamp (timestamp) TYPE minmax GRANULARITY 1;
+ALTER TABLE blocks ADD INDEX IF NOT EXISTS idx_is_valid (is_valid) TYPE set(2) GRANULARITY 1;
+
+
+-- ============================================================================
+-- TRANSACTIONS TABLE
+-- Primary access: by block_height (batch loading), by txid (point lookup)
+-- Using ReplacingMergeTree to deduplicate on re-indexing
+-- TTL: Data older than 7 days auto-recompresses to ZSTD(9) for better storage
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS transactions (
+    block_height UInt32 CODEC(Delta(4), ZSTD(3)),
+    txid FixedString(64) CODEC(ZSTD(3)),
+    tx_index UInt16 DEFAULT 0 CODEC(LZ4),
+    timestamp UInt32 CODEC(Delta(4), ZSTD(3)),
+    version UInt32 CODEC(LZ4),
+    locktime UInt64 CODEC(LZ4),
+    size UInt32 CODEC(LZ4),
+    vsize UInt32 CODEC(LZ4),
+    input_count UInt16 CODEC(LZ4),
+    output_count UInt16 CODEC(LZ4),
+    input_total UInt64 CODEC(LZ4),
+    output_total UInt64 CODEC(LZ4),
+    fee Int64 CODEC(LZ4),
+    is_coinbase UInt8 DEFAULT 0,
+    is_fluxnode_tx UInt8 DEFAULT 0,
+    fluxnode_type Nullable(UInt8) DEFAULT NULL,
+    is_shielded UInt8 DEFAULT 0,
+    is_valid UInt8 DEFAULT 1,                         -- For reorg handling (soft delete)
+    _version UInt64 DEFAULT toUnixTimestamp64Milli(now64()) CODEC(Delta(8), ZSTD(3))  -- For deduplication
+) ENGINE = ReplacingMergeTree(_version)
+ORDER BY (txid)
+PARTITION BY intDiv(block_height, 100000)
+TTL toDateTime(timestamp) + INTERVAL 7 DAY RECOMPRESS CODEC(ZSTD(9))
+SETTINGS index_granularity = 8192;
+
+-- NOTE: proj_by_txid is NOT needed - table is already ORDER BY txid
+-- Redundant projection would waste ~10GB of storage
+
+-- Projection for coinbase transactions (block rewards analysis)
+-- Note: WHERE clause in projections not supported, filter at query time
+ALTER TABLE transactions ADD PROJECTION IF NOT EXISTS proj_coinbase (
+    SELECT block_height, txid, output_total, timestamp, is_coinbase
+    ORDER BY is_coinbase, block_height
+);
+
+-- Bloom filter for txid (backup for projection misses)
+ALTER TABLE transactions ADD INDEX IF NOT EXISTS idx_txid (txid) TYPE bloom_filter(0.001) GRANULARITY 1;
+ALTER TABLE transactions ADD INDEX IF NOT EXISTS idx_timestamp (timestamp) TYPE minmax GRANULARITY 8192;
+ALTER TABLE transactions ADD INDEX IF NOT EXISTS idx_is_valid (is_valid) TYPE set(2) GRANULARITY 1;
+
+
+-- ============================================================================
+-- UTXOS TABLE (ReplacingMergeTree for spent updates)
+-- Primary access: by (txid, vout) for spending, by address for balance
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS utxos (
+    txid FixedString(64) CODEC(ZSTD(3)),
+    vout UInt16 CODEC(LZ4),
+    address LowCardinality(String) CODEC(ZSTD(3)),
+    value UInt64 CODEC(LZ4),
+    script_pubkey String DEFAULT '' CODEC(ZSTD(3)),
+    script_type LowCardinality(String) CODEC(LZ4),
+    block_height UInt32 CODEC(Delta(4), ZSTD(3)),
+    spent UInt8 DEFAULT 0,
+    spent_txid FixedString(64) DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CODEC(ZSTD(3)),
+    spent_block_height UInt32 DEFAULT 0 CODEC(Delta(4), ZSTD(3)),
+    version UInt64 CODEC(LZ4)
+) ENGINE = ReplacingMergeTree(version)
+ORDER BY (txid, vout)
+PARTITION BY intDiv(block_height, 100000)
+SETTINGS index_granularity = 4096;
+
+-- Projection for address UTXO queries - CRITICAL for wallet balance
+ALTER TABLE utxos ADD PROJECTION IF NOT EXISTS proj_by_address (
+    SELECT address, txid, vout, value, script_type, block_height, spent, spent_txid
+    ORDER BY address, spent, block_height
+);
+
+-- Projection for unspent UTXOs by value (for coin selection algorithms)
+-- Note: WHERE clause in projections not supported, filter at query time
+ALTER TABLE utxos ADD PROJECTION IF NOT EXISTS proj_unspent_by_value (
+    SELECT address, txid, vout, value, block_height, spent
+    ORDER BY spent, value
+);
+
+-- Skip indexes
+ALTER TABLE utxos ADD INDEX IF NOT EXISTS idx_address (address) TYPE bloom_filter(0.01) GRANULARITY 4;
+ALTER TABLE utxos ADD INDEX IF NOT EXISTS idx_spent (spent) TYPE set(2) GRANULARITY 1;
+ALTER TABLE utxos ADD INDEX IF NOT EXISTS idx_block_height (block_height) TYPE minmax GRANULARITY 1;
+
+
+-- ============================================================================
+-- ADDRESS_TRANSACTIONS TABLE
+-- Primary access: paginated by address (most recent first)
+-- Denormalized for fast queries: includes block_hash to avoid JOINs
+-- Using ReplacingMergeTree to deduplicate on re-indexing
+-- TTL: Data older than 7 days auto-recompresses to ZSTD(9) for better storage
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS address_transactions (
+    address LowCardinality(String) CODEC(ZSTD(3)),
+    block_height UInt32 CODEC(Delta(4), ZSTD(3)),
+    block_hash FixedString(64) CODEC(ZSTD(3)),        -- Denormalized for fast access
+    txid FixedString(64) CODEC(ZSTD(3)),
+    tx_index UInt16 CODEC(LZ4),                       -- Position in block (for ordering)
+    timestamp UInt32 CODEC(Delta(4), LZ4),
+    direction LowCardinality(String) DEFAULT 'received' CODEC(LZ4),
+    received_value UInt64 CODEC(LZ4),
+    sent_value UInt64 CODEC(LZ4),
+    is_coinbase UInt8 DEFAULT 0,                      -- Fast coinbase identification
+    is_valid UInt8 DEFAULT 1,                         -- For reorg handling (soft delete)
+    _version UInt64 DEFAULT toUnixTimestamp64Milli(now64()) CODEC(Delta(8), LZ4)  -- For deduplication
+) ENGINE = ReplacingMergeTree(_version)
+ORDER BY (address, txid)
+PARTITION BY intDiv(block_height, 100000)
+TTL toDateTime(timestamp) + INTERVAL 7 DAY RECOMPRESS CODEC(ZSTD(9))
+SETTINGS index_granularity = 8192;
+
+-- Projection for txid lookup within address context
+ALTER TABLE address_transactions ADD PROJECTION IF NOT EXISTS proj_by_txid (
+    SELECT * ORDER BY txid, address
+);
+
+ALTER TABLE address_transactions ADD INDEX IF NOT EXISTS idx_txid (txid) TYPE bloom_filter(0.01) GRANULARITY 4;
+
+
+-- ============================================================================
+-- ADDRESS_SUMMARY TABLE (SummingMergeTree for incremental balance updates)
+-- Primary access: by address (point lookup), by balance (rich list)
+-- Using SummingMergeTree: insert deltas, ClickHouse automatically sums on merge
+-- This works perfectly with async inserts since no pre-read is needed
 --
--- PHASE 3 OPTIMIZATIONS:
--- - Address Normalization: address TEXT → address_id INTEGER (-8GB)
--- - txid → BYTEA: 64-char TEXT → 32-byte BYTEA (-15GB)
--- Combined with previous optimizations: 174GB → ~27GB target
-
--- Enable TimescaleDB extension
-CREATE EXTENSION IF NOT EXISTS timescaledb;
-
--- Drop existing tables and views (for clean migrations)
-DROP VIEW IF EXISTS utxos CASCADE;  -- utxos is now a VIEW, not a table
-DROP TABLE IF EXISTS reorgs CASCADE;
-DROP TABLE IF EXISTS sync_state CASCADE;
-DROP TABLE IF EXISTS producers CASCADE;
-DROP TABLE IF EXISTS address_summary CASCADE;
-DROP TABLE IF EXISTS fluxnode_transactions CASCADE;
-DROP TABLE IF EXISTS address_transactions CASCADE;
-DROP TABLE IF EXISTS supply_stats CASCADE;
-DROP TABLE IF EXISTS utxos_unspent CASCADE;
-DROP TABLE IF EXISTS utxos_spent CASCADE;
-DROP TABLE IF EXISTS tx_lookup CASCADE;
-DROP TABLE IF EXISTS transactions CASCADE;
-DROP TABLE IF EXISTS blocks CASCADE;
-DROP TABLE IF EXISTS addresses CASCADE;
-DROP TABLE IF EXISTS schema_migrations CASCADE;
+-- ARCHITECTURE:
+-- 1. Raw table (address_summary): Stores delta values, uses SummingMergeTree
+-- 2. Materialized view (address_summary_agg): Pre-aggregates for fast queries
+-- 3. Query the _agg table for accurate, fast results
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS address_summary (
+    address LowCardinality(String) CODEC(LZ4),
+    -- Summing columns: these accumulate across inserts
+    balance Int64 CODEC(LZ4),
+    tx_count UInt32 CODEC(LZ4),
+    received_total UInt64 CODEC(LZ4),
+    sent_total UInt64 CODEC(LZ4),
+    unspent_count UInt32 CODEC(LZ4),
+    unconfirmed_balance Int64 DEFAULT 0 CODEC(LZ4),
+    -- Non-summing columns: aggregated via min/max in the materialized view
+    first_seen UInt32 CODEC(Delta, LZ4),
+    last_activity UInt32 CODEC(Delta, LZ4),
+    -- FluxNode counts: aggregated via max in the materialized view
+    cumulus_count UInt16 DEFAULT 0,
+    nimbus_count UInt16 DEFAULT 0,
+    stratus_count UInt16 DEFAULT 0,
+    fluxnode_last_sync Nullable(DateTime) DEFAULT NULL
+) ENGINE = SummingMergeTree((balance, tx_count, received_total, sent_total, unspent_count, unconfirmed_balance))
+ORDER BY (address)
+SETTINGS index_granularity = 8192;
 
 -- ============================================================================
--- ADDRESS NORMALIZATION TABLE
+-- ADDRESS_SUMMARY_AGG - Materialized View for pre-aggregated address data
+-- This is the PRIMARY table to query for address information
+-- It automatically aggregates data from address_summary using AggregatingMergeTree
 -- ============================================================================
+CREATE TABLE IF NOT EXISTS address_summary_agg (
+    address LowCardinality(String) CODEC(LZ4),
+    -- AggregateFunction states for accurate aggregation
+    balance AggregateFunction(sum, Int64),
+    tx_count AggregateFunction(sum, UInt32),
+    received_total AggregateFunction(sum, UInt64),
+    sent_total AggregateFunction(sum, UInt64),
+    unspent_count AggregateFunction(sum, UInt32),
+    first_seen AggregateFunction(min, UInt32),
+    last_activity AggregateFunction(max, UInt32),
+    cumulus_count AggregateFunction(max, UInt16),
+    nimbus_count AggregateFunction(max, UInt16),
+    stratus_count AggregateFunction(max, UInt16),
+    fluxnode_last_sync AggregateFunction(max, Nullable(DateTime))
+) ENGINE = AggregatingMergeTree()
+ORDER BY (address)
+SETTINGS index_granularity = 8192;
 
--- Addresses lookup table for normalization
--- Reduces address storage from ~40 bytes (TEXT) to 4 bytes (INTEGER) per reference
--- Saves ~8GB across utxos_unspent, utxos_spent, and address_transactions
-CREATE TABLE addresses (
-  id SERIAL PRIMARY KEY,
-  address TEXT UNIQUE NOT NULL,
-  first_seen INTEGER,  -- block_height of first occurrence
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_addresses_address ON addresses(address);
-
--- ============================================================================
--- HYPERTABLES (Time-series optimized tables)
--- ============================================================================
-
--- Blocks table (hypertable partitioned by height)
-CREATE TABLE blocks (
-  height INTEGER NOT NULL,
-  hash TEXT NOT NULL,
-  prev_hash TEXT,
-  merkle_root TEXT,
-  timestamp INTEGER NOT NULL,
-  bits TEXT,
-  nonce TEXT,
-  version INTEGER,
-  size INTEGER,
-  tx_count INTEGER DEFAULT 0,
-  producer TEXT,
-  producer_reward BIGINT,
-  difficulty DECIMAL(20, 8),
-  chainwork TEXT,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  PRIMARY KEY (height)
-);
-
--- Convert blocks to hypertable (100k blocks per chunk)
-SELECT create_hypertable('blocks', by_range('height', 100000));
-
-CREATE INDEX idx_blocks_hash ON blocks(hash);
-CREATE INDEX idx_blocks_timestamp ON blocks(timestamp DESC);
-CREATE INDEX idx_blocks_producer ON blocks(producer) WHERE producer IS NOT NULL;
-
--- Transactions table (hypertable partitioned by block_height)
--- OPTIMIZED: Removed block_hash column (-15GB across all tables)
--- OPTIMIZED: txid stored as BYTEA (32 bytes) instead of TEXT (64 chars) - 50% savings
-CREATE TABLE transactions (
-  txid BYTEA NOT NULL,  -- PHASE 3: Changed from TEXT to BYTEA
-  block_height INTEGER NOT NULL,
-  timestamp INTEGER,
-  version INTEGER,
-  locktime BIGINT,
-  size INTEGER,
-  vsize INTEGER,
-  input_count INTEGER DEFAULT 0,
-  output_count INTEGER DEFAULT 0,
-  input_total BIGINT DEFAULT 0,
-  output_total BIGINT DEFAULT 0,
-  fee BIGINT DEFAULT 0,
-  is_coinbase BOOLEAN DEFAULT false,
-  is_fluxnode_tx BOOLEAN DEFAULT false,
-  fluxnode_type INTEGER,
-  hex TEXT,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  PRIMARY KEY (block_height, txid)
-);
-
--- Convert transactions to hypertable (100k blocks per chunk)
-SELECT create_hypertable('transactions', by_range('block_height', 100000));
-
-CREATE INDEX idx_tx_timestamp ON transactions(timestamp DESC);
-CREATE INDEX idx_tx_coinbase ON transactions(is_coinbase) WHERE is_coinbase = true;
-CREATE INDEX idx_tx_fluxnode ON transactions(is_fluxnode_tx) WHERE is_fluxnode_tx = true;
-
--- Address transactions cache (hypertable partitioned by block_height)
--- OPTIMIZED: address_id (INTEGER) instead of address (TEXT) - 90% savings per row
--- OPTIMIZED: txid stored as BYTEA (32 bytes) instead of TEXT (64 chars)
-CREATE TABLE address_transactions (
-  address_id INTEGER NOT NULL REFERENCES addresses(id),  -- PHASE 3: Normalized
-  txid BYTEA NOT NULL,  -- PHASE 3: Changed from TEXT to BYTEA
-  block_height INTEGER NOT NULL,
-  timestamp INTEGER NOT NULL,
-  direction TEXT NOT NULL CHECK (direction IN ('received', 'sent')),
-  received_value BIGINT NOT NULL DEFAULT 0,
-  sent_value BIGINT NOT NULL DEFAULT 0,
-  PRIMARY KEY (block_height, address_id, txid)
-);
-
--- Convert address_transactions to hypertable (100k blocks per chunk)
-SELECT create_hypertable('address_transactions', by_range('block_height', 100000));
-
--- Index for address lookups (via address_id)
-CREATE INDEX idx_address_tx_address_id ON address_transactions(address_id, block_height DESC, txid DESC);
-
--- FluxNode transactions (hypertable partitioned by block_height)
--- OPTIMIZED: txid stored as BYTEA
-CREATE TABLE fluxnode_transactions (
-  txid BYTEA NOT NULL,  -- PHASE 3: Changed from TEXT to BYTEA
-  block_height INTEGER NOT NULL,
-  block_time TIMESTAMPTZ NOT NULL,
-  version INTEGER NOT NULL,
-  type INTEGER NOT NULL,
-  collateral_hash TEXT,
-  collateral_index INTEGER,
-  ip_address TEXT,
-  public_key TEXT,
-  signature TEXT,
-  p2sh_address TEXT,
-  benchmark_tier TEXT,
-  extra_data JSONB,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  PRIMARY KEY (block_height, txid)
-);
-
--- Convert fluxnode_transactions to hypertable (100k blocks per chunk)
-SELECT create_hypertable('fluxnode_transactions', by_range('block_height', 100000));
-
-CREATE INDEX idx_fluxnode_tx_txid ON fluxnode_transactions(txid);
-CREATE INDEX idx_fluxnode_tx_type ON fluxnode_transactions(type);
-CREATE INDEX idx_fluxnode_tx_collateral ON fluxnode_transactions(collateral_hash, collateral_index) WHERE collateral_hash IS NOT NULL;
-CREATE INDEX idx_fluxnode_tx_pubkey ON fluxnode_transactions(public_key) WHERE public_key IS NOT NULL;
-CREATE INDEX idx_fluxnode_tx_ip ON fluxnode_transactions(ip_address) WHERE ip_address IS NOT NULL;
-CREATE INDEX idx_fluxnode_tx_p2sh ON fluxnode_transactions(p2sh_address) WHERE p2sh_address IS NOT NULL;
-
--- Supply statistics (hypertable partitioned by block_height)
-CREATE TABLE supply_stats (
-  block_height INTEGER NOT NULL,
-  transparent_supply BIGINT NOT NULL DEFAULT 0,
-  shielded_pool BIGINT NOT NULL DEFAULT 0,
-  total_supply BIGINT NOT NULL DEFAULT 0,
-  updated_at TIMESTAMPTZ DEFAULT NOW(),
-  PRIMARY KEY (block_height)
-);
-
--- Convert supply_stats to hypertable (100k blocks per chunk)
-SELECT create_hypertable('supply_stats', by_range('block_height', 100000));
-
--- ============================================================================
--- SPLIT UTXO TABLES (Optimized for storage and query performance)
--- ============================================================================
-
--- Unspent UTXOs - Small hot table (~2M rows) for fast balance queries
--- OPTIMIZED: address_id (INTEGER) instead of address (TEXT)
--- OPTIMIZED: txid stored as BYTEA (32 bytes)
-CREATE TABLE utxos_unspent (
-  txid BYTEA NOT NULL,  -- PHASE 3: Changed from TEXT to BYTEA
-  vout INTEGER NOT NULL,
-  address_id INTEGER NOT NULL REFERENCES addresses(id),  -- PHASE 3: Normalized
-  value BIGINT NOT NULL,
-  script_pubkey TEXT,
-  script_type TEXT,
-  block_height INTEGER NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  PRIMARY KEY (txid, vout)
-);
-
-CREATE INDEX idx_utxos_unspent_address_id ON utxos_unspent(address_id);
-CREATE INDEX idx_utxos_unspent_block_height ON utxos_unspent(block_height);
-CREATE INDEX idx_utxos_unspent_value ON utxos_unspent(value DESC);
--- Expression index for TEXT-based txid lookups (used by utxos VIEW queries)
--- Critical for performance: enables index scans instead of seq scans when
--- queries use encode(txid, 'hex') pattern through the utxos VIEW
-CREATE INDEX idx_utxos_unspent_txid_hex ON utxos_unspent (encode(txid, 'hex'), vout);
-
--- Spent UTXOs - Large cold table (~100M rows) with TimescaleDB compression
--- OPTIMIZED: address_id (INTEGER) instead of address (TEXT)
--- OPTIMIZED: txid and spent_txid stored as BYTEA
-CREATE TABLE utxos_spent (
-  txid BYTEA NOT NULL,  -- PHASE 3: Changed from TEXT to BYTEA
-  vout INTEGER NOT NULL,
-  address_id INTEGER NOT NULL REFERENCES addresses(id),  -- PHASE 3: Normalized
-  value BIGINT NOT NULL,
-  script_pubkey TEXT,
-  script_type TEXT,
-  block_height INTEGER NOT NULL,  -- When UTXO was created
-  spent_txid BYTEA NOT NULL,  -- PHASE 3: Changed from TEXT to BYTEA
-  spent_block_height INTEGER NOT NULL,  -- When UTXO was spent (partition key)
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  spent_at TIMESTAMPTZ DEFAULT NOW(),
-  PRIMARY KEY (spent_block_height, txid, vout)  -- Include partition key in PK
-);
-
--- Convert to hypertable partitioned by spent_block_height (100k blocks per chunk)
-SELECT create_hypertable('utxos_spent', by_range('spent_block_height', 100000));
-
-CREATE INDEX idx_utxos_spent_address_id ON utxos_spent(address_id, spent_block_height DESC);
-CREATE INDEX idx_utxos_spent_txid ON utxos_spent(txid);
-CREATE INDEX idx_utxos_spent_spent_txid ON utxos_spent(spent_txid);
-CREATE INDEX idx_utxos_spent_block_height ON utxos_spent(block_height);
--- Expression index for TEXT-based txid lookups (used by utxos VIEW queries)
--- Critical for performance: enables index scans instead of seq scans when
--- queries use encode(txid, 'hex') pattern through the utxos VIEW
-CREATE INDEX idx_utxos_spent_txid_hex ON utxos_spent (encode(txid, 'hex'), vout);
-
--- View to unify both tables with address string (for backward compatibility)
--- JOINs to addresses table to return address TEXT
--- Encodes BYTEA txid/spent_txid to hex TEXT for API compatibility
-CREATE OR REPLACE VIEW utxos AS
+-- Materialized view that populates address_summary_agg from address_summary inserts
+CREATE MATERIALIZED VIEW IF NOT EXISTS address_summary_mv TO address_summary_agg AS
 SELECT
-  encode(u.txid, 'hex') AS txid,
-  u.vout,
-  a.address,
-  u.value,
-  u.script_pubkey,
-  u.script_type,
-  u.block_height,
-  false AS spent,
-  NULL::TEXT AS spent_txid,
-  NULL::INTEGER AS spent_block_height,
-  u.created_at,
-  NULL::TIMESTAMPTZ AS spent_at
-FROM utxos_unspent u
-JOIN addresses a ON u.address_id = a.id
-UNION ALL
+    address,
+    sumState(balance) AS balance,
+    sumState(tx_count) AS tx_count,
+    sumState(received_total) AS received_total,
+    sumState(sent_total) AS sent_total,
+    sumState(unspent_count) AS unspent_count,
+    minState(first_seen) AS first_seen,
+    maxState(last_activity) AS last_activity,
+    maxState(cumulus_count) AS cumulus_count,
+    maxState(nimbus_count) AS nimbus_count,
+    maxState(stratus_count) AS stratus_count,
+    maxState(fluxnode_last_sync) AS fluxnode_last_sync
+FROM address_summary
+GROUP BY address;
+
+-- Note: Projections with aggregation functions cannot have ORDER BY in ClickHouse.
+-- Rich list queries will use ORDER BY in the query itself, which is efficient
+-- since the _agg table is already grouped by address.
+
+
+-- ============================================================================
+-- SUPPLY_STATS TABLE
+-- Primary access: latest record, historical range queries
+-- Using ReplacingMergeTree to deduplicate on re-indexing
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS supply_stats (
+    block_height UInt32 CODEC(Delta(4), ZSTD(3)),
+    timestamp UInt32 CODEC(Delta(4), ZSTD(3)),         -- Block timestamp for accurate date grouping
+    transparent_supply Int64 CODEC(Delta(8), ZSTD(3)),
+    shielded_pool Int64 CODEC(Delta(8), ZSTD(3)),
+    total_supply Int64 CODEC(Delta(8), ZSTD(3)),
+    _version UInt64 DEFAULT toUnixTimestamp64Milli(now64()) CODEC(Delta(8), ZSTD(3))  -- For deduplication
+) ENGINE = ReplacingMergeTree(_version)
+ORDER BY (block_height)
+PARTITION BY intDiv(block_height, 100000)
+SETTINGS index_granularity = 8192;
+
+
+-- ============================================================================
+-- FLUXNODE_TRANSACTIONS TABLE
+-- Primary access: by block_height, by IP, by tier
+-- Using ReplacingMergeTree to deduplicate on re-indexing
+-- TTL: Data older than 7 days auto-recompresses to ZSTD(9) for better storage
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS fluxnode_transactions (
+    block_height UInt32 CODEC(Delta(4), ZSTD(3)),
+    txid FixedString(64) CODEC(ZSTD(3)),
+    block_time DateTime CODEC(Delta(4), ZSTD(3)),
+    version UInt32 CODEC(ZSTD(3)),
+    type UInt8,
+    collateral_hash String DEFAULT '' CODEC(ZSTD(3)),
+    collateral_index UInt16 DEFAULT 0 CODEC(ZSTD(3)),
+    ip_address String DEFAULT '' CODEC(ZSTD(3)),
+    public_key String DEFAULT '' CODEC(ZSTD(3)),
+    signature String DEFAULT '' CODEC(ZSTD(3)),
+    p2sh_address LowCardinality(String) DEFAULT '' CODEC(ZSTD(3)),
+    benchmark_tier LowCardinality(String) DEFAULT '' CODEC(ZSTD(3)),
+    extra_data String DEFAULT '' CODEC(ZSTD(3)),
+    is_valid UInt8 DEFAULT 1,                         -- For reorg handling (soft delete)
+    _version UInt64 DEFAULT toUnixTimestamp64Milli(now64()) CODEC(Delta(8), ZSTD(3))  -- For deduplication
+) ENGINE = ReplacingMergeTree(_version)
+ORDER BY (txid)
+PARTITION BY intDiv(block_height, 100000)
+TTL block_time + INTERVAL 7 DAY RECOMPRESS CODEC(ZSTD(9))
+SETTINGS index_granularity = 8192;
+
+-- Projection for IP lookups - ONLY includes columns needed by getFluxNodeStatus API
+-- Excludes signature (~200 bytes) and extra_data to save ~14GB vs SELECT *
+ALTER TABLE fluxnode_transactions ADD PROJECTION IF NOT EXISTS proj_by_ip (
+    SELECT
+        txid, block_height, block_time, type, ip_address,
+        public_key, benchmark_tier, p2sh_address,
+        collateral_hash, collateral_index, is_valid, _version
+    ORDER BY ip_address, block_height
+);
+
+-- Projection for tier analysis (already optimized - only needed columns)
+ALTER TABLE fluxnode_transactions ADD PROJECTION IF NOT EXISTS proj_by_tier (
+    SELECT benchmark_tier, block_height, txid, ip_address, type
+    ORDER BY benchmark_tier, block_height
+);
+
+ALTER TABLE fluxnode_transactions ADD INDEX IF NOT EXISTS idx_type (type) TYPE set(8) GRANULARITY 1;
+ALTER TABLE fluxnode_transactions ADD INDEX IF NOT EXISTS idx_tier (benchmark_tier) TYPE set(8) GRANULARITY 1;
+ALTER TABLE fluxnode_transactions ADD INDEX IF NOT EXISTS idx_ip (ip_address) TYPE bloom_filter(0.01) GRANULARITY 4;
+
+
+-- ============================================================================
+-- LIVE_FLUXNODES TABLE
+-- Current FluxNode counts per payment address (synced from daemon)
+-- Using ReplacingMergeTree: each sync replaces all data for an address
+-- This is SEPARATE from address_summary to avoid SummingMergeTree zero-row deletion
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS live_fluxnodes (
+    address LowCardinality(String) CODEC(LZ4),
+    cumulus_count UInt16 DEFAULT 0,
+    nimbus_count UInt16 DEFAULT 0,
+    stratus_count UInt16 DEFAULT 0,
+    total_collateral UInt64 DEFAULT 0 CODEC(LZ4),  -- Total FLUX locked (1000*cumulus + 12500*nimbus + 40000*stratus)
+    last_sync DateTime DEFAULT now() CODEC(Delta, LZ4),
+    _version UInt64 DEFAULT toUnixTimestamp64Milli(now64()) CODEC(Delta, LZ4)
+) ENGINE = ReplacingMergeTree(_version)
+ORDER BY (address)
+SETTINGS index_granularity = 8192;
+
+-- Projection for rich list queries (by total collateral)
+ALTER TABLE live_fluxnodes ADD PROJECTION IF NOT EXISTS proj_by_collateral (
+    SELECT address, cumulus_count, nimbus_count, stratus_count, total_collateral
+    ORDER BY total_collateral
+);
+
+
+-- ============================================================================
+-- PRODUCERS TABLE (PoN Block Producers)
+-- Primary access: by blocks_produced (leaderboard), by fluxnode (lookup)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS producers (
+    fluxnode LowCardinality(String) CODEC(LZ4),
+    blocks_produced UInt32 CODEC(LZ4),
+    first_block UInt32 CODEC(Delta, LZ4),
+    last_block UInt32 CODEC(Delta, LZ4),
+    total_rewards UInt64 CODEC(LZ4),
+    avg_block_time Float32 CODEC(Gorilla),
+    updated_at DateTime DEFAULT now() CODEC(Delta, LZ4)
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (fluxnode)
+SETTINGS index_granularity = 8192;
+
+-- Projection for producer leaderboard
+ALTER TABLE producers ADD PROJECTION IF NOT EXISTS proj_leaderboard (
+    SELECT fluxnode, blocks_produced, total_rewards, last_block
+    ORDER BY blocks_produced
+);
+
+
+-- ============================================================================
+-- SYNC_STATE TABLE (Single row tracking sync progress)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS sync_state (
+    id UInt8 DEFAULT 1,
+    current_height Int32,
+    chain_height UInt32,
+    sync_percentage Float32,
+    last_block_hash FixedString(64),
+    last_sync_time DateTime,
+    is_syncing UInt8 DEFAULT 0,
+    blocks_per_second Float32 CODEC(Gorilla),
+    updated_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (id)
+SETTINGS index_granularity = 1;
+
+-- Initialize sync state
+INSERT INTO sync_state (id, current_height, chain_height, sync_percentage, last_block_hash, is_syncing)
+VALUES (1, -1, 0, 0, '0000000000000000000000000000000000000000000000000000000000000000', 0);
+
+
+-- ============================================================================
+-- REORGS TABLE (Audit log for chain reorganizations)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS reorgs (
+    id UInt64 CODEC(Delta, LZ4),
+    from_height UInt32,
+    to_height UInt32,
+    common_ancestor UInt32,
+    old_hash FixedString(64),
+    new_hash FixedString(64),
+    blocks_affected UInt16,
+    occurred_at DateTime DEFAULT now() CODEC(Delta, LZ4)
+) ENGINE = MergeTree()
+ORDER BY (occurred_at, id)
+SETTINGS index_granularity = 8192;
+
+
+-- ============================================================================
+-- MATERIALIZED VIEW: Real-time transaction count per hour (for charts)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS mv_hourly_tx_count (
+    hour DateTime CODEC(Delta, LZ4),
+    tx_count UInt64,
+    block_count UInt64
+) ENGINE = SummingMergeTree()
+ORDER BY (hour)
+SETTINGS index_granularity = 256;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_hourly_tx_count_view TO mv_hourly_tx_count AS
 SELECT
-  encode(s.txid, 'hex') AS txid,
-  s.vout,
-  a.address,
-  s.value,
-  s.script_pubkey,
-  s.script_type,
-  s.block_height,
-  true AS spent,
-  encode(s.spent_txid, 'hex') AS spent_txid,
-  s.spent_block_height,
-  s.created_at,
-  s.spent_at
-FROM utxos_spent s
-JOIN addresses a ON s.address_id = a.id;
+    toStartOfHour(toDateTime(timestamp)) AS hour,
+    count() AS tx_count,
+    1 AS block_count
+FROM transactions
+GROUP BY hour;
 
--- Transaction lookup table for fast txid -> block_height resolution
--- Already uses BYTEA from previous optimization
-CREATE TABLE tx_lookup (
-  txid BYTEA PRIMARY KEY,
-  block_height INTEGER NOT NULL
-);
-
-CREATE INDEX idx_tx_lookup_block_height ON tx_lookup(block_height);
-
--- Helper function to convert txid hex string to bytea for lookups
-CREATE OR REPLACE FUNCTION txid_to_bytes(txid_hex TEXT) RETURNS BYTEA AS $$
-BEGIN
-  RETURN decode(txid_hex, 'hex');
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
-
--- Helper function to convert bytea txid to hex string
-CREATE OR REPLACE FUNCTION txid_to_hex(txid_bytes BYTEA) RETURNS TEXT AS $$
-BEGIN
-  RETURN encode(txid_bytes, 'hex');
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
-
--- Helper function to get address_id, creating if not exists
-CREATE OR REPLACE FUNCTION get_or_create_address_id(addr TEXT) RETURNS INTEGER AS $$
-DECLARE
-  addr_id INTEGER;
-BEGIN
-  -- Try to get existing
-  SELECT id INTO addr_id FROM addresses WHERE address = addr;
-  IF addr_id IS NOT NULL THEN
-    RETURN addr_id;
-  END IF;
-
-  -- Insert new address
-  INSERT INTO addresses (address)
-  VALUES (addr)
-  ON CONFLICT (address) DO UPDATE SET address = EXCLUDED.address
-  RETURNING id INTO addr_id;
-
-  RETURN addr_id;
-END;
-$$ LANGUAGE plpgsql;
-
--- Address summary (for quick balance lookups) - Regular table, keyed by address
--- KEPT AS TEXT: Small table (~3M rows), direct lookups by address string
-CREATE TABLE address_summary (
-  address TEXT PRIMARY KEY,
-  balance BIGINT NOT NULL DEFAULT 0,
-  tx_count INTEGER NOT NULL DEFAULT 0,
-  received_total BIGINT NOT NULL DEFAULT 0,
-  sent_total BIGINT NOT NULL DEFAULT 0,
-  unspent_count INTEGER NOT NULL DEFAULT 0,
-  unconfirmed_balance BIGINT NOT NULL DEFAULT 0,
-  first_seen INTEGER,
-  last_activity INTEGER,
-  cumulus_count INTEGER NOT NULL DEFAULT 0,
-  nimbus_count INTEGER NOT NULL DEFAULT 0,
-  stratus_count INTEGER NOT NULL DEFAULT 0,
-  fluxnode_last_sync TIMESTAMPTZ,
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_address_balance ON address_summary(balance DESC);
-CREATE INDEX idx_address_activity ON address_summary(last_activity DESC);
-CREATE INDEX idx_address_tx_count ON address_summary(tx_count DESC);
-CREATE INDEX idx_address_fluxnodes ON address_summary((cumulus_count + nimbus_count + stratus_count) DESC)
-  WHERE (cumulus_count + nimbus_count + stratus_count) > 0;
-
--- FluxNode producers (PoN specific) - Regular table
-CREATE TABLE producers (
-  fluxnode TEXT PRIMARY KEY,
-  blocks_produced INTEGER DEFAULT 0,
-  first_block INTEGER,
-  last_block INTEGER,
-  total_rewards BIGINT DEFAULT 0,
-  avg_block_time DECIMAL(10, 2),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_producer_blocks ON producers(blocks_produced DESC);
-CREATE INDEX idx_producer_last_block ON producers(last_block DESC);
-
--- Sync state (single row table tracking indexer progress)
-CREATE TABLE sync_state (
-  id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-  current_height INTEGER NOT NULL DEFAULT 0,
-  chain_height INTEGER NOT NULL DEFAULT 0,
-  sync_percentage DECIMAL(5,2) DEFAULT 0,
-  last_block_hash TEXT,
-  last_sync_time TIMESTAMPTZ,
-  is_syncing BOOLEAN DEFAULT false,
-  sync_start_time TIMESTAMPTZ,
-  blocks_per_second DECIMAL(10, 2),
-  estimated_completion TIMESTAMPTZ
-);
-
--- Initialize sync state (start from -1 so first sync fetches block 0)
-INSERT INTO sync_state (id, current_height, chain_height) VALUES (1, -1, 0)
-ON CONFLICT (id) DO NOTHING;
-
--- Reorg history (track chain reorganizations) - Regular table
-CREATE TABLE reorgs (
-  id SERIAL PRIMARY KEY,
-  from_height INTEGER NOT NULL,
-  to_height INTEGER NOT NULL,
-  common_ancestor INTEGER NOT NULL,
-  old_hash TEXT,
-  new_hash TEXT,
-  blocks_affected INTEGER,
-  occurred_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_reorg_occurred_at ON reorgs(occurred_at DESC);
-
--- Schema migrations tracking (matches migrate.ts format)
-CREATE TABLE schema_migrations (
-  name TEXT PRIMARY KEY,
-  applied_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Mark all migrations as applied since this schema already includes everything
-INSERT INTO schema_migrations (name) VALUES
-  ('001_incremental_address_summaries'),
-  ('002_statement_level_triggers'),
-  ('002_fix_bigint_overflow_in_batch_triggers'),
-  ('003_fluxnode_transactions'),
-  ('006_block_transaction_indexes'),
-  ('007_address_transactions_cache'),
-  ('008_rebuild_address_transactions_cache'),
-  ('009_utxos_txid_index'),
-  ('011_fully_shielded_transactions'),
-  ('012_performance_indexes'),
-  ('013_cursor_pagination_indexes'),
-  ('014_address_transactions_tx_count_trigger'),
-  ('015_add_fluxnode_counts'),
-  ('016_phase3_address_normalization'),
-  ('017_phase3_txid_bytea')
-ON CONFLICT (name) DO NOTHING;
 
 -- ============================================================================
--- COMPRESSION POLICIES (Auto-compress old data)
+-- MATERIALIZED VIEW: Daily supply history (for supply charts)
+-- Uses actual block timestamps for accurate date grouping
 -- ============================================================================
+CREATE TABLE IF NOT EXISTS mv_daily_supply (
+    day Date CODEC(Delta, LZ4),
+    max_height UInt32,
+    transparent_supply Int64,
+    shielded_pool Int64,
+    total_supply Int64
+) ENGINE = ReplacingMergeTree(max_height)
+ORDER BY (day)
+SETTINGS index_granularity = 256;
 
--- Enable compression on hypertables
-ALTER TABLE blocks SET (
-  timescaledb.compress,
-  timescaledb.compress_orderby = 'height DESC'
-);
-
-ALTER TABLE transactions SET (
-  timescaledb.compress,
-  timescaledb.compress_orderby = 'block_height DESC, txid'
-);
-
--- PHASE 3: Segment by address_id instead of address
-ALTER TABLE address_transactions SET (
-  timescaledb.compress,
-  timescaledb.compress_segmentby = 'address_id',
-  timescaledb.compress_orderby = 'block_height DESC, txid'
-);
-
-ALTER TABLE fluxnode_transactions SET (
-  timescaledb.compress,
-  timescaledb.compress_segmentby = 'type, benchmark_tier',
-  timescaledb.compress_orderby = 'block_height DESC, txid'
-);
-
-ALTER TABLE supply_stats SET (
-  timescaledb.compress,
-  timescaledb.compress_orderby = 'block_height DESC'
-);
-
--- PHASE 3: Segment by address_id instead of address
-ALTER TABLE utxos_spent SET (
-  timescaledb.compress,
-  timescaledb.compress_segmentby = 'address_id',
-  timescaledb.compress_orderby = 'spent_block_height DESC, txid'
-);
-
--- Create integer_now function for compression policies
--- TimescaleDB requires this for integer-based partitioning to determine "current" value
--- (equivalent to now() for timestamp-based partitioning)
-CREATE OR REPLACE FUNCTION current_block_height() RETURNS INTEGER
-LANGUAGE SQL STABLE SET search_path = public
-AS $$ SELECT COALESCE(MAX(height), 0)::INTEGER FROM blocks; $$;
-
--- Register integer_now function for all hypertables
-SELECT set_integer_now_func('blocks', 'current_block_height');
-SELECT set_integer_now_func('transactions', 'current_block_height');
-SELECT set_integer_now_func('address_transactions', 'current_block_height');
-SELECT set_integer_now_func('fluxnode_transactions', 'current_block_height');
-SELECT set_integer_now_func('supply_stats', 'current_block_height');
-SELECT set_integer_now_func('utxos_spent', 'current_block_height');
-
--- Add compression policies (compress chunks older than 100k blocks from current tip)
-SELECT add_compression_policy('blocks', compress_after => 100000::integer);
-SELECT add_compression_policy('transactions', compress_after => 100000::integer);
-SELECT add_compression_policy('address_transactions', compress_after => 100000::integer);
-SELECT add_compression_policy('fluxnode_transactions', compress_after => 100000::integer);
-SELECT add_compression_policy('supply_stats', compress_after => 100000::integer);
--- NOTE: utxos_spent compression is DISABLED because:
--- 1. Expression indexes like encode(txid, 'hex') don't work efficiently on compressed chunks
--- 2. During sync, UTXOs are queried by txid through the utxos VIEW which uses encode()
--- 3. Compressed chunks require full decompression + seq scan, taking minutes per query
--- 4. This breaks sync performance completely
--- To enable compression after sync completes (for archival), manually run:
---   SELECT add_compression_policy('utxos_spent', compress_after => 100000::integer);
--- SELECT add_compression_policy('utxos_spent', compress_after => 100000::integer);
-
--- ============================================================================
--- HELPER FUNCTIONS
--- ============================================================================
-
--- Helper function to calculate address balance from UTXOs
--- PHASE 3: Uses address_id lookup
-CREATE OR REPLACE FUNCTION calculate_address_balance(addr TEXT)
-RETURNS BIGINT AS $$
-DECLARE
-  addr_id INTEGER;
-BEGIN
-  -- Get address_id
-  SELECT id INTO addr_id FROM addresses WHERE address = addr;
-  IF addr_id IS NULL THEN
-    RETURN 0;
-  END IF;
-
-  RETURN COALESCE(
-    (SELECT SUM(value) FROM utxos_unspent WHERE address_id = addr_id),
-    0
-  );
-END;
-$$ LANGUAGE plpgsql;
-
--- Helper function to update address summary
--- PHASE 3: Uses utxos VIEW which handles JOINs internally
-CREATE OR REPLACE FUNCTION update_address_summary(addr TEXT)
-RETURNS VOID AS $$
-DECLARE
-  summary_data RECORD;
-  actual_tx_count BIGINT;
-  addr_id INTEGER;
-BEGIN
-  -- Get address_id
-  SELECT id INTO addr_id FROM addresses WHERE address = addr;
-  IF addr_id IS NULL THEN
-    RETURN;
-  END IF;
-
-  -- Calculate UTXO-based statistics using the VIEW
-  SELECT
-    COALESCE(SUM(CASE WHEN spent = false THEN value ELSE 0 END), 0) as balance,
-    COALESCE(SUM(value), 0) as received,
-    COALESCE(SUM(CASE WHEN spent = true THEN value ELSE 0 END), 0) as sent,
-    COUNT(CASE WHEN spent = false THEN 1 END) as unspent_count,
-    MIN(block_height) as first_seen,
-    MAX(GREATEST(block_height, COALESCE(spent_block_height, 0))) as last_activity
-  INTO summary_data
-  FROM utxos
-  WHERE address = addr;
-
-  -- Get actual transaction count from address_transactions
-  SELECT COUNT(*)
-  INTO actual_tx_count
-  FROM address_transactions
-  WHERE address_id = addr_id;
-
-  -- Upsert address summary
-  INSERT INTO address_summary (
-    address, balance, tx_count, received_total, sent_total,
-    unspent_count, first_seen, last_activity, updated_at
-  ) VALUES (
-    addr,
-    summary_data.balance,
-    actual_tx_count,
-    summary_data.received,
-    summary_data.sent,
-    summary_data.unspent_count,
-    summary_data.first_seen,
-    summary_data.last_activity,
-    NOW()
-  )
-  ON CONFLICT (address) DO UPDATE SET
-    balance = EXCLUDED.balance,
-    tx_count = EXCLUDED.tx_count,
-    received_total = EXCLUDED.received_total,
-    sent_total = EXCLUDED.sent_total,
-    unspent_count = EXCLUDED.unspent_count,
-    first_seen = EXCLUDED.first_seen,
-    last_activity = EXCLUDED.last_activity,
-    updated_at = NOW();
-END;
-$$ LANGUAGE plpgsql;
-
--- ============================================================================
--- COMMENTS
--- ============================================================================
-
-COMMENT ON TABLE addresses IS 'Address normalization table - maps address strings to integer IDs (Phase 3 optimization)';
-COMMENT ON TABLE blocks IS 'Indexed blockchain blocks (TimescaleDB hypertable)';
-COMMENT ON TABLE transactions IS 'All blockchain transactions with BYTEA txid (TimescaleDB hypertable)';
-COMMENT ON TABLE address_transactions IS 'Address transaction history with normalized address_id and BYTEA txid (TimescaleDB hypertable)';
-COMMENT ON TABLE fluxnode_transactions IS 'FluxNode-related transactions with BYTEA txid (TimescaleDB hypertable)';
-COMMENT ON TABLE supply_stats IS 'Per-block supply statistics (TimescaleDB hypertable)';
-COMMENT ON TABLE utxos_unspent IS 'Unspent UTXOs with normalized address_id and BYTEA txid';
-COMMENT ON TABLE utxos_spent IS 'Spent UTXOs with normalized address_id and BYTEA txid/spent_txid (TimescaleDB hypertable)';
-COMMENT ON VIEW utxos IS 'Unified view of unspent and spent UTXOs with address strings and hex txids';
-COMMENT ON TABLE address_summary IS 'Cached address balances and statistics (TEXT address for direct lookups)';
-COMMENT ON TABLE producers IS 'FluxNode block producers (PoN consensus)';
-COMMENT ON TABLE sync_state IS 'Indexer synchronization state';
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_daily_supply_view TO mv_daily_supply AS
+SELECT
+    toDate(toDateTime(timestamp)) AS day,  -- Use actual block timestamp
+    block_height AS max_height,
+    transparent_supply,
+    shielded_pool,
+    total_supply
+FROM supply_stats;

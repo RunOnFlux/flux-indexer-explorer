@@ -28,9 +28,12 @@ Thumbs.db
 *.zip
 backup.sh
 
-# Markdown files (except README.md and FLUX_TRANSACTION_SPECIFICATION.md)
+# Markdown files (exclude internal/development docs)
 *.md
+# Whitelist public documentation
 !README.md
+!DEPLOYMENT.md
+!CHANGELOG.md
 !FLUX_TRANSACTION_SPECIFICATION.md
 
 # Keep important config

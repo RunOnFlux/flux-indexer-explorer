@@ -1,87 +1,47 @@
 # FluxIndexer
 
-A custom blockchain indexer built specifically for **Flux v9.0.0+** with **Proof of Node (PoN)** consensus.
+Blockchain indexer for Flux v9.0.0+ with Proof of Node (PoN) consensus, backed by ClickHouse.
 
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.3-blue)](https://www.typescriptlang.org/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-blue)](https://www.postgresql.org/)
+[![ClickHouse](https://img.shields.io/badge/ClickHouse-24.x-yellow)](https://clickhouse.com/)
 [![Node.js](https://img.shields.io/badge/Node.js-20-green)](https://nodejs.org/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-blue)](https://www.docker.com/)
 
-## Why FluxIndexer?
+## Overview
 
-Flux v9.0.0 introduces a **hard fork** with major changes:
-- ️ **PoW mining discontinued** →  **PoN (Proof of Node)** consensus
-- ⏱️ **30-second block times** (was 2 minutes)
-- ️ **FluxNodes produce blocks** instead of miners
+FluxIndexer tracks Flux blockchain data optimized for the PoN hard fork introduced in v9.0.0:
 
-**Traditional indexers like FluxIndexer:**
-- Built for PoW chains
-- Pending PR for v9.0.0 support
-- Lack PoN-specific features (FluxNode producer tracking)
+- 30-second block times (previously 2 minutes)
+- FluxNodes produce blocks instead of miners
+- FluxNode START/CONFIRM transaction parsing
+- Block producer tracking and statistics
 
-**FluxIndexer is:**
--  Built specifically for PoN Flux
--  Tracks FluxNode block producers
--  Optimized for 30-second blocks
--  FluxIndexer-compatible API
--  No external dependencies
-
----
-
-## Features
-
-### Core Blockchain Indexing
--  Full block indexing with transaction details
--  UTXO tracking (unspent transaction outputs)
--  Address balance calculations
--  Transaction history
--  Mempool monitoring
--  Reorg handling (up to 100 blocks deep)
-
-### PoN-Specific Features
--  **FluxNode producer tracking** - Which node produced which block
--  **Producer statistics** - Blocks produced, rewards earned, performance
--  **Producer leaderboard** - Top block producers
--  **Block production analytics** - Time between blocks, distribution
-
-### API
--  **FluxIndexer-compatible** REST API
--  Block queries (by height or hash)
--  Transaction lookups
--  Address balance and history
--  UTXO queries
--  FluxNode producer endpoints
--  Sync status and health checks
+The ClickHouse backend provides significant storage savings (~61GB vs ~260GB with PostgreSQL) and fast query performance.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    FluxIndexer Stack                     │
-│                                                          │
-│  ┌──────────────┐      ┌──────────────┐      ┌────────┐ │
-│  │  Flux Daemon │──────▶│ FluxIndexer  │──────▶│  REST  │ │
-│  │   v9.0.0+    │  RPC │   Service    │  API  │  API   │ │
-│  │   (PoN)      │      │              │       │        │ │
-│  └──────────────┘      └──────┬───────┘      └────────┘ │
-│                               │                          │
-│                               ▼                          │
-│                       ┌──────────────┐                   │
-│                       │  PostgreSQL  │                   │
-│                       │   Database   │                   │
-│                       └──────────────┘                   │
-└─────────────────────────────────────────────────────────┘
+┌──────────────┐      ┌──────────────┐      ┌────────────┐
+│  Flux Daemon │──────│ FluxIndexer  │──────│  REST API  │
+│   v9.0.0+    │  RPC │              │      │  :42067    │
+└──────────────┘      └──────┬───────┘      └────────────┘
+                             │
+                             ▼
+                      ┌──────────────┐
+                      │  ClickHouse  │
+                      │    :8123     │
+                      └──────────────┘
 ```
 
 ### Components
 
-1. **Flux RPC Client** - Communicates with Flux daemon v9.0.0+
-2. **Sync Engine** - Indexes blocks continuously, handles reorgs
-3. **Block Indexer** - Parses blocks, transactions, UTXOs
-4. **Database Layer** - PostgreSQL with optimized indexes
-5. **API Server** - FluxIndexer-compatible REST API
+1. **Flux RPC Client** - Communicates with Flux daemon
+2. **Sync Engine** - Continuous block indexing with reorg handling
+3. **Block Indexer** - Parses blocks, transactions, and UTXOs
+4. **Bulk Loader** - High-throughput inserts with UTXO caching
+5. **API Server** - REST API endpoints
 
 ---
 
@@ -90,71 +50,32 @@ Flux v9.0.0 introduces a **hard fork** with major changes:
 ### Prerequisites
 
 - Node.js 20+
-- PostgreSQL 15+
-- Flux daemon v9.0.0+ running with RPC enabled
+- Docker & Docker Compose v2
+- Flux daemon v9.0.0+ with RPC enabled
 
-### Installation
-
-```bash
-# Clone repository
-cd flux-indexer
-
-# Install dependencies
-npm install
-
-# Configure environment
-cp .env.example .env
-# Edit .env with your settings
-
-# Run database migrations
-npm run db:migrate
-
-# Start development server
-npm run dev
-```
-
-### Docker Quick Start
+### Docker (Recommended)
 
 ```bash
-# Copy environment file
-cp .env.example .env
-
-# Edit .env with your Flux RPC credentials
-# FLUX_RPC_URL=http://your-flux-daemon:16124
-# FLUX_RPC_USER=your_rpc_user
-# FLUX_RPC_PASSWORD=your_rpc_password
-
-# Start with docker-compose
-docker-compose up -d
+# From repository root
+docker compose -f docker-compose.production.yml up -d
 
 # View logs
-docker-compose logs -f indexer
+docker compose -f docker-compose.production.yml logs -f indexer
 
-# Check health
+# Health check
 curl http://127.0.0.1:42067/health
 ```
 
-#### Zcash Parameters
-
-FluxIndexer automatically downloads Zcash cryptographic parameters (~900MB) on first run:
-- `sapling-spend.params` (~46 MB)
-- `sapling-output.params` (~3.4 MB)
-- `sprout-groth16.params` (~692 MB)
-
-**Parameters are persisted** in a Docker volume and only downloaded once.
-
-**Optional: Use existing params** (if you already have them from FluxIndexer or other Zcash software):
+### Local Development
 
 ```bash
-# Copy the example override file
-cp docker-compose.override.yml.example docker-compose.override.yml
-
-# Edit to point to your local params directory
-# Then start normally
-docker-compose up -d
+cd flux-indexer
+npm install
+cp .env.example .env
+# Edit .env with your settings
+npm run build
+npm start
 ```
-
-This avoids re-downloading the parameters.
 
 ---
 
@@ -162,290 +83,112 @@ This avoids re-downloading the parameters.
 
 ### Environment Variables
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
+| Variable | Default | Description |
+|----------|---------|-------------|
 | **Flux RPC** |
-| `FLUX_RPC_URL` | Yes | `http://127.0.0.1:16124` | Flux daemon RPC endpoint |
-| `FLUX_RPC_USER` | No | - | RPC username (if auth enabled) |
-| `FLUX_RPC_PASSWORD` | No | - | RPC password (if auth enabled) |
-| **Database** |
-| `DB_HOST` | Yes | `127.0.0.1` | PostgreSQL host |
-| `DB_PORT` | No | `5432` | PostgreSQL port |
-| `DB_NAME` | Yes | `fluxindexer` | Database name |
-| `DB_USER` | Yes | `flux` | Database user |
-| `DB_PASSWORD` | Yes | - | Database password |
+| `FLUX_RPC_URL` | `http://127.0.0.1:16124` | Flux daemon RPC endpoint |
+| `FLUX_RPC_USER` | - | RPC username |
+| `FLUX_RPC_PASSWORD` | - | RPC password |
+| **ClickHouse** |
+| `CH_HOST` | `127.0.0.1` | ClickHouse host |
+| `CH_HTTP_PORT` | `8123` | ClickHouse HTTP port |
+| `CH_DATABASE` | `flux` | Database name |
+| `CH_USER` | `default` | ClickHouse username |
+| `CH_PASSWORD` | - | ClickHouse password |
 | **Indexer** |
-| `INDEXER_BATCH_SIZE` | No | `100` | Blocks to index per batch |
-| `INDEXER_POLLING_INTERVAL` | No | `5000` | Polling interval (ms) |
-| `INDEXER_START_HEIGHT` | No | - | Start indexing from height |
-| `INDEXER_MAX_REORG_DEPTH` | No | `100` | Max reorg depth to handle |
+| `INDEXER_BATCH_SIZE` | `1000` | Blocks per batch |
+| `INDEXER_POLLING_INTERVAL` | `5000` | Polling interval (ms) |
+| `INDEXER_START_HEIGHT` | - | Start height (-1 for genesis) |
 | **API** |
-| `API_PORT` | No | `42067` | API server port |
-| `API_HOST` | No | `0.0.0.0` | API server host |
+| `API_PORT` | `42067` | API server port |
+| `API_HOST` | `0.0.0.0` | API server bind address |
 
 ---
 
 ## API Endpoints
 
 ### Status
-
-```bash
-# Indexer + daemon status
-GET /api/v1/status
-
-# Sync progress
-GET /api/v1/sync
+```
+GET /health              # Health check
+GET /api/v1/status       # Sync status and daemon info
 ```
 
 ### Blocks
-
-```bash
-# Latest block summaries
-GET /api/v1/blocks/latest
-
-# Recent block list (paged)
-GET /api/v1/blocks
-
-# Block by height or hash
-GET /api/v1/blocks/:heightOrHash
+```
+GET /api/v1/blocks/latest              # Recent blocks
+GET /api/v1/blocks/:heightOrHash       # Block by height or hash
+GET /api/v1/stats/dashboard            # Dashboard statistics
 ```
 
 ### Transactions
-
-```bash
-# Transaction by txid
-GET /api/v1/transactions/:txid
+```
+GET /api/v1/transactions/:txid         # Transaction details
+POST /api/v1/transactions/batch        # Batch lookup
 ```
 
 ### Addresses
-
-```bash
-# Summary + balances
-GET /api/v1/addresses/:address
-
-# Paginated transaction history
-GET /api/v1/addresses/:address/transactions
-
-# UTXO list
-GET /api/v1/addresses/:address/utxos
+```
+GET /api/v1/addresses/:address                    # Balance and stats
+GET /api/v1/addresses/:address/transactions       # Transaction history (cursor-based)
+GET /api/v1/addresses/:address/utxos              # Unspent outputs
 ```
 
-### Stats & Network Data
-
-```bash
-# Rich list + supply
-GET /api/v1/richlist
-GET /api/v1/supply
-
-# Producers & FluxNodes
-GET /api/v1/producers
-GET /api/v1/producers/:identifier
-GET /api/v1/nodes
-GET /api/v1/nodes/:ip
-
-# Network / mempool / dashboard
-GET /api/v1/network
-GET /api/v1/mempool
-GET /api/v1/stats/dashboard
+### Analytics
 ```
-
-### Response Examples
-
-**Status:**
-```json
-{
-  "fluxindexer": {
-    "coin": "Flux",
-    "version": "1.0.0",
-    "bestHeight": 2500000,
-    "inSync": true,
-    "consensus": "PoN"
-  },
-  "backend": {
-    "chain": "main",
-    "blocks": 2500000,
-    "bestBlockHash": "abc123..."
-  }
-}
-```
-
-**Block:**
-```json
-{
-  "height": 2500000,
-  "hash": "abc123...",
-  "time": 1729513200,
-  "txCount": 15,
-  "producer": "192.168.1.100",
-  "producerReward": "7.5",
-  "txs": [...]
-}
-```
-
-**Producer:**
-```json
-{
-  "fluxnode": "192.168.1.100",
-  "blocksProduced": 1250,
-  "totalRewards": "9375.00",
-  "firstBlock": 2400000,
-  "lastBlock": 2500000
-}
+GET /api/v1/richlist           # Top holders
+GET /api/v1/supply             # Circulating supply
+GET /api/v1/producers          # Block producer stats
 ```
 
 ---
 
 ## Database Schema
 
-### Tables
+ClickHouse tables use MergeTree family engines:
 
-- **blocks** - Indexed blocks with PoN producer info
-- **transactions** - All transactions
-- **utxos** - UTXO set (spent and unspent)
-- **address_summary** - Cached address balances
-- **producers** - FluxNode producer statistics
-- **sync_state** - Indexer synchronization state
-- **reorgs** - Blockchain reorganization history
+| Table | Engine | Purpose |
+|-------|--------|---------|
+| `blocks` | ReplacingMergeTree | Block headers |
+| `transactions` | ReplacingMergeTree | Transaction data |
+| `utxos` | ReplacingMergeTree | UTXO tracking |
+| `address_transactions` | ReplacingMergeTree | Address-tx mapping |
+| `address_summary` | SummingMergeTree | Address balances |
+| `fluxnode_transactions` | ReplacingMergeTree | FluxNode operations |
+| `live_fluxnodes` | ReplacingMergeTree | FluxNode counts |
+| `supply_stats` | ReplacingMergeTree | Supply tracking |
+| `producers` | SummingMergeTree | Producer statistics |
+| `sync_state` | ReplacingMergeTree | Sync status |
 
-### Performance
-
-- Optimized indexes for fast queries
-- Address balance materialized view
-- Transaction pagination support
-- UTXO spent/unspent tracking
+Schema is created automatically by the indexer on startup.
 
 ---
 
-## Development
-
-### Project Structure
+## Project Structure
 
 ```
 flux-indexer/
 ├── src/
-│   ├── api/              # REST API server
-│   ├── database/         # Database layer
-│   │   ├── connection.ts
-│   │   ├── migrate.ts
-│   │   └── schema.sql
-│   ├── indexer/          # Core indexing logic
-│   │   ├── block-indexer.ts
-│   │   └── sync-engine.ts
-│   ├── rpc/              # Flux RPC client
-│   │   └── flux-rpc-client.ts
-│   ├── types/            # TypeScript types
-│   │   └── index.ts
-│   ├── utils/            # Utilities
-│   │   └── logger.ts
-│   ├── config.ts         # Configuration
-│   └── index.ts          # Main entry point
+│   ├── api/server.ts              # REST API
+│   ├── database/
+│   │   ├── connection.ts          # ClickHouse client
+│   │   ├── bulk-loader.ts         # Bulk inserts
+│   │   └── schema.sql             # Table definitions
+│   ├── indexer/
+│   │   ├── sync-engine.ts         # Sync with reorg handling
+│   │   ├── block-indexer.ts       # Block parsing
+│   │   └── parallel-fetcher.ts    # Parallel RPC fetching
+│   ├── rpc/flux-rpc-client.ts     # Daemon RPC client
+│   ├── services/fluxnode-sync.ts  # FluxNode sync
+│   ├── types/index.ts             # TypeScript types
+│   ├── config.ts                  # Configuration
+│   └── index.ts                   # Entry point
+├── docker/
+│   ├── clickhouse-memory.xml      # ClickHouse config
+│   ├── entrypoint.sh              # Container entrypoint
+│   ├── flux.conf.template         # Daemon config
+│   └── supervisord.conf           # Process manager
 ├── Dockerfile
-├── docker-compose.yml
-├── package.json
-└── tsconfig.json
-```
-
-### Scripts
-
-```bash
-# Development
-npm run dev              # Start with auto-reload
-npm run build            # Build TypeScript
-npm start                # Run production build
-
-# Database
-npm run db:migrate       # Run migrations
-npm run db:reset         # Reset database (caution!)
-
-# Testing
-npm test                 # Run tests
-```
-
----
-
-## Deployment
-
-### Docker
-
-```bash
-# Build image
-docker build -t fluxindexer:latest .
-
-# Run container
-docker run -d \
-  --name fluxindexer \
-  -p 42067:42067 \
-  -e FLUX_RPC_URL=http://flux-daemon:16124 \
-  -e DB_HOST=postgres \
-  -e DB_PASSWORD=your_password \
-  fluxindexer:latest
-```
-
-### Flux Cloud
-
-For deployment on Flux cloud platform:
-
-**Component Spec:**
-```json
-{
-  "name": "indexer",
-  "description": "Flux blockchain indexer",
-  "repotag": "yourusername/fluxindexer:latest",
-  "port": 42067,
-  "containerPort": 42067,
-  "environmentParameters": [
-    "FLUX_RPC_URL=http://fluxdaemon_yourappname:16124",
-    "DB_HOST=postgres_yourappname",
-    "DB_NAME=fluxindexer",
-    "DB_USER=flux",
-    "DB_PASSWORD=your_password",
-    "INDEXER_BATCH_SIZE=100",
-    "LOG_LEVEL=info"
-  ],
-  "containerData": "/home/flux/.flux",
-  "cpu": 4.0,
-  "ram": 4096,
-  "hdd": 200
-}
-```
-
-**Note:** Ensure PostgreSQL and Flux daemon components are deployed first.
-
----
-
-## Monitoring
-
-### Health Check
-
-```bash
-curl http://127.0.0.1:42067/health
-# Returns: {"status":"ok","timestamp":"2025-10-21T..."}
-```
-
-### Sync Status
-
-```bash
-curl http://127.0.0.1:42067/api/v1/sync
-```
-
-```json
-{
-  "currentHeight": 2500000,
-  "chainHeight": 2500100,
-  "percentage": 99.96,
-  "isSyncing": true,
-  "lastSyncTime": "2025-10-21T14:30:00Z"
-}
-```
-
-### Logs
-
-```bash
-# Docker
-docker-compose logs -f indexer
-
-# Native
-tail -f /var/log/fluxindexer.log  # if LOG_FILE is set
+└── package.json
 ```
 
 ---
@@ -453,66 +196,75 @@ tail -f /var/log/fluxindexer.log  # if LOG_FILE is set
 ## Performance
 
 ### Sync Speed
+- Full sync: ~9 hours (2.1M+ blocks)
+- Bulk sync: ~65 blocks/second
+- Tip-following: ~18 blocks/second
 
-- **Initial sync:** Optimized blockchain synchronization (depends on hardware)
-- **Real-time sync:** Keeps up with 30-second blocks easily
-- **Database size:** ~260GB current size (grows continuously as new blocks are indexed)
+### Storage
+| Component | Size |
+|-----------|------|
+| ClickHouse | ~61 GB |
+| Flux daemon | ~50 GB |
+| **Total** | ~112 GB |
 
-### Resource Requirements
+### Resources
+| Component | RAM | CPU |
+|-----------|-----|-----|
+| ClickHouse | 9-16 GB | 4 cores |
+| FluxIndexer | 3-4 GB | 2 cores |
 
-**FluxIndexer (includes Flux daemon):**
-- CPU: 4 cores
-- RAM: 4 GB
-- Storage: 200 GB (~45GB blockchain + Zcash params)
+### Query Times
+- Block lookup: <10ms
+- Transaction lookup: <10ms
+- Address transactions: <50ms
+- Rich list: <100ms
 
-**PostgreSQL Database:**
-- CPU: 2 cores
-- RAM: 20 GB
-- Storage: 400 GB (~260GB current database size, grows over time)
+---
 
-**Note:** These are production-grade specifications from the Flux deployment spec. The database size grows continuously as new blocks are indexed.
+## Deployment
+
+### Docker Compose
+
+```bash
+docker compose -f docker-compose.production.yml up -d
+docker compose -f docker-compose.production.yml logs -f indexer
+```
+
+### Check Database Size
+
+```bash
+docker exec fluxindexer-clickhouse clickhouse-client --query "
+  SELECT
+    formatReadableSize(sum(bytes_on_disk)) as size,
+    formatReadableSize(sum(data_uncompressed_bytes)) as uncompressed
+  FROM system.parts WHERE active
+"
+```
 
 ---
 
 ## Troubleshooting
 
-### Indexer won't start
-
-**Check RPC connection:**
+### RPC Connection Failed
 ```bash
 curl -u user:pass http://127.0.0.1:16124 \
   -d '{"method":"getblockcount","params":[],"id":1}'
 ```
 
-**Check database:**
+### ClickHouse Connection Failed
 ```bash
-psql -h 127.0.0.1 -U flux -d fluxindexer -c "SELECT * FROM sync_state;"
+curl "http://127.0.0.1:8123/?query=SELECT%201"
 ```
 
-### Sync is slow
+### Slow Sync
+- Increase `INDEXER_BATCH_SIZE` (2000-5000 for initial sync)
+- Ensure ClickHouse has sufficient RAM (9GB+ recommended)
 
-- Increase `INDEXER_BATCH_SIZE` (try 200-500)
-- Check database performance (add indexes if needed)
-- Ensure SSD storage for database
-- Increase PostgreSQL `shared_buffers` and `work_mem`
-
-### Reorg detected
-
-- Check logs for reorg details
-- Indexer automatically handles reorgs up to `MAX_REORG_DEPTH` (default 100)
-- Deep reorgs may require manual intervention
-
----
-
-## Contributing
-
-Contributions welcome! Please:
-
-1. Fork the repository
-2. Create feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit changes (`git commit -m 'Add amazing feature'`)
-4. Push to branch (`git push origin feature/amazing-feature`)
-5. Open Pull Request
+### Reorg Handling
+The indexer handles reorgs up to 100 blocks deep automatically. Check logs:
+```bash
+docker logs fluxindexer-prod | grep -i reorg
+```
 
 ---
 
@@ -522,17 +274,8 @@ MIT License
 
 ---
 
-## Acknowledgments
+## Links
 
-- Built for [Flux](https://runonflux.io/) blockchain network
-- Crafted specifically for FluxIndexer API v1
-- PostgreSQL for reliable data storage
-
----
-
-## Support
-
-- **Issues:** https://github.com/Sikbik/flux-blockchain-explorer/issues
-- **Flux Discord:** https://discord.com/invite/runonflux
-
----
+- [Flux Network](https://runonflux.io/)
+- [ClickHouse](https://clickhouse.com/)
+- [Issues](https://github.com/Sikbik/flux-blockchain-explorer/issues)

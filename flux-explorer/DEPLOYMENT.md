@@ -4,7 +4,7 @@ Complete guide for deploying Flux Explorer on the Flux network.
 
 **Production Status:**  READY TO DEPLOY
 **Security Audit:** PASSED - All critical vulnerabilities resolved
-**Last Updated:** November 15, 2025
+**Last Updated:** December 13, 2025
 **Version:** 1.0.0
 
 ## Table of Contents
@@ -79,7 +79,7 @@ Complete guide for deploying Flux Explorer on the Flux network.
 
 ### Prerequisites
 - Docker and Docker Compose installed
-- Port 3000 available
+- Port 42069 available
 
 ### Quick Start
 
@@ -92,7 +92,7 @@ cd flux-blockchain-explorer/flux-explorer
 docker-compose up --build
 
 # Access the application
-# Open http://localhost:3000 in your browser
+# Open http://127.0.0.1:42069 in your browser
 ```
 
 ### Testing the Build
@@ -102,7 +102,7 @@ docker-compose up --build
 docker build -t flux-explorer:latest .
 
 # Run the container
-docker run -p 3000:3000 --name flux-explorer flux-explorer:latest
+docker run -p 42069:42069 --name flux-explorer flux-explorer:latest
 
 # Check health status
 docker inspect --format='{{json .State.Health}}' flux-explorer
@@ -147,7 +147,7 @@ docker push USERNAME/flux-explorer:v1.0.0
 # Run production image
 docker run -d \
   --name flux-explorer-prod \
-  -p 3000:3000 \
+  -p 42069:42069 \
   --restart unless-stopped \
   USERNAME/flux-explorer:latest
 
@@ -155,8 +155,8 @@ docker run -d \
 watch -n 5 'docker inspect --format="{{json .State.Health}}" flux-explorer-prod | jq'
 
 # Test endpoints
-curl http://localhost:3000
-curl http://localhost:3000/api/health
+curl http://127.0.0.1:42069
+curl http://127.0.0.1:42069/api/health
 ```
 
 ## Flux Deployment Options
@@ -203,7 +203,7 @@ docker push littlestache/flux-explorer:latest
 
    **Docker Configuration:**
    - **Docker Image**: `USERNAME/flux-explorer:latest`
-   - **Port**: `3000`
+   - **Port**: `42069`
    - **Domains**: Leave empty (will use default Flux domain)
 
    **Resource Requirements:**
@@ -216,7 +216,7 @@ docker push littlestache/flux-explorer:latest
    NODE_ENV=production
    NEXT_TELEMETRY_DISABLED=1
    HOSTNAME=0.0.0.0
-   PORT=3000
+   PORT=42069
    ```
 
    **Commands:** Leave empty (uses Dockerfile CMD)
@@ -240,7 +240,7 @@ curl -X POST https://api.runonflux.io/apps/registerapp \
     "name": "flux-explorer",
     "description": "Blockchain explorer for Flux",
     "repotag": "USERNAME/flux-explorer:latest",
-    "port": 3000,
+    "port": 42069,
     "cpu": 2,
     "ram": 4096,
     "hdd": 10,
@@ -249,7 +249,7 @@ curl -X POST https://api.runonflux.io/apps/registerapp \
       "NODE_ENV=production",
       "NEXT_TELEMETRY_DISABLED=1",
       "HOSTNAME=0.0.0.0",
-      "PORT=3000"
+      "PORT=42069"
     ]
   }'
 ```
@@ -285,7 +285,7 @@ The application uses these environment variables (already set in Dockerfile):
 NODE_ENV=production
 NEXT_TELEMETRY_DISABLED=1
 HOSTNAME=0.0.0.0
-PORT=3000
+PORT=42069
 ```
 
 No additional configuration needed for basic deployment.
@@ -319,9 +319,9 @@ Deploy with local FluxIndexer instance for 10-100x better performance.
   "name": "indexer",
   "description": "Flux daemon + FluxIndexer API",
   "repotag": "yourdockerhub/flux-indexer:latest",
-  "port": 3002,
-  "containerPort": 3002,
-  "containerData": "/root",
+  "port": 42067,
+  "containerPort": 42067,
+  "containerData": "/home/flux/.flux",
   "cpu": 5.0,
   "ram": 10240,
   "hdd": 181
@@ -334,11 +334,11 @@ Deploy with local FluxIndexer instance for 10-100x better performance.
   "name": "explorer",
   "description": "Blockchain explorer frontend",
   "repotag": "yourdockerhub/flux-explorer:latest",
-  "port": 3000,
-  "containerPort": 3000,
+  "port": 42069,
+  "containerPort": 42069,
   "containerData": "/app/data",
   "environmentParameters": [
-    "SERVER_API_URL=http://fluxindexer_yourappname:3002",
+    "SERVER_API_URL=http://fluxindexer_yourappname:42067",
     "NEXT_PUBLIC_API_URL=https://your-public-fluxindexer-url"
   ],
   "cpu": 2.0,
@@ -385,7 +385,7 @@ flux{componentname}_{appname}
 
 ```bash
 # In Explorer component - connect to FluxIndexer
-SERVER_API_URL=http://fluxindexer_myexplorer:3002
+SERVER_API_URL=http://fluxindexer_myexplorer:42067
 NEXT_PUBLIC_API_URL=https://your-public-fluxindexer.com
 ```
 
@@ -410,7 +410,7 @@ docker inspect --format='{{.State.Health.Status}}' flux-explorer
 docker inspect --format='{{json .State.Health}}' flux-explorer | jq
 
 # Manual health check
-curl http://localhost:3000
+curl http://127.0.0.1:42069
 ```
 
 Health check runs every 30 seconds and verifies HTTP 200 response.

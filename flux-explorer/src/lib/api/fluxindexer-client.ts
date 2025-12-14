@@ -898,10 +898,10 @@ export class FluxIndexerAPI {
         const valueSat = tx.value ?? '0';
         const receivedSat = tx.receivedValue ?? '0';
         const sentSat = tx.sentValue ?? '0';
-        const feeSat = tx.feeValue ?? (BigInt(sentSat) > BigInt(receivedSat)
-          ? (BigInt(sentSat) - BigInt(receivedSat)).toString()
-          : '0');
+        // Use fee from API (now joined from transactions table)
+        const feeSat = tx.feeValue ?? '0';
         const changeSat = tx.changeValue ?? '0';
+        // Use toOthersValue from API
         const toOthersSat = tx.toOthersValue ?? '0';
         return {
           txid: tx.txid,

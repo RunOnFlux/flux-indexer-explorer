@@ -1,86 +1,111 @@
-# Production Docker Compose for Full FluxIndexer Stack
-# Components: PostgreSQL + FluxIndexer (daemon + indexer + dashboard) + Explorer
-# Suitable for deployment on Hetzner VPS or other production servers
+# Production Docker Compose for FluxIndexer Stack
+# Components: ClickHouse + FluxIndexer (daemon + indexer) + Explorer
 #
 # IMPORTANT: Replace all "CHANGE_THIS_*" placeholders with your secure passwords before deploying
-# Edit the password values directly in this file
-
-version: '3.8'
+#
+# Bootstrap Support:
+#   Set CH_BOOTSTRAP_URL to auto-download ClickHouse database bootstrap on first start
+#   Set BOOTSTRAP_URL for daemon blockchain bootstrap (speeds up initial sync significantly)
+#
+# RESOURCE REQUIREMENTS:
+#   - ClickHouse: 14GB RAM (spikes to 12-15GB during merge operations, idles at ~2GB)
+#   - Indexer: 4GB RAM (daemon ~1.5GB + indexer ~1GB + buffer)
+#   - Explorer: 512MB RAM (~70MB actual usage)
+#   - MINIMUM SYSTEM: 20GB+ RAM recommended (or 16GB with 4GB swap)
+#   - Storage: ~225GB with bootstrap (120GB ClickHouse + 100GB daemon + 5GB explorer)
+#   - After bootstrap: ~112GB (61GB database + 50GB blockchain + overhead)
 
 services:
-  # TimescaleDB Database (PostgreSQL with time-series optimization)
-  postgres:
-    image: timescale/timescaledb:latest-pg15
-    container_name: fluxindexer-postgres-prod
-    shm_size: 1g
+  # ClickHouse Database (columnar storage optimized for blockchain data)
+  # Uses official ClickHouse image - bootstrap is handled by the indexer container
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    container_name: fluxindexer-clickhouse
+    restart: unless-stopped
     environment:
-      POSTGRES_DB: fluxindexer
-      POSTGRES_USER: fluxindexer
-      POSTGRES_PASSWORD: CHANGE_THIS_PASSWORD  # Replace with your secure PostgreSQL password
-    command: >
-      postgres
-      -c shared_buffers=4GB
-      -c effective_cache_size=12GB
-      -c maintenance_work_mem=1GB
-      -c work_mem=64MB
-      -c max_connections=100
-      -c checkpoint_completion_target=0.9
-      -c wal_buffers=64MB
-      -c random_page_cost=1.1
-      -c timescaledb.max_background_workers=8
-      -c max_worker_processes=16
-      -c max_parallel_workers_per_gather=4
-      -c max_parallel_workers=8
+      # ClickHouse auth
+      CLICKHOUSE_USER: fluxindexer
+      CLICKHOUSE_PASSWORD: CHANGE_THIS_CH_PASSWORD  # Replace with secure password
+      CLICKHOUSE_DB: fluxindexer
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ports:
-      - "127.0.0.1:5432:5432"  # Only expose locally for security
+      - "127.0.0.1:8123:8123"   # HTTP interface (only expose locally)
+      - "127.0.0.1:9000:9000"   # Native TCP interface (only expose locally)
     volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./flux-indexer/src/database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+      - clickhouse-backup:/var/lib/clickhouse/backup  # Shared volume for bootstrap
+      - ./flux-indexer/docker/clickhouse-memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U fluxindexer -d fluxindexer"]
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
       interval: 10s
       timeout: 5s
       retries: 5
-    restart: unless-stopped
+      start_period: 30s  # Give ClickHouse time to initialize before health checks count
     networks:
       - fluxindexer
+    deploy:
+      resources:
+        limits:
+          memory: 14G  # ClickHouse needs 12-15GB during merge operations
+        reservations:
+          memory: 4G
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
 
-  # FluxIndexer (Flux daemon + Indexer + Status Dashboard)
+  # FluxIndexer (Flux daemon + Indexer + REST API)
+  # Handles both ClickHouse and daemon bootstrap sequentially to minimize peak storage
   indexer:
     build:
       context: ./flux-indexer
       dockerfile: Dockerfile
-    image: yourusername/flux-indexer:latest  # Replace 'yourusername' with your Docker Hub username
+    image: littlestache/flux-indexer:latest
     container_name: fluxindexer-prod
+    restart: unless-stopped
     depends_on:
-      postgres:
+      clickhouse:
         condition: service_healthy
     environment:
       # Flux Daemon RPC Configuration (internal bundled daemon)
-      FLUX_RPC_URL: http://localhost:16124
+      FLUX_RPC_URL: http://127.0.0.1:16124
       FLUX_RPC_USER: fluxrpc
-      FLUX_RPC_PASSWORD: CHANGE_THIS_RPC_PASSWORD  # Replace with your secure Flux RPC password
+      FLUX_RPC_PASSWORD: CHANGE_THIS_RPC_PASSWORD  # Replace with secure password
 
-      # Database Configuration
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: fluxindexer
-      DB_USER: fluxindexer
-      DB_PASSWORD: CHANGE_THIS_PASSWORD  # Must match POSTGRES_PASSWORD above
+      # ClickHouse Configuration
+      CH_HOST: clickhouse
+      CH_PORT: 9000           # Native protocol for clickhouse-client
+      CH_HTTP_PORT: 8123      # HTTP protocol for indexer application
+      CH_DATABASE: fluxindexer
+      CH_USER: fluxindexer
+      CH_PASSWORD: CHANGE_THIS_CH_PASSWORD  # Must match CLICKHOUSE_PASSWORD above
+      CH_REQUEST_TIMEOUT: 300000
+      CH_MAX_CONNECTIONS: 25
 
-      # Indexer Configuration
-      INDEXER_BATCH_SIZE: 100
+      # ClickHouse Bootstrap (database backup)
+      # Set to auto-download and restore database on first start
+      # CH_BOOTSTRAP_URL: https://your-bucket.r2.dev/clickhouse-bootstrap.tar.gz
+
+      # Indexer Configuration - Optimized for ClickHouse bulk inserts
+      INDEXER_BATCH_SIZE: 5000
       INDEXER_POLLING_INTERVAL: 1000
-      INDEXER_START_HEIGHT: -1  # -1 = start from genesis, or set to specific block height
+      INDEXER_START_HEIGHT: -1  # -1 = start from genesis block
 
-      # Bootstrap Configuration (optional - leave empty to sync from genesis)
-      BOOTSTRAP_URL: ""  # Example: https://your-cdn.com/flux_blockchain_data.tar.gz
-      DB_BOOTSTRAP_URL: ""  # Example: https://your-cdn.com/postgresql_fluxindexer.pgdump
+      # Node.js memory limit (indexer uses ~1GB, daemon uses ~1.5GB)
+      NODE_OPTIONS: "--max-old-space-size=2048"
+
+      # Backfill any detected block gaps before continuing
+      BACKFILL_GAPS: "true"
+
+      # Daemon Bootstrap (blockchain data)
+      # Set to download bootstrap for faster daemon sync (~30 mins vs days)
+      # BOOTSTRAP_URL: https://your-cdn.com/flux-daemon-bootstrap.tar.gz
 
       # API Configuration
       API_PORT: 42067
@@ -90,19 +115,25 @@ services:
       LOG_LEVEL: info
     ports:
       - "42067:42067"      # API + Status Dashboard
-      # - "16124:16124"  # Flux RPC (uncomment for debugging)
+      # - "16124:16124"    # Flux RPC (uncomment for debugging)
     volumes:
-      - flux-data:/home/flux/.flux  # Persist blockchain data
-      - zcash-params:/home/flux/.zcash-params  # Zcash parameters (auto-downloaded on first run)
-    restart: unless-stopped
+      - flux-data:/home/flux/.flux
+      - zcash-params:/home/flux/.zcash-params
+      - clickhouse-backup:/clickhouse-backup  # Shared volume for CH bootstrap
     networks:
       - fluxindexer
+    deploy:
+      resources:
+        limits:
+          memory: 4G  # Daemon ~1.5GB + Indexer ~1GB + buffer
+        reservations:
+          memory: 2G
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:42067/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 3600s  # Allow time for migrations (up to 1 hour)
+      start_period: 3600s  # Allow time for bootstrap/sync
     logging:
       driver: "json-file"
       options:
@@ -115,34 +146,36 @@ services:
       context: ./flux-explorer
       dockerfile: Dockerfile
       args:
-        # AUTO = use /api/indexer proxy route (works on any domain/IP)
         NEXT_PUBLIC_API_URL: AUTO
-    image: yourusername/flux-explorer:latest  # Replace 'yourusername' with your Docker Hub username
+    image: littlestache/flux-explorer:latest
     container_name: flux-explorer-prod
+    restart: unless-stopped
     depends_on:
       indexer:
-        condition: service_started  # Don't wait for health check (allows explorer to start during long bootstrap)
+        condition: service_started
     environment:
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: 1
       HOSTNAME: 0.0.0.0
       PORT: 42069
 
-      # Client-side API URL: AUTO = use /api/indexer proxy route (works on any domain/IP)
+      # Client-side API URL: AUTO = use /api/indexer proxy route
       NEXT_PUBLIC_API_URL: AUTO
 
       # Server-side API URL (for Next.js API routes inside container)
       SERVER_API_URL: http://indexer:42067
-
-      # Optional: Public fallback (if deploying behind reverse proxy)
-      # NEXT_PUBLIC_FALLBACK_API_URL: https://your-domain.com/api
     ports:
       - "42069:42069"
     volumes:
-      - price-cache-data:/app/data  # Persist SQLite price cache across rebuilds (historical price data)
-    restart: unless-stopped
+      - price-cache-data:/app/data
     networks:
       - fluxindexer
+    deploy:
+      resources:
+        limits:
+          memory: 512M  # Next.js frontend uses ~70MB actual
+        reservations:
+          memory: 128M
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:42069"]
       interval: 30s
@@ -160,11 +193,15 @@ networks:
     driver: bridge
 
 volumes:
-  postgres-data:
+  clickhouse-data:
     driver: local
+  clickhouse-logs:
+    driver: local
+  clickhouse-backup:
+    driver: local  # Shared volume for bootstrap file transfer between indexer and ClickHouse
   flux-data:
     driver: local
   zcash-params:
     driver: local
-  price-cache-data:  # Stores hourly historical price data (SQLite database)
+  price-cache-data:
     driver: local

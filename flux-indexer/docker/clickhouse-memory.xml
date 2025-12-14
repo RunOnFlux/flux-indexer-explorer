@@ -1,0 +1,39 @@
+<clickhouse>
+    <!--
+    ClickHouse Memory Configuration for FluxIndexer
+    Tuned for 14GB RAM container - merge operations can spike to 12-15GB
+    -->
+
+    <!-- Server-level memory settings -->
+    <max_server_memory_usage>12000000000</max_server_memory_usage>
+
+    <!-- Background merge settings - reduce concurrency to limit memory spikes -->
+    <background_pool_size>4</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>1</background_merges_mutations_concurrency_ratio>
+
+    <!-- MergeTree settings -->
+    <merge_tree>
+        <number_of_free_entries_in_pool_to_execute_mutation>2</number_of_free_entries_in_pool_to_execute_mutation>
+        <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>2</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+        <number_of_free_entries_in_pool_to_lower_max_size_of_merge>2</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+        <!-- 3GB merge limit for 14GB RAM -->
+        <max_bytes_to_merge_at_max_space_in_pool>3221225472</max_bytes_to_merge_at_max_space_in_pool>
+        <max_parts_to_merge_at_once>30</max_parts_to_merge_at_once>
+    </merge_tree>
+
+    <!-- User profile settings -->
+    <profiles>
+        <default>
+            <!-- Async insert settings - 1s timeout for near real-time explorer -->
+            <async_insert>1</async_insert>
+            <wait_for_async_insert>0</wait_for_async_insert>
+            <async_insert_busy_timeout_ms>1000</async_insert_busy_timeout_ms>
+            <async_insert_max_data_size>52428800</async_insert_max_data_size>
+
+            <!-- Per-query memory limits -->
+            <max_memory_usage>8000000000</max_memory_usage>
+            <max_bytes_before_external_group_by>4000000000</max_bytes_before_external_group_by>
+            <max_bytes_before_external_sort>4000000000</max_bytes_before_external_sort>
+        </default>
+    </profiles>
+</clickhouse>

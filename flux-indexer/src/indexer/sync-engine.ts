@@ -1,40 +1,52 @@
 /**
- * Sync Engine
+ * ClickHouse Sync Engine
  *
  * Manages blockchain synchronization and continuous indexing
- * with automatic performance optimization
+ * with ClickHouse as the storage backend
  */
 
 import { FluxRPCClient } from '../rpc/flux-rpc-client';
-import { DatabaseConnection } from '../database/connection';
-import { BlockIndexer } from './block-indexer';
-import { DatabaseOptimizer } from '../database/optimizer';
+import { ClickHouseConnection, getClickHouse } from '../database/connection';
+import { ClickHouseBlockIndexer } from './block-indexer';
 import { ParallelBlockFetcher } from './parallel-fetcher';
 import { logger } from '../utils/logger';
-import { SyncError, Block } from '../types';
+import { Block } from '../types';
+import {
+  updateSyncState,
+  recordReorg,
+  invalidateFromHeight,
+  getSyncState,
+} from '../database/bulk-loader';
 
-// Memory profiling helper - logs heap usage at key points
+// Memory profiling helper - throttled to avoid log spam
 let lastMemLog = 0;
 let baselineHeap = 0;
-function logMemory(label: string, force = false): void {
+const MEMORY_LOG_INTERVAL = 30000; // Only log memory every 30 seconds
+
+// Progress bar throttling - only show every 10 seconds
+let lastProgressLog = 0;
+const PROGRESS_LOG_INTERVAL = 10000;
+
+// Waiting message throttling - only show every 30 seconds
+let lastWaitingLog = 0;
+const WAITING_LOG_INTERVAL = 30000;
+
+function logMemory(label: string): void {
   const now = Date.now();
-  // Only log every 10 seconds unless forced
-  if (!force && now - lastMemLog < 10000) return;
+  if (now - lastMemLog < MEMORY_LOG_INTERVAL) return;
   lastMemLog = now;
 
   const mem = process.memoryUsage();
   const heapMB = Math.round(mem.heapUsed / 1024 / 1024);
   const rssMB = Math.round(mem.rss / 1024 / 1024);
-  const externalMB = Math.round(mem.external / 1024 / 1024);
 
   if (baselineHeap === 0) baselineHeap = heapMB;
   const delta = heapMB - baselineHeap;
 
-  logger.info('Memory snapshot', {
+  logger.debug('Memory snapshot', {
     label,
     heapMB,
     rssMB,
-    externalMB,
     deltaHeapMB: delta,
   });
 }
@@ -46,9 +58,9 @@ export interface SyncConfig {
   maxReorgDepth: number;
 }
 
-export class SyncEngine {
-  private blockIndexer: BlockIndexer;
-  private optimizer: DatabaseOptimizer;
+export class ClickHouseSyncEngine {
+  private blockIndexer: ClickHouseBlockIndexer;
+  private ch: ClickHouseConnection;
   private isRunning = false;
   private syncInterval: NodeJS.Timeout | null = null;
   private lastSyncTime = Date.now();
@@ -56,14 +68,21 @@ export class SyncEngine {
   private syncInProgress = false;
   private consecutiveErrors = 0;
   private daemonReady = false;
+  // Track height in memory to avoid stale reads from async inserts
+  private lastKnownHeight: number = -1;
 
   constructor(
     private rpc: FluxRPCClient,
-    private db: DatabaseConnection,
-    private config: SyncConfig
+    ch?: ClickHouseConnection,
+    private config?: SyncConfig
   ) {
-    this.blockIndexer = new BlockIndexer(rpc, db);
-    this.optimizer = new DatabaseOptimizer(db);
+    this.ch = ch || getClickHouse();
+    this.blockIndexer = new ClickHouseBlockIndexer(rpc, this.ch);
+    this.config = config || {
+      batchSize: 200,  // Increased from 100 to reduce insert frequency and part creation
+      pollingInterval: 5000,
+      maxReorgDepth: 100,
+    };
   }
 
   /**
@@ -75,46 +94,32 @@ export class SyncEngine {
       return;
     }
 
-    logger.info('Starting sync engine...');
+    logger.info('Starting ClickHouse sync engine...');
     this.isRunning = true;
 
-    // Ensure performance indexes exist on startup
-    try {
-      await this.optimizer.ensureIndexes();
-      logger.info('✅ Performance indexes verified');
-    } catch (error: any) {
-      logger.warn('Failed to ensure performance indexes (will continue anyway)', { error: error.message });
-    }
-
-    // Set up polling interval (will retry if RPC not ready)
+    // Set up polling interval
     this.syncInterval = setInterval(async () => {
       try {
         await this.sync();
-        this.consecutiveErrors = 0; // Reset on success
+        this.consecutiveErrors = 0;
       } catch (error: any) {
         this.consecutiveErrors++;
-        // During daemon warmup, log minimally at debug level
         if (this.daemonReady) {
-          // Daemon was ready but now failing - log as warning
           logger.warn('Sync error (will retry)', { error: error.message });
         } else if (this.consecutiveErrors === 1) {
-          // First warmup message only
           logger.info('Waiting for Flux daemon to respond to RPC calls...');
         } else if (this.consecutiveErrors % 30 === 0) {
-          // Every 30 attempts (~2.5 minutes) show we're still waiting
           logger.debug('Still waiting for daemon warmup', { attempts: this.consecutiveErrors });
         }
       }
-    }, this.config.pollingInterval);
+    }, this.config!.pollingInterval);
 
-    logger.info('Sync engine started', {
-      pollingInterval: this.config.pollingInterval,
-      batchSize: this.config.batchSize,
+    logger.info('ClickHouse sync engine started', {
+      pollingInterval: this.config!.pollingInterval,
+      batchSize: this.config!.batchSize,
     });
-    logger.info('Waiting for Flux daemon to be ready...');
 
-    // Try initial sync in background (don't block startup)
-    // Use debug level since failures are expected during daemon warmup
+    // Try initial sync in background
     this.sync().catch(error => {
       logger.debug('Initial sync attempt failed (daemon warmup)', { error: error.message });
     });
@@ -128,7 +133,7 @@ export class SyncEngine {
       return;
     }
 
-    logger.info('Stopping sync engine...');
+    logger.info('Stopping ClickHouse sync engine...');
 
     if (this.syncInterval) {
       clearInterval(this.syncInterval);
@@ -138,7 +143,7 @@ export class SyncEngine {
     this.isRunning = false;
     await this.blockIndexer.setSyncingStatus(false);
 
-    logger.info('Sync engine stopped');
+    logger.info('ClickHouse sync engine stopped');
   }
 
   /**
@@ -153,62 +158,108 @@ export class SyncEngine {
     this.syncInProgress = true;
 
     try {
-      // Get chain info from RPC - use headers as chain height since it represents
-      // the actual network height that the daemon is aware of
+      // Get chain info from RPC
       const chainInfo = await this.rpc.getBlockchainInfo();
-      const chainHeight = chainInfo.headers;
+      const chainHeight = chainInfo.headers;  // Total chain height (from headers)
+      const daemonBlocks = chainInfo.blocks;  // Blocks daemon has actually downloaded
+
+      // Daemon is "syncing" if it hasn't downloaded all blocks OR hasn't discovered chain yet
+      // A fresh daemon starts with headers=0 until it connects to peers
+      const MIN_CHAIN_HEIGHT = 1000; // Flux mainnet has 2M+ blocks, so 1000 means daemon is still discovering
+      const daemonDiscoveringChain = chainHeight < MIN_CHAIN_HEIGHT;
+      const daemonIsSyncing = daemonDiscoveringChain || daemonBlocks < chainHeight;
+      const daemonSyncPercent = chainHeight > 0 ? ((daemonBlocks / chainHeight) * 100).toFixed(1) : '0';
 
       // Mark daemon as ready on first successful RPC call
       if (!this.daemonReady) {
         this.daemonReady = true;
-        logger.info('✅ Flux daemon is ready and responding to RPC calls');
+        if (daemonDiscoveringChain) {
+          logger.info('✅ Flux daemon responding - connecting to network...', {
+            headers: chainHeight,
+            blocks: daemonBlocks,
+          });
+        } else if (daemonIsSyncing) {
+          logger.info('✅ Flux daemon responding - blockchain sync in progress', {
+            daemonBlocks,
+            chainHeight,
+            syncPercent: `${daemonSyncPercent}%`,
+          });
+        } else {
+          logger.info('✅ Flux daemon is ready and fully synced');
+        }
       }
 
-      // Get current indexed height from database
-      const syncState = await this.blockIndexer.getSyncState();
-      let currentHeight = syncState.currentHeight;
+      // Get current indexed height - prefer in-memory tracking to avoid stale reads
+      let currentHeight: number;
+      if (this.lastKnownHeight >= 0) {
+        // Use memory-tracked height
+        currentHeight = this.lastKnownHeight;
+      } else {
+        // First sync or after restart - query database
+        const syncState = await this.blockIndexer.getSyncState();
+        currentHeight = syncState.currentHeight;
+        this.lastKnownHeight = currentHeight;
+      }
 
       // Use start height from config if specified and higher
-      if (this.config.startHeight !== undefined && currentHeight < this.config.startHeight) {
-        currentHeight = this.config.startHeight - 1;
+      if (this.config!.startHeight !== undefined && currentHeight < this.config!.startHeight) {
+        currentHeight = this.config!.startHeight - 1;
+        this.lastKnownHeight = currentHeight;
       }
 
-      // During daemon initial sync, stay 1000 blocks behind to avoid constant reorgs.
-      // Once daemon is caught up (blocks == headers), index all the way to the tip.
-      const safetyBuffer = 1000;
-      const blocksBehind = chainHeight - currentHeight;
-      const daemonIsSyncing = chainInfo.blocks < chainInfo.headers;
+      // CRITICAL: Only index up to blocks the daemon has actually downloaded
+      // This prevents errors from trying to fetch non-existent blocks
+      // When daemon is fully synced, we can safely index to chain tip
+      const isDaemonFullySynced = daemonBlocks >= chainHeight;
+      const safetyBuffer = isDaemonFullySynced ? 0 : 10; // No buffer when fully synced
+      const safeTarget = Math.max(0, daemonBlocks - safetyBuffer);
+      const indexingTarget = Math.min(safeTarget, chainHeight);
 
-      const indexingTarget = daemonIsSyncing && blocksBehind > safetyBuffer
-        ? Math.max(0, chainHeight - safetyBuffer)  // Keep buffer during daemon sync
-        : chainHeight;  // Chase tip when daemon is synced
+      // Log daemon sync status periodically when waiting (throttled)
+      if (daemonIsSyncing && currentHeight >= indexingTarget) {
+        const now = Date.now();
+        if (now - lastWaitingLog >= WAITING_LOG_INTERVAL) {
+          lastWaitingLog = now;
+          if (daemonDiscoveringChain) {
+            logger.info('⏳ Waiting for daemon to connect to network and discover chain', {
+              indexerHeight: currentHeight,
+              headers: chainHeight,
+              blocks: daemonBlocks,
+            });
+          } else {
+            logger.info('⏳ Waiting for daemon to download more blocks', {
+              indexerHeight: currentHeight,
+              daemonBlocks,
+              chainHeight,
+              daemonSync: `${daemonSyncPercent}%`,
+            });
+          }
+        }
+        await this.blockIndexer.setSyncingStatus(false, chainHeight);
+        return;
+      }
 
-      // Update chain height in database (use actual chain height, not buffered)
+      // Update chain height
       await this.blockIndexer.setSyncingStatus(true, chainHeight);
 
-      // Check if we're in sync (compare against buffered height)
+      // Check if we're in sync
       if (currentHeight >= indexingTarget) {
         logger.debug('In sync with buffer', { currentHeight, indexingTarget, actualChainHeight: chainHeight });
         await this.blockIndexer.setSyncingStatus(false, chainHeight);
         return;
       }
 
-      // Calculate blocks to sync (to buffered target, not latest chain tip)
+      // Calculate blocks to sync
       const blocksToSync = indexingTarget - currentHeight;
-      const batchSize = Math.min(this.config.batchSize, blocksToSync);
+      const batchSize = Math.min(this.config!.batchSize, blocksToSync);
 
-      // Threshold: use simple sequential fetch for small catches (tip-following)
-      // Use parallel fetcher only for bulk sync (> 10 blocks)
       const PARALLEL_FETCH_THRESHOLD = 10;
-
       const startTime = Date.now();
       let lastHeight = currentHeight;
       let processedThisBatch = 0;
 
       if (blocksToSync <= PARALLEL_FETCH_THRESHOLD) {
-        // ===== SIMPLE TIP-FOLLOWING MODE =====
-        // For small catches (1-10 blocks), use simple sequential fetch
-        // This avoids the overhead of starting/stopping the parallel fetcher
+        // Simple tip-following mode
         logger.debug('Tip-following mode', {
           blocksToSync,
           startBlock: currentHeight + 1,
@@ -227,32 +278,21 @@ export class SyncEngine {
           }
         }
       } else {
-        // ===== BULK SYNC MODE =====
-        // For large syncs (> 10 blocks), use parallel fetcher for speed
+        // Bulk sync mode with parallel fetcher
         logger.info('Batch starting', {
           startBlock: currentHeight + 1,
           endBlock: currentHeight + batchSize,
           blocksToSync,
           batchSize,
-          currentHeight,
-          chainHeight,
         });
 
         const batchStartHeight = currentHeight + 1;
         const batchEndHeight = currentHeight + batchSize;
-        // Aggressive settings for high-performance server (32GB RAM, memory leak fixed)
-        const fetchBatchSize = 200;   // 200 blocks per RPC batch (2x faster fetching)
-        const prefetchBatches = 10;   // 10 batches in flight = 2000 blocks max in memory
-        const parallelWorkers = 8;    // 8 concurrent fetch workers
-
-        logger.debug('Using pipelined block fetcher', {
-          batchStartHeight,
-          batchEndHeight,
-          fetchBatchSize,
-          prefetchBatches,
-          parallelWorkers,
-          targetBatchSize: batchSize,
-        });
+        // Memory-optimized settings - reduced to prevent OOM
+        // At block 1M+, transactions are larger and more numerous
+        const fetchBatchSize = 100;  // 100 blocks per RPC batch (was 200)
+        const prefetchBatches = 3;   // 3 batches in flight (was 6)
+        const parallelWorkers = 3;   // 3 concurrent workers (was 4)
 
         const fetcher = new ParallelBlockFetcher(this.rpc, {
           batchSize: fetchBatchSize,
@@ -261,7 +301,7 @@ export class SyncEngine {
         });
 
         await fetcher.start(batchStartHeight, batchEndHeight);
-        logMemory('batch-start', true);
+        logMemory('batch-start');
 
         try {
           while (true) {
@@ -284,7 +324,7 @@ export class SyncEngine {
               }
             }
 
-            // Process valid blocks in batch (MUCH faster - single DB transaction, batchUtxoMap)
+            // Process valid blocks in batch
             if (validBlocks.length > 0) {
               const batchStartHeight = lastHeight + 1;
               const blocksProcessed = await this.blockIndexer.indexBlocksBatch(validBlocks, batchStartHeight);
@@ -293,40 +333,50 @@ export class SyncEngine {
               this.blocksIndexed += blocksProcessed;
             }
 
-            // Handle any missing blocks individually (should be rare)
+            // Handle any missing blocks individually
             for (const height of missingHeights) {
-              logger.warn('Missing block from pipelined fetch, refetching individually', { height });
+              logger.warn('Missing block from pipelined fetch, refetching', { height });
               await this.blockIndexer.indexBlock(height);
               lastHeight = height;
               processedThisBatch++;
               this.blocksIndexed++;
             }
 
-            // Clear batch array to allow V8 to reclaim memory between fetches
+            // Clear arrays for GC
             fetchedBlocks.length = 0;
             validBlocks.length = 0;
 
-            // Trigger FULL GC after each batch to properly reclaim memory
+            // Trigger GC
             if (typeof global.gc === 'function') {
               global.gc(true);
             }
-            logMemory('post-batch-gc', true);
+            logMemory('post-batch-gc');
 
-            // Log progress after each batch
-            const elapsed = (Date.now() - startTime) / 1000;
-            const processed = lastHeight - currentHeight;
-            const blocksPerSecond = processed > 0 && elapsed > 0 ? processed / elapsed : 0;
-            const remaining = chainHeight - lastHeight;
-            const eta = blocksPerSecond > 0 ? remaining / blocksPerSecond : Infinity;
+            // Log progress (throttled to avoid log spam)
+            const now = Date.now();
+            if (now - lastProgressLog >= PROGRESS_LOG_INTERVAL) {
+              lastProgressLog = now;
+              const elapsed = (now - startTime) / 1000;
+              const processed = lastHeight - currentHeight;
+              const blocksPerSecond = processed > 0 && elapsed > 0 ? processed / elapsed : 0;
+              const remaining = chainHeight - lastHeight;
+              const eta = blocksPerSecond > 0 ? remaining / blocksPerSecond : Infinity;
 
-            const etaStr = Number.isFinite(eta) ? `${Math.floor(eta / 60)}m ${Math.floor(eta % 60)}s` : 'unknown';
-            logger.info(`Bulk sync progress ${lastHeight}/${chainHeight}`, {
-              height: lastHeight,
-              chainHeight,
-              blocksPerSecond: blocksPerSecond.toFixed(1),
-              eta: etaStr,
-              remaining,
-            });
+              const etaStr = Number.isFinite(eta) ? `${Math.floor(eta / 60)}m ${Math.floor(eta % 60)}s` : 'unknown';
+              const progressInfo: Record<string, any> = {
+                height: lastHeight,
+                chainHeight,
+                blocksPerSecond: blocksPerSecond.toFixed(1),
+                eta: etaStr,
+                remaining,
+              };
+              // Show daemon sync status if daemon is still syncing
+              if (daemonIsSyncing) {
+                progressInfo.daemonBlocks = daemonBlocks;
+                progressInfo.daemonSync = `${daemonSyncPercent}%`;
+              }
+              logger.info(`Bulk sync progress ${lastHeight}/${chainHeight}`, progressInfo);
+            }
 
             // Verify supply accuracy every 10000 blocks
             if (lastHeight % 10000 < fetchedBlocks.length) {
@@ -341,10 +391,21 @@ export class SyncEngine {
         }
       }
 
-      // Check for reorgs
-      if (lastHeight > 0) {
+      // Check for reorgs - but ONLY when daemon is fully synced
+      // During daemon sync, hash changes are expected and not actual reorgs
+      const daemonFullySynced = chainInfo.blocks >= chainInfo.headers;
+      if (lastHeight > 0 && daemonFullySynced) {
         await this.checkForReorg(lastHeight);
+      } else if (lastHeight > 0 && !daemonFullySynced) {
+        logger.debug('Skipping reorg check - daemon still syncing', {
+          daemonBlocks: chainInfo.blocks,
+          daemonHeaders: chainInfo.headers,
+          indexerHeight: lastHeight,
+        });
       }
+
+      // Update in-memory height tracking
+      this.lastKnownHeight = lastHeight;
 
       const syncTime = Date.now() - startTime;
       const batchBlocksPerSec = processedThisBatch > 0 && syncTime > 0
@@ -356,22 +417,18 @@ export class SyncEngine {
         blocksPerSecond: batchBlocksPerSec.toFixed(1),
       });
 
-      // Force FULL GC after every batch to prevent long-term heap drift
-      logMemory('batch-end-pre-gc', true);
+      // Force GC
+      logMemory('batch-end');
       if (typeof global.gc === 'function') {
-        global.gc(true); // true = full GC, not just incremental
+        global.gc(true);
       }
-      logMemory('batch-end-post-gc', true);
 
       await this.blockIndexer.setSyncingStatus(false, chainHeight);
-
-      // Update metrics
       this.lastSyncTime = Date.now();
 
-      // If still far behind, schedule next sync batch
+      // Continue syncing if still behind
       const stillBehind = chainHeight - lastHeight > safetyBuffer;
       if (stillBehind) {
-        // Use setImmediate to allow event loop to breathe between batches
         setImmediate(() => {
           this.sync().catch(err => {
             logger.warn('Continuous sync error', { error: err.message });
@@ -393,46 +450,99 @@ export class SyncEngine {
    */
   private async checkForReorg(currentHeight: number): Promise<void> {
     try {
-      // Get last indexed block hash from database
       const syncState = await this.blockIndexer.getSyncState();
       const dbHash = syncState.lastBlockHash;
+      const dbHeight = syncState.currentHeight;
 
       if (!dbHash) return;
 
-      // Get current block hash from RPC
-      const rpcHash = await this.rpc.getBlockHash(currentHeight);
+      // Skip if dbHash is the empty/default hash
+      if (dbHash === '0000000000000000000000000000000000000000000000000000000000000000') {
+        return;
+      }
 
-      // If hashes match, no reorg
+      // CRITICAL: Use the height from sync_state, not the passed-in height
+      // The passed-in height might not match the height that lastBlockHash corresponds to
+      // This can happen if sync_state wasn't updated correctly or there's a race condition
+      if (dbHeight !== currentHeight) {
+        logger.debug('Skipping reorg check - height mismatch', {
+          passedHeight: currentHeight,
+          syncStateHeight: dbHeight,
+          syncStateHash: dbHash?.slice(0, 16),
+        });
+        return;
+      }
+
+      let rpcHash: string;
+      try {
+        rpcHash = await this.rpc.getBlockHash(dbHeight);
+      } catch (rpcError: any) {
+        // Block may not exist yet or daemon may not have it
+        // This is NOT a reorg - just wait for next sync cycle
+        logger.debug('Skipping reorg check - block not available from daemon', {
+          height: currentHeight,
+          error: rpcError.message,
+        });
+        return;
+      }
+
       if (dbHash === rpcHash) {
         return;
       }
 
+      // Before declaring reorg, double-check that this isn't just a timing issue
+      // Wait a moment and retry the hash check
+      await new Promise(r => setTimeout(r, 1000));
+
+      try {
+        const retryHash = await this.rpc.getBlockHash(currentHeight);
+        if (dbHash === retryHash) {
+          logger.debug('Reorg false positive resolved on retry', { height: currentHeight });
+          return;
+        }
+        rpcHash = retryHash;
+      } catch {
+        // If retry fails, skip reorg check entirely
+        logger.debug('Skipping reorg check - block unavailable on retry', { height: currentHeight });
+        return;
+      }
+
+      // Log full details to debug false positive reorgs
+      const syncStateDebug = await this.blockIndexer.getSyncState();
       logger.warn('Reorg detected!', {
         height: currentHeight,
         dbHash,
         rpcHash,
+        syncStateHeight: syncStateDebug.currentHeight,
+        syncStateHash: syncStateDebug.lastBlockHash,
       });
 
       // Find common ancestor
       let commonAncestor = currentHeight - 1;
       let foundCommonAncestor = false;
-      for (let i = 1; i <= this.config.maxReorgDepth; i++) {
+
+      for (let i = 1; i <= this.config!.maxReorgDepth; i++) {
         const height = currentHeight - i;
         if (height < 0) break;
 
-        const result = await this.db.query(
-          'SELECT hash FROM blocks WHERE height = $1',
-          [height]
-        );
+        // FINAL for ReplacingMergeTree (blocks)
+        const result = await this.ch.queryOne<{ hash: string }>(`
+          SELECT hash FROM blocks FINAL
+          WHERE height = {height:UInt32} AND is_valid = 1
+        `, { height });
 
-        if (result.rows.length === 0) {
+        if (!result) break;
+
+        let rpcBlockHash: string;
+        try {
+          rpcBlockHash = await this.rpc.getBlockHash(height);
+        } catch {
+          // Block not available, can't determine common ancestor
+          logger.warn('Block not available from daemon during reorg search', { height });
           break;
         }
 
-        const dbBlockHash = result.rows[0].hash;
-        const rpcBlockHash = await this.rpc.getBlockHash(height);
-
-        if (dbBlockHash === rpcBlockHash) {
+        if (result.hash === rpcBlockHash) {
           commonAncestor = height;
           foundCommonAncestor = true;
           break;
@@ -440,10 +550,13 @@ export class SyncEngine {
       }
 
       if (!foundCommonAncestor) {
-        throw new SyncError('Failed to find common ancestor within max reorg depth', {
+        // Don't throw - just log and wait for next sync cycle
+        // This can happen during daemon sync when blocks are being reorganized internally
+        logger.warn('Could not find common ancestor - will retry on next sync cycle', {
           currentHeight,
-          maxDepth: this.config.maxReorgDepth,
+          maxDepth: this.config!.maxReorgDepth,
         });
+        return;
       }
 
       logger.info('Reorg common ancestor found', {
@@ -451,17 +564,17 @@ export class SyncEngine {
         blocksToRollback: currentHeight - commonAncestor,
       });
 
-      // Rollback to common ancestor
       await this.handleReorg(commonAncestor, currentHeight, dbHash, rpcHash);
 
     } catch (error: any) {
-      logger.error('Reorg check failed', { error: error.message });
-      throw error;
+      // Don't rethrow - log and continue
+      // Reorg check failures should not stop the sync engine
+      logger.error('Reorg check failed (will retry on next cycle)', { error: error.message });
     }
   }
 
   /**
-   * Handle blockchain reorganization
+   * Handle blockchain reorganization using ClickHouse soft deletes
    */
   private async handleReorg(
     commonAncestor: number,
@@ -475,106 +588,39 @@ export class SyncEngine {
       blocksAffected: currentHeight - commonAncestor,
     });
 
-    await this.db.transaction(async (client) => {
-      // Get affected addresses from both unspent and spent tables
-      // PHASE 3: JOIN addresses table since address_id replaces address column
-      const affectedAddressRows = await client.query(
-        `SELECT DISTINCT a.address FROM (
-           SELECT address_id FROM utxos_unspent WHERE block_height > $1
-           UNION
-           SELECT address_id FROM utxos_spent WHERE block_height > $1 OR spent_block_height > $1
-         ) combined
-         JOIN addresses a ON combined.address_id = a.id`,
-        [commonAncestor]
-      );
-
-      const affectedAddresses = new Set<string>();
-      for (const row of affectedAddressRows.rows) {
-        if (row.address) {
-          affectedAddresses.add(row.address);
-        }
-      }
-
-      // Log reorg event
-      await client.query(
-        `INSERT INTO reorgs (from_height, to_height, common_ancestor, old_hash, new_hash, blocks_affected)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [currentHeight, commonAncestor, commonAncestor, oldHash, newHash, currentHeight - commonAncestor]
-      );
-
-      // Move UTXOs that were spent in rolled-back blocks back to unspent table
-      // Step 1: Insert back into utxos_unspent from utxos_spent
-      // PHASE 3: Use address_id instead of address column
-      await client.query(
-        `INSERT INTO utxos_unspent (txid, vout, address_id, value, script_pubkey, script_type, block_height, created_at)
-         SELECT txid, vout, address_id, value, script_pubkey, script_type, block_height, created_at
-         FROM utxos_spent
-         WHERE spent_block_height > $1
-         ON CONFLICT (txid, vout) DO NOTHING`,
-        [commonAncestor]
-      );
-
-      // Step 2: Delete from utxos_spent
-      await client.query(
-        'DELETE FROM utxos_spent WHERE spent_block_height > $1',
-        [commonAncestor]
-      );
-
-      // Delete UTXOs created in rolled-back blocks from utxos_unspent
-      await client.query(
-        'DELETE FROM utxos_unspent WHERE block_height > $1',
-        [commonAncestor]
-      );
-
-      // Delete transactions from rolled-back blocks
-      await client.query(
-        'DELETE FROM transactions WHERE block_height > $1',
-        [commonAncestor]
-      );
-
-      // Delete rolled-back blocks
-      await client.query(
-        'DELETE FROM blocks WHERE height > $1',
-        [commonAncestor]
-      );
-
-      // Delete supply stats from rolled-back blocks
-      await client.query(
-        'DELETE FROM supply_stats WHERE block_height > $1',
-        [commonAncestor]
-      );
-
-      // Update sync state
-      const lastValidBlock = await client.query(
-        'SELECT hash FROM blocks WHERE height = $1',
-        [commonAncestor]
-      );
-
-      if (lastValidBlock.rows.length > 0) {
-        await client.query(
-          `UPDATE sync_state
-           SET current_height = $1,
-               last_block_hash = $2,
-               last_sync_time = NOW()
-           WHERE id = 1`,
-          [commonAncestor, lastValidBlock.rows[0].hash]
-        );
-      } else {
-        await client.query(
-          `UPDATE sync_state
-           SET current_height = $1,
-               last_block_hash = NULL,
-               last_sync_time = NOW()
-           WHERE id = 1`,
-          [commonAncestor]
-        );
-      }
-
-      // Recalculate address summaries for affected addresses
-      for (const address of affectedAddresses) {
-        await client.query('SELECT update_address_summary($1)', [address]);
-      }
+    // Record the reorg
+    await recordReorg(this.ch, {
+      fromHeight: currentHeight,
+      toHeight: commonAncestor,
+      commonAncestor,
+      oldHash,
+      newHash,
+      blocksAffected: currentHeight - commonAncestor,
     });
+
+    // Invalidate data from rolled-back blocks (soft delete using is_valid = 0)
+    await invalidateFromHeight(this.ch, commonAncestor + 1);
+
+    // Clear cross-batch UTXO cache to avoid stale data from rolled-back blocks
+    this.blockIndexer.clearCrossBatchUtxoCache();
+
+    // Update sync state - FINAL for ReplacingMergeTree (blocks)
+    const lastValidBlock = await this.ch.queryOne<{ hash: string }>(`
+      SELECT hash FROM blocks FINAL
+      WHERE height = {height:UInt32} AND is_valid = 1
+    `, { height: commonAncestor });
+
+    await updateSyncState(this.ch, {
+      currentHeight: commonAncestor,
+      chainHeight: currentHeight,
+      syncPercentage: 0,
+      lastBlockHash: lastValidBlock?.hash || '',
+      isSyncing: true,
+      blocksPerSecond: 0,
+    });
+
+    // Reset in-memory height tracking to the rollback point
+    this.lastKnownHeight = commonAncestor;
 
     logger.info('Reorg handled successfully', {
       rolledBackTo: commonAncestor,
@@ -594,14 +640,14 @@ export class SyncEngine {
   }
 
   /**
-   * Get block indexer instance for backfill operations
+   * Get block indexer instance
    */
-  getBlockIndexer(): BlockIndexer {
+  getBlockIndexer(): ClickHouseBlockIndexer {
     return this.blockIndexer;
   }
 
   /**
-   * Force sync now (bypasses interval)
+   * Force sync now
    */
   async syncNow(): Promise<void> {
     if (!this.isRunning) {
@@ -611,34 +657,30 @@ export class SyncEngine {
   }
 
   /**
-   * Verify supply accuracy against daemon at specific height
-   * Compares both transparent and shielded pool values
+   * Verify supply accuracy against daemon
    */
   private async verifySupplyAccuracy(height: number): Promise<void> {
     try {
-      // Get daemon's blockchain info at current height
       const chainInfo = await this.rpc.getBlockchainInfo();
 
-      // Only verify if daemon is at or past this height
       if (chainInfo.blocks < height) {
-        logger.debug('Skipping supply verification - daemon not at height yet', {
-          daemonHeight: chainInfo.blocks,
-          verifyHeight: height
-        });
         return;
       }
 
-      // Get indexer's calculated transparent supply from utxos_unspent table
-      const result = await this.db.getPool().query(`
+      // Get indexer's calculated supply from ClickHouse
+      const result = await this.ch.queryOne<{
+        transparent_supply: string;
+        utxo_count: string;
+      }>(`
         SELECT
-          SUM(value)::numeric / 100000000 as transparent_supply,
-          COUNT(*) as utxo_count
-        FROM utxos_unspent
-        WHERE block_height <= $1
-      `, [height]);
+          toString(sum(value)) as transparent_supply,
+          toString(count()) as utxo_count
+        FROM utxos FINAL
+        WHERE block_height <= {height:UInt32} AND spent = 0
+      `, { height });
 
-      const indexerTransparent = parseFloat(result.rows[0]?.transparent_supply || '0');
-      const utxoCount = parseInt(result.rows[0]?.utxo_count || '0');
+      const indexerTransparent = parseFloat(result?.transparent_supply || '0') / 1e8;
+      const utxoCount = parseInt(result?.utxo_count || '0');
 
       // Get daemon's value pools
       const valuePools = chainInfo.valuePools || [];
@@ -647,27 +689,23 @@ export class SyncEngine {
       const daemonSprout = valuePools.find((p: any) => p.id === 'sprout')?.chainValue || 0;
       const daemonShielded = daemonSapling + daemonSprout;
 
-      // Calculate discrepancy
       const transparentDiff = indexerTransparent - daemonTransparent;
       const transparentDiffPercent = daemonTransparent > 0
         ? (Math.abs(transparentDiff) / daemonTransparent * 100).toFixed(4)
         : '0';
 
-      // Get shielded supply from supply_stats table (if exists)
-      const shieldedResult = await this.db.getPool().query(`
-        SELECT shielded_pool as shielded_supply
-        FROM supply_stats
-        WHERE block_height = (
-          SELECT MAX(block_height) FROM supply_stats WHERE block_height <= $1
-        )
-      `, [height]).catch(() => ({ rows: [{ shielded_supply: null }] }));
+      // Get shielded supply from supply_stats - FINAL for ReplacingMergeTree
+      const shieldedResult = await this.ch.queryOne<{ shielded_pool: string }>(`
+        SELECT shielded_pool
+        FROM supply_stats FINAL
+        WHERE block_height <= {height:UInt32}
+        ORDER BY block_height DESC
+        LIMIT 1
+      `, { height });
 
-      // Convert from satoshis to FLUX for comparison with daemon
-      const indexerShieldedSats = parseFloat(shieldedResult.rows[0]?.shielded_supply || '0');
-      const indexerShielded = indexerShieldedSats / 1e8;
+      const indexerShielded = parseFloat(shieldedResult?.shielded_pool || '0') / 1e8;
       const shieldedDiff = indexerShielded - daemonShielded;
 
-      // Log comparison
       const logLevel = Math.abs(transparentDiff) > 1.0 ? 'warn' : 'info';
 
       logger[logLevel](`Supply verification at height ${height}`, {
@@ -676,14 +714,12 @@ export class SyncEngine {
           daemon: daemonTransparent.toFixed(8),
           difference: transparentDiff.toFixed(8),
           diffPercent: `${transparentDiffPercent}%`,
-          utxoCount: utxoCount
+          utxoCount
         },
         shielded: {
           indexer: indexerShielded.toFixed(8),
           daemon: daemonShielded.toFixed(8),
           difference: shieldedDiff.toFixed(8),
-          sapling: daemonSapling.toFixed(8),
-          sprout: daemonSprout.toFixed(8)
         },
         total: {
           indexer: (indexerTransparent + indexerShielded).toFixed(8),
@@ -691,13 +727,11 @@ export class SyncEngine {
         }
       });
 
-      // Alert if significant discrepancy (>1 FLUX)
       if (Math.abs(transparentDiff) > 1.0) {
         logger.error('⚠️  SUPPLY DISCREPANCY DETECTED', {
           height,
           transparentDiff: transparentDiff.toFixed(8),
           percentOff: `${transparentDiffPercent}%`,
-          message: 'Indexer transparent supply does not match daemon!'
         });
       }
 

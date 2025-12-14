@@ -251,11 +251,12 @@ export class FluxRPCClient {
    * Get raw transaction
    * @param txid - Transaction ID
    * @param verbose - If true, returns JSON; if false, returns hex
-   * @param blockhash - Optional block hash to help locate the transaction
+   * Note: Flux daemon doesn't support blockhash parameter, requires txindex=1 for reliable lookups
    */
-  async getRawTransaction(txid: string, verbose: boolean = true, blockhash?: string): Promise<Transaction | string> {
-    const params = blockhash ? [txid, verbose, blockhash] : [txid, verbose];
-    return this.call('getrawtransaction', params);
+  async getRawTransaction(txid: string, verbose: boolean = true): Promise<Transaction | string> {
+    // Convert boolean to integer for better daemon compatibility
+    const verboseInt = verbose ? 1 : 0;
+    return this.call('getrawtransaction', [txid, verboseInt]);
   }
 
   /**

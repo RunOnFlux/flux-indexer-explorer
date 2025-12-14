@@ -36,7 +36,7 @@ Beautiful real-time monitoring dashboard for FluxIndexer built with Next.js and 
 ### Prerequisites
 
 - Node.js 20+
-- FluxIndexer running on http://localhost:3002
+- FluxIndexer running on http://127.0.0.1:42067
 
 ### Installation
 
@@ -48,7 +48,7 @@ npm install
 npm run dev
 ```
 
-Dashboard will be available at http://localhost:3003
+Dashboard will be available at http://127.0.0.1:3003
 
 ### Production Build
 
@@ -66,7 +66,7 @@ Create `.env.local` file:
 
 ```env
 # FluxIndexer API URL
-NEXT_PUBLIC_API_URL=http://localhost:3002
+NEXT_PUBLIC_API_URL=http://127.0.0.1:42067
 ```
 
 ## Features Overview
@@ -144,7 +144,7 @@ const interval = setInterval(fetchData, 10000) // 10 seconds
 
 ## Deployment
 
-> **Production:** Dashboard is automatically bundled with FluxIndexer. Just run `docker-compose up -d` from the main flux-indexer directory and access the dashboard at `http://localhost:3002/`
+> **Production:** Dashboard is automatically bundled with FluxIndexer. Just run `docker-compose up -d` from the main flux-indexer directory and access the dashboard at `http://127.0.0.1:42067/`
 
 ### Development Only
 
@@ -155,13 +155,13 @@ cd frontend
 npm install
 
 # Create .env.local
-echo "NEXT_PUBLIC_API_URL=http://localhost:3002" > .env.local
+echo "NEXT_PUBLIC_API_URL=http://127.0.0.1:42067" > .env.local
 
 # Start dev server
 npm run dev
 ```
 
-Dashboard runs on `http://localhost:3003` in development mode.
+Dashboard runs on `http://127.0.0.1:3003` in development mode.
 
 ## Customization
 
@@ -178,7 +178,7 @@ const interval = setInterval(fetchData, 5000) // 5 seconds
 Update `.env.local`:
 
 ```env
-NEXT_PUBLIC_API_URL=http://your-indexer-api:3002
+NEXT_PUBLIC_API_URL=http://your-indexer-api:42067
 ```
 
 ### Modify Theme

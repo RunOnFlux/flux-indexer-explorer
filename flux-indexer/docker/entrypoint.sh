@@ -1,13 +1,258 @@
 #!/bin/sh
 set -e
 
-echo "FluxIndexer container starting..."
+echo "=============================================="
+echo "FluxIndexer Container Starting"
+echo "=============================================="
 
 # Create log directory
 mkdir -p /var/log/supervisor
 
-# Generate flux.conf directly
-echo "Configuring Flux daemon..."
+#######################################
+# SECTION 1: ClickHouse Bootstrap
+#######################################
+
+# ClickHouse connection settings
+CH_HOST="${CH_HOST:-clickhouse}"
+CH_PORT="${CH_PORT:-9000}"
+CH_HTTP_PORT="${CH_HTTP_PORT:-8123}"
+CH_DATABASE="${CH_DATABASE:-fluxindexer}"
+CH_USER="${CH_USER:-fluxindexer}"
+CH_PASSWORD="${CH_PASSWORD:-}"
+
+# Build clickhouse-client connection string
+ch_client() {
+  clickhouse-client \
+    --host="$CH_HOST" \
+    --port="$CH_PORT" \
+    --user="$CH_USER" \
+    --password="$CH_PASSWORD" \
+    --database="$CH_DATABASE" \
+    "$@"
+}
+
+# Wait for ClickHouse to be ready (up to 30 minutes for initial startup)
+wait_for_clickhouse() {
+  echo ""
+  echo "[ClickHouse] Waiting for ClickHouse to be ready..."
+
+  max_attempts=180  # 30 minutes at 10 second intervals
+  attempt=1
+
+  while [ $attempt -le $max_attempts ]; do
+    if ch_client --query="SELECT 1" >/dev/null 2>&1; then
+      echo "[ClickHouse] Connected successfully!"
+      return 0
+    fi
+
+    if [ $((attempt % 6)) -eq 0 ]; then
+      elapsed=$((attempt * 10 / 60))
+      echo "[ClickHouse] Still waiting... (${elapsed} minutes elapsed)"
+    fi
+
+    sleep 10
+    attempt=$((attempt + 1))
+  done
+
+  echo "[ClickHouse] ERROR: Could not connect to ClickHouse after 30 minutes"
+  echo "[ClickHouse] Check that ClickHouse container is running and healthy"
+  exit 1
+}
+
+# Check if ClickHouse needs bootstrap (no block data)
+# Note: Schema is created by the indexer application, not by ClickHouse init scripts
+# Bootstrap restores a full backup including schema and data
+clickhouse_needs_bootstrap() {
+  # First check if the blocks table exists in our database
+  table_exists=$(ch_client --query="SELECT count() FROM system.tables WHERE database='$CH_DATABASE' AND name='blocks'" 2>/dev/null || echo "0")
+
+  if [ "$table_exists" = "0" ]; then
+    echo "[ClickHouse] No blocks table found - bootstrap needed (fresh database)"
+    return 0  # Needs bootstrap
+  fi
+
+  # Check if there's any block data
+  block_count=$(ch_client --query="SELECT count() FROM $CH_DATABASE.blocks" 2>/dev/null || echo "0")
+
+  if [ "$block_count" = "0" ]; then
+    echo "[ClickHouse] No block data found - bootstrap needed"
+    return 0  # Needs bootstrap
+  else
+    echo "[ClickHouse] Found $block_count blocks in database"
+    return 1  # Already has data
+  fi
+}
+
+# Download and restore ClickHouse bootstrap
+bootstrap_clickhouse() {
+  local bootstrap_url="$1"
+  # Shared volume: mounted at /clickhouse-backup in indexer, /var/lib/clickhouse/backup in ClickHouse
+  local backup_dir="/clickhouse-backup"
+  local ch_backup_path="/var/lib/clickhouse/backup"  # Path as seen by ClickHouse server
+  local backup_name="fluxindexer_bootstrap"
+
+  echo ""
+  echo "[ClickHouse Bootstrap] Starting database bootstrap..."
+  echo "[ClickHouse Bootstrap] URL: $bootstrap_url"
+
+  # Create backup directory if it doesn't exist
+  mkdir -p "$backup_dir"
+
+  # Determine file type and download
+  case "$bootstrap_url" in
+    *.tar.gz|*.tgz)
+      echo "[ClickHouse Bootstrap] Detected tar.gz format"
+      local archive_file="$backup_dir/bootstrap.tar.gz"
+
+      echo "[ClickHouse Bootstrap] Downloading bootstrap archive..."
+      if ! wget --timeout=0 --tries=3 --no-check-certificate -q --show-progress -O "$archive_file" "$bootstrap_url"; then
+        echo "[ClickHouse Bootstrap] ERROR: Failed to download bootstrap"
+        return 1
+      fi
+
+      echo "[ClickHouse Bootstrap] Extracting archive..."
+      mkdir -p "$backup_dir/$backup_name"
+      if ! tar -xzf "$archive_file" -C "$backup_dir/$backup_name" --strip-components=0; then
+        echo "[ClickHouse Bootstrap] ERROR: Failed to extract archive"
+        rm -f "$archive_file"
+        return 1
+      fi
+
+      # Cleanup archive immediately to free space
+      rm -f "$archive_file"
+      echo "[ClickHouse Bootstrap] Archive extracted and cleaned up"
+      ;;
+
+    *.zip)
+      echo "[ClickHouse Bootstrap] Detected zip format"
+      local archive_file="$backup_dir/bootstrap.zip"
+
+      echo "[ClickHouse Bootstrap] Downloading bootstrap archive..."
+      if ! wget --timeout=0 --tries=3 --no-check-certificate -q --show-progress -O "$archive_file" "$bootstrap_url"; then
+        echo "[ClickHouse Bootstrap] ERROR: Failed to download bootstrap"
+        return 1
+      fi
+
+      echo "[ClickHouse Bootstrap] Extracting archive..."
+      mkdir -p "$backup_dir/$backup_name"
+      if ! unzip -q "$archive_file" -d "$backup_dir/$backup_name"; then
+        echo "[ClickHouse Bootstrap] ERROR: Failed to extract archive"
+        rm -f "$archive_file"
+        return 1
+      fi
+
+      rm -f "$archive_file"
+      echo "[ClickHouse Bootstrap] Archive extracted and cleaned up"
+      ;;
+
+    *)
+      echo "[ClickHouse Bootstrap] WARNING: Unknown format. Supported: .tar.gz, .tgz, .zip"
+      return 1
+      ;;
+  esac
+
+  # Find the actual backup directory (handle nested directories)
+  # ClickHouse backups have a .backup file at the root
+  local actual_backup_dir="$backup_dir/$backup_name"
+  if [ ! -f "$actual_backup_dir/.backup" ]; then
+    # Check one level deeper
+    for subdir in "$actual_backup_dir"/*; do
+      if [ -d "$subdir" ] && [ -f "$subdir/.backup" ]; then
+        actual_backup_dir="$subdir"
+        break
+      fi
+    done
+  fi
+
+  if [ ! -f "$actual_backup_dir/.backup" ]; then
+    echo "[ClickHouse Bootstrap] ERROR: Invalid backup format - missing .backup metadata"
+    rm -rf "$backup_dir/$backup_name"
+    return 1
+  fi
+
+  echo "[ClickHouse Bootstrap] Found valid backup at: $actual_backup_dir"
+
+  # Compute the path relative to backup_dir to get the subpath for ClickHouse
+  local relative_path="${actual_backup_dir#$backup_dir/}"
+  local ch_restore_path="$ch_backup_path/$relative_path"
+
+  echo "[ClickHouse Bootstrap] ClickHouse restore path: $ch_restore_path"
+
+  # Restore the backup using RESTORE command
+  echo "[ClickHouse Bootstrap] Restoring database..."
+
+  # First, ensure the database exists
+  ch_client --query="CREATE DATABASE IF NOT EXISTS $CH_DATABASE" 2>/dev/null || true
+
+  # Run RESTORE command with allow_non_empty_tables for idempotency
+  # The path must be as seen by ClickHouse server, not the indexer container
+  local restore_query="RESTORE DATABASE $CH_DATABASE FROM File('$ch_restore_path') SETTINGS allow_non_empty_tables=true"
+
+  if ch_client --query="$restore_query" 2>&1; then
+    echo "[ClickHouse Bootstrap] Database restored successfully!"
+
+    # Verify restoration
+    local restored_blocks=$(ch_client --query="SELECT count() FROM blocks" 2>/dev/null || echo "0")
+    echo "[ClickHouse Bootstrap] Verified: $restored_blocks blocks in database"
+
+    # Cleanup backup files to free space
+    echo "[ClickHouse Bootstrap] Cleaning up backup files..."
+    rm -rf "$backup_dir/$backup_name"
+
+    return 0
+  else
+    echo "[ClickHouse Bootstrap] ERROR: RESTORE command failed"
+    rm -rf "$backup_dir/$backup_name"
+    return 1
+  fi
+}
+
+# Main ClickHouse bootstrap logic
+if [ -n "$CH_BOOTSTRAP_URL" ]; then
+  echo ""
+  echo "=============================================="
+  echo "ClickHouse Bootstrap Configuration Detected"
+  echo "=============================================="
+
+  # Wait for ClickHouse to be ready first
+  wait_for_clickhouse
+
+  # Check if bootstrap is needed
+  if clickhouse_needs_bootstrap; then
+    if [ "$FORCE_CH_BOOTSTRAP" = "true" ]; then
+      echo "[ClickHouse] FORCE_CH_BOOTSTRAP=true - proceeding with bootstrap"
+    fi
+
+    if bootstrap_clickhouse "$CH_BOOTSTRAP_URL"; then
+      echo "[ClickHouse Bootstrap] Bootstrap completed successfully!"
+    else
+      echo "[ClickHouse Bootstrap] Bootstrap failed - indexer will sync from scratch"
+      echo "[ClickHouse Bootstrap] This will take longer but data will still be indexed"
+    fi
+  else
+    if [ "$FORCE_CH_BOOTSTRAP" = "true" ]; then
+      echo "[ClickHouse] FORCE_CH_BOOTSTRAP=true detected, but data exists"
+      echo "[ClickHouse] Clear ClickHouse volume to force re-bootstrap"
+    fi
+    echo "[ClickHouse] Skipping bootstrap - database already has data"
+  fi
+else
+  echo ""
+  echo "[ClickHouse] No CH_BOOTSTRAP_URL set - will sync from scratch or use existing data"
+
+  # Still wait for ClickHouse to verify connectivity
+  wait_for_clickhouse
+fi
+
+#######################################
+# SECTION 2: Flux Daemon Configuration
+#######################################
+
+echo ""
+echo "=============================================="
+echo "Configuring Flux Daemon"
+echo "=============================================="
+
 # Set defaults
 FLUX_RPC_USER=${FLUX_RPC_USER:-fluxrpc}
 FLUX_RPC_PASSWORD=${FLUX_RPC_PASSWORD:-fluxrpc2024}
@@ -39,13 +284,19 @@ EOF
 # Set proper permissions
 chown -R flux:flux /home/flux/.flux
 
-# Setup Zcash parameters (pre-downloaded during Docker build or download if missing)
+#######################################
+# SECTION 3: Zcash Parameters
+#######################################
+
+echo ""
+echo "[Zcash Params] Checking Zcash parameters..."
+
 ZCASH_PARAMS_DIR="/home/flux/.zcash-params"
 mkdir -p "$ZCASH_PARAMS_DIR"
 
 # Copy pre-downloaded params from build stage if they exist
 if [ -d "/root/.zcash-params" ] && [ "$(ls -A /root/.zcash-params 2>/dev/null)" ]; then
-  echo "Copying pre-downloaded Zcash parameters from build stage..."
+  echo "[Zcash Params] Copying pre-downloaded parameters from build stage..."
   cp -r /root/.zcash-params/* "$ZCASH_PARAMS_DIR/"
   chown -R flux:flux "$ZCASH_PARAMS_DIR"
 fi
@@ -81,8 +332,8 @@ check_param_file "$ZCASH_PARAMS_DIR/sapling-output.params" "$SAPLING_OUTPUT_MIN"
 check_param_file "$ZCASH_PARAMS_DIR/sprout-groth16.params" "$SPROUT_GROTH16_MIN" || need_download=1
 
 if [ "$need_download" -eq 1 ]; then
-  echo "Downloading Zcash parameters (first time only, ~900MB)..."
-  echo "This may take several minutes depending on your connection..."
+  echo "[Zcash Params] Downloading Zcash parameters (first time only, ~900MB)..."
+  echo "[Zcash Params] This may take several minutes depending on your connection..."
 
   cd "$ZCASH_PARAMS_DIR"
 
@@ -140,163 +391,103 @@ if [ "$need_download" -eq 1 ]; then
   fi
 
   chown -R flux:flux "$ZCASH_PARAMS_DIR"
-  echo "Zcash parameters downloaded and validated successfully!"
+  echo "[Zcash Params] Parameters downloaded and validated successfully!"
 else
-  echo "Zcash parameters already present and validated, skipping download."
+  echo "[Zcash Params] All parameters present and validated."
 fi
 
-# Bootstrap handling
-# Support two bootstrap types:
-# 1. BOOTSTRAP_URL: Flux blockchain bootstrap (blocks/chainstate)
-# 2. DB_BOOTSTRAP_URL: PostgreSQL database dump bootstrap
+#######################################
+# SECTION 4: Flux Daemon Bootstrap
+#######################################
+
 FLUX_DATA_DIR="/home/flux/.flux"
 
 if [ -n "$BOOTSTRAP_URL" ]; then
-  echo "Bootstrap URL provided: $BOOTSTRAP_URL"
+  echo ""
+  echo "=============================================="
+  echo "Flux Daemon Bootstrap Configuration Detected"
+  echo "=============================================="
+  echo "[Daemon Bootstrap] URL: $BOOTSTRAP_URL"
 
   # Check if blockchain data already exists
   if [ -d "$FLUX_DATA_DIR/blocks" ] && [ "$(ls -A $FLUX_DATA_DIR/blocks 2>/dev/null)" ]; then
-    echo "Blockchain data already exists. Skipping bootstrap download."
-    echo "To force bootstrap, clear the volume or set FORCE_BOOTSTRAP=true"
+    echo "[Daemon Bootstrap] Blockchain data already exists."
 
     if [ "$FORCE_BOOTSTRAP" = "true" ]; then
-      echo "FORCE_BOOTSTRAP=true detected. Clearing existing blockchain data..."
+      echo "[Daemon Bootstrap] FORCE_BOOTSTRAP=true - clearing existing data..."
       rm -rf "$FLUX_DATA_DIR/blocks" "$FLUX_DATA_DIR/chainstate" "$FLUX_DATA_DIR/database"
     else
-      echo "Proceeding with existing blockchain data."
+      echo "[Daemon Bootstrap] Skipping bootstrap - using existing data."
+      echo "[Daemon Bootstrap] Set FORCE_BOOTSTRAP=true to force re-download."
     fi
   fi
 
   # Download and extract bootstrap if needed
   if [ ! -d "$FLUX_DATA_DIR/blocks" ] || [ -z "$(ls -A $FLUX_DATA_DIR/blocks 2>/dev/null)" ]; then
-    echo "Downloading blockchain bootstrap from $BOOTSTRAP_URL..."
-    echo "This may take a while depending on file size and network speed..."
+    echo "[Daemon Bootstrap] Downloading blockchain bootstrap..."
+    echo "[Daemon Bootstrap] This may take a while depending on file size and network speed..."
 
     cd /tmp
 
     # Detect file extension for proper extraction
     case "$BOOTSTRAP_URL" in
       *.tar.gz|*.tgz)
-        echo "Detected tar.gz format"
+        echo "[Daemon Bootstrap] Detected tar.gz format"
         if wget --timeout=0 --tries=3 --no-check-certificate -q --show-progress -O bootstrap.tar.gz "$BOOTSTRAP_URL"; then
-          echo "Extracting blockchain bootstrap..."
+          echo "[Daemon Bootstrap] Extracting blockchain bootstrap..."
           tar -xzf bootstrap.tar.gz -C "$FLUX_DATA_DIR"
           rm -f bootstrap.tar.gz
           chown -R flux:flux "$FLUX_DATA_DIR"
-          echo "Blockchain bootstrap extracted successfully!"
+          echo "[Daemon Bootstrap] Bootstrap extracted successfully!"
         else
-          echo "ERROR: Failed to download blockchain bootstrap from $BOOTSTRAP_URL"
-          echo "Continuing with normal sync from genesis..."
+          echo "[Daemon Bootstrap] ERROR: Failed to download bootstrap"
+          echo "[Daemon Bootstrap] Continuing with normal sync from genesis..."
         fi
         ;;
       *.zip)
-        echo "Detected zip format"
+        echo "[Daemon Bootstrap] Detected zip format"
         if wget --timeout=0 --tries=3 --no-check-certificate -q --show-progress -O bootstrap.zip "$BOOTSTRAP_URL"; then
-          echo "Extracting blockchain bootstrap..."
+          echo "[Daemon Bootstrap] Extracting blockchain bootstrap..."
           unzip -q bootstrap.zip -d "$FLUX_DATA_DIR"
           rm -f bootstrap.zip
           chown -R flux:flux "$FLUX_DATA_DIR"
-          echo "Blockchain bootstrap extracted successfully!"
+          echo "[Daemon Bootstrap] Bootstrap extracted successfully!"
         else
-          echo "ERROR: Failed to download blockchain bootstrap"
-          echo "Continuing with normal sync from genesis..."
+          echo "[Daemon Bootstrap] ERROR: Failed to download bootstrap"
+          echo "[Daemon Bootstrap] Continuing with normal sync from genesis..."
         fi
         ;;
       *)
-        echo "WARNING: Unknown bootstrap format. Supported: .tar.gz, .tgz, .zip"
-        echo "Continuing with normal sync from genesis..."
+        echo "[Daemon Bootstrap] WARNING: Unknown format. Supported: .tar.gz, .tgz, .zip"
+        echo "[Daemon Bootstrap] Continuing with normal sync from genesis..."
         ;;
     esac
   fi
+else
+  echo ""
+  echo "[Daemon Bootstrap] No BOOTSTRAP_URL set - will sync from genesis or use existing data"
 fi
 
-# Database bootstrap handling
-if [ -n "$DB_BOOTSTRAP_URL" ]; then
-  echo "Database bootstrap URL provided: $DB_BOOTSTRAP_URL"
+#######################################
+# SECTION 5: Start Services
+#######################################
 
-  # Wait for PostgreSQL to be ready
-  echo "Waiting for PostgreSQL to be ready..."
-  max_attempts=30
-  attempt=0
-  while ! pg_isready -h "${DB_HOST:-postgres}" -p "${DB_PORT:-5432}" -U "${DB_USER:-fluxindexer}" >/dev/null 2>&1; do
-    attempt=$((attempt + 1))
-    if [ $attempt -ge $max_attempts ]; then
-      echo "WARNING: PostgreSQL not ready after ${max_attempts} attempts. Skipping DB bootstrap."
-      break
-    fi
-    echo "  PostgreSQL not ready yet, waiting... (attempt $attempt/$max_attempts)"
-    sleep 2
-  done
-
-  if pg_isready -h "${DB_HOST:-postgres}" -p "${DB_PORT:-5432}" -U "${DB_USER:-fluxindexer}" >/dev/null 2>&1; then
-    # Check if database is already populated with DATA (not just schema)
-    # Check if blocks table exists and has data
-    block_count=$(PGPASSWORD="${DB_PASSWORD}" psql -h "${DB_HOST:-postgres}" -p "${DB_PORT:-5432}" -U "${DB_USER:-fluxindexer}" -d "${DB_NAME:-fluxindexer}" -t -c "SELECT COUNT(*) FROM blocks;" 2>/dev/null | tr -d ' ' || echo "0")
-
-    if [ "$block_count" -gt 0 ] && [ "$FORCE_BOOTSTRAP" != "true" ]; then
-      echo "Database already populated with $block_count blocks. Skipping DB bootstrap."
-      echo "To force DB bootstrap, set FORCE_BOOTSTRAP=true"
-    else
-      echo "Downloading database bootstrap from $DB_BOOTSTRAP_URL..."
-
-      cd /tmp
-
-      # Detect file format from URL
-      if echo "$DB_BOOTSTRAP_URL" | grep -q '\.pgdump$'; then
-        # PostgreSQL custom format dump - use pg_restore
-        echo "Detected PostgreSQL custom format dump (.pgdump)"
-        if wget --timeout=0 --tries=3 --no-check-certificate -q --show-progress -O db_bootstrap.pgdump "$DB_BOOTSTRAP_URL"; then
-          echo "Restoring database from custom format dump..."
-          PGPASSWORD="${DB_PASSWORD}" pg_restore \
-            --host="${DB_HOST:-postgres}" \
-            --port="${DB_PORT:-5432}" \
-            --username="${DB_USER:-fluxindexer}" \
-            --dbname="${DB_NAME:-fluxindexer}" \
-            --clean \
-            --if-exists \
-            --no-owner \
-            --no-acl \
-            --verbose \
-            db_bootstrap.pgdump
-          rm -f db_bootstrap.pgdump
-          echo "Database bootstrap restored successfully!"
-        else
-          echo "ERROR: Failed to download database bootstrap from $DB_BOOTSTRAP_URL"
-          echo "Continuing with empty database (migrations will run)..."
-        fi
-      elif echo "$DB_BOOTSTRAP_URL" | grep -q '\.sql\.gz$'; then
-        # Gzipped SQL dump - decompress and pipe to psql
-        echo "Detected gzipped SQL dump (.sql.gz)"
-        if wget --timeout=0 --tries=3 --no-check-certificate -q --show-progress -O db_bootstrap.sql.gz "$DB_BOOTSTRAP_URL"; then
-          echo "Restoring database from SQL dump..."
-          gunzip -c db_bootstrap.sql.gz | PGPASSWORD="${DB_PASSWORD}" psql -h "${DB_HOST:-postgres}" -p "${DB_PORT:-5432}" -U "${DB_USER:-fluxindexer}" -d "${DB_NAME:-fluxindexer}"
-          rm -f db_bootstrap.sql.gz
-          echo "Database bootstrap restored successfully!"
-        else
-          echo "ERROR: Failed to download database bootstrap from $DB_BOOTSTRAP_URL"
-          echo "Continuing with empty database (migrations will run)..."
-        fi
-      else
-        # Unknown format
-        echo "ERROR: Unsupported database bootstrap format. Expected .pgdump or .sql.gz"
-        echo "Continuing with empty database (migrations will run)..."
-      fi
-    fi
-  fi
-fi
-
-# Display configuration info
-echo "Flux daemon configuration:"
+echo ""
+echo "=============================================="
+echo "Configuration Summary"
+echo "=============================================="
+echo "Flux Daemon:"
 echo "  RPC Port: 16124"
-echo "  RPC User: ${FLUX_RPC_USER:-fluxrpc}"
-echo "  Data directory: /home/flux/.flux"
+echo "  RPC User: ${FLUX_RPC_USER}"
+echo "  Data Directory: /home/flux/.flux"
 echo ""
-echo "FluxIndexer configuration:"
-echo "  API Port: ${API_PORT:-3002}"
-echo "  Database: ${DB_HOST:-postgres}:${DB_PORT:-5432}"
-echo "  Flux RPC: http://localhost:16124"
+echo "FluxIndexer:"
+echo "  API Port: ${API_PORT:-42067}"
+echo "  ClickHouse: ${CH_HOST}:${CH_HTTP_PORT}"
+echo "  Database: ${CH_DATABASE}"
 echo ""
 
-# Start supervisord
-echo "Starting services (fluxd + fluxindexer)..."
+echo "=============================================="
+echo "Starting Services (fluxd + fluxindexer)"
+echo "=============================================="
 exec /usr/bin/supervisord -n -c /etc/supervisord.conf
