@@ -4,6 +4,11 @@
     Tuned for 14GB RAM container - merge operations can spike to 12-15GB
     -->
 
+    <!-- Allow backups from the shared backup volume -->
+    <backups>
+        <allowed_path>/var/lib/clickhouse/backup/</allowed_path>
+    </backups>
+
     <!-- Server-level memory settings -->
     <max_server_memory_usage>12000000000</max_server_memory_usage>
 
