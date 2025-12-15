@@ -50,7 +50,7 @@
     "date-fns": "^4.1.0",
     "ky": "^1.11.0",
     "lucide-react": "^0.545.0",
-    "next": "14.2.33",
+    "next": "14.2.35",
     "qrcode.react": "^4.2.0",
     "react": "^18",
     "react-day-picker": "^9.11.1",
