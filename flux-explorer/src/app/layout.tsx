@@ -19,20 +19,11 @@ export const metadata: Metadata = {
     title: "Flux Explorer - Blockchain Explorer for Flux Network",
     description: "Modern, high-performance blockchain explorer for Flux - Real-time network monitoring, transaction tracking, and FluxNode analytics",
     type: "website",
-    images: [
-      {
-        url: "/flux-logo.svg",
-        width: 256,
-        height: 256,
-        alt: "Flux Logo",
-      },
-    ],
   },
   twitter: {
     card: "summary",
     title: "Flux Explorer",
     description: "Modern blockchain explorer for Flux network",
-    images: ["/flux-logo.svg"],
   },
 };
 
