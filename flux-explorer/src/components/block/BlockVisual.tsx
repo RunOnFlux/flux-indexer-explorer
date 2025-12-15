@@ -26,14 +26,14 @@ export function BlockVisual({ block }: BlockVisualProps) {
   const avgTxSize = block.size / txCountForAverage;
 
   return (
-    <Card>
+    <Card className="overflow-visible">
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <Info className="h-5 w-5" />
           Block Visualization
         </CardTitle>
       </CardHeader>
-      <CardContent className="space-y-6">
+      <CardContent className="space-y-6 overflow-visible">
         <div className="space-y-2">
           <div className="flex items-center justify-between text-sm">
             <span className="font-medium">Block Fullness</span>
@@ -73,7 +73,7 @@ export function BlockVisual({ block }: BlockVisualProps) {
             </div>
           ) : (
             <>
-              <div className="flex flex-wrap gap-0.5">
+              <div className="flex flex-wrap gap-0.5 overflow-visible">
                 {txDetails.map((detail, index) => {
                   let bgColor = "bg-orange-500";
                   let tooltip = `Transaction ${index + 1}`;
@@ -111,15 +111,17 @@ export function BlockVisual({ block }: BlockVisualProps) {
 
                   const prev = txDetails[index - 1];
                   const shouldAddGap = fluxNode && prev && !isFluxNodeKind(prev.kind);
+                  // Position tooltip to the right for first few items to prevent left cutoff
+                  const isLeftEdge = index < 3;
 
                   return (
                     <div
                       key={detail.txid}
                       className={`relative group h-3 w-3 rounded-sm ${bgColor} cursor-help transition-transform hover:scale-125 flex-shrink-0 ${shouldAddGap ? "ml-4" : ""}`}
                     >
-                      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-popover text-popover-foreground text-xs rounded border shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 whitespace-nowrap z-50 pointer-events-none">
+                      <div className={`absolute bottom-full mb-2 px-2 py-1 bg-popover text-popover-foreground text-xs rounded border shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 whitespace-nowrap z-50 pointer-events-none ${isLeftEdge ? "left-0" : "left-1/2 -translate-x-1/2"}`}>
                         {tooltip}
-                        <div className="absolute top-full left-1/2 -translate-x-1/2 -mt-1 border-4 border-transparent border-t-popover"></div>
+                        <div className={`absolute top-full -mt-1 border-4 border-transparent border-t-popover ${isLeftEdge ? "left-1" : "left-1/2 -translate-x-1/2"}`}></div>
                       </div>
                     </div>
                   );

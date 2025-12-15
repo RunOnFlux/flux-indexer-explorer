@@ -77,8 +77,8 @@ export function RecentBlockRewards() {
             </div>
 
             {/* Reward Recipients */}
-            <div className="space-y-2">
-              <h4 className="text-xs font-medium text-[var(--flux-text-muted)] uppercase tracking-wider mb-3">
+            <div className="space-y-3">
+              <h4 className="text-xs font-medium text-[var(--flux-text-muted)] uppercase tracking-wider">
                 Distribution
               </h4>
               {rewards.map((reward, i) => {
@@ -87,14 +87,14 @@ export function RecentBlockRewards() {
                   <Link
                     key={`${latestReward.height}-${reward.address}-${i}`}
                     href={linkTarget}
-                    className="flex items-center justify-between p-3 rounded-lg hover:bg-white/[0.03] transition-all duration-200 border border-[var(--flux-border)] group"
+                    className="flex items-center justify-between p-4 rounded-lg hover:bg-white/[0.03] transition-all duration-200 border border-[var(--flux-border)] group"
                   >
                     <div className="flex items-center gap-3">
-                      <div className={`w-1 h-10 rounded-full ${reward.color}`} />
+                      <div className={`w-1.5 h-12 rounded-full ${reward.color}`} />
                       <div className="min-w-0">
                         <Badge
                           variant="outline"
-                          className="mb-1 text-[10px]"
+                          className="mb-1.5 text-xs font-medium"
                           style={{
                             color: reward.color.includes('pink') ? 'var(--tier-cumulus)' :
                                    reward.color.includes('purple') ? 'var(--tier-nimbus)' :
@@ -108,13 +108,13 @@ export function RecentBlockRewards() {
                         >
                           {reward.tier}
                         </Badge>
-                        <p className="text-xs font-mono text-[var(--flux-text-muted)] truncate max-w-[200px] group-hover:text-[var(--flux-text-secondary)] transition-colors">
+                        <p className="text-sm font-mono text-[var(--flux-text-muted)] truncate max-w-[200px] group-hover:text-[var(--flux-text-secondary)] transition-colors">
                           {reward.address.substring(0, 12)}...{reward.address.substring(Math.max(reward.address.length - 8, 0))}
                         </p>
                       </div>
                     </div>
-                    <div className="flex items-center gap-1.5 text-sm font-mono font-bold text-[var(--flux-text-primary)]">
-                      <Coins className="h-3.5 w-3.5 text-[var(--flux-gold)]" />
+                    <div className="flex items-center gap-2 text-sm font-mono font-bold text-[var(--flux-text-primary)]">
+                      <Coins className="h-4 w-4 text-[var(--flux-gold)]" />
                       {reward.amount.toFixed(8)}
                     </div>
                   </Link>
