@@ -93,6 +93,7 @@
   html {
     color-scheme: dark;
     scroll-behavior: smooth;
+    overflow-x: hidden;
   }
 
   body {
@@ -100,6 +101,7 @@
     font-family: 'Outfit', system-ui, sans-serif;
     background: var(--flux-bg-deep);
     min-height: 100vh;
+    overflow-x: hidden;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
