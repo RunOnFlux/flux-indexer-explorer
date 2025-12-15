@@ -13,7 +13,7 @@ export function Footer() {
           {/* Links */}
           <div className="flex flex-wrap items-center justify-center gap-3 sm:gap-6">
             <a
-              href="https://runonflux.io"
+              href="https://runonflux.com"
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center gap-1.5 text-xs text-[var(--flux-text-muted)] hover:text-[var(--flux-cyan)] transition-colors"
@@ -22,7 +22,7 @@ export function Footer() {
               Flux Network
             </a>
             <a
-              href="https://github.com/Sikbik/flux-blockchain-explorer"
+              href="https://github.com/RunOnFlux/flux-indexer-explorer"
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center gap-1.5 text-xs text-[var(--flux-text-muted)] hover:text-[var(--flux-cyan)] transition-colors"
@@ -31,7 +31,7 @@ export function Footer() {
               GitHub
             </a>
             <a
-              href="https://github.com/Sikbik/flux-blockchain-explorer/issues"
+              href="https://github.com/RunOnFlux/flux-indexer-explorer/issues"
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center gap-1.5 text-xs text-[var(--flux-text-muted)] hover:text-[var(--flux-cyan)] transition-colors"

@@ -276,6 +276,6 @@ MIT License
 
 ## Links
 
-- [Flux Network](https://runonflux.io/)
+- [Flux Network](https://runonflux.com/)
 - [ClickHouse](https://clickhouse.com/)
-- [Issues](https://github.com/Sikbik/flux-blockchain-explorer/issues)
+- [Issues](https://github.com/RunOnFlux/flux-indexer-explorer/issues)

@@ -15,7 +15,7 @@ Complete guide for deploying FluxIndexer with ClickHouse to production.
 ### 1. Clone and Navigate
 
 ```bash
-git clone https://github.com/Sikbik/flux-blockchain-explorer.git
+git clone https://github.com/RunOnFlux/flux-indexer-explorer.git
 cd flux-blockchain-explorer
 ```
 
@@ -655,6 +655,6 @@ ClickHouse performs background merge operations to optimize storage and query pe
 
 ## Support
 
-- **GitHub Issues:** https://github.com/Sikbik/flux-blockchain-explorer/issues
+- **GitHub Issues:** https://github.com/RunOnFlux/flux-indexer-explorer/issues
 - **Flux Discord:** https://discord.com/invite/runonflux
 - **Documentation:** See README.md

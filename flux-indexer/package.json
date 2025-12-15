@@ -24,11 +24,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Sikbik/flux-blockchain-explorer.git"
+    "url": "https://github.com/RunOnFlux/flux-indexer-explorer.git"
   },
-  "homepage": "https://github.com/Sikbik/flux-blockchain-explorer#readme",
+  "homepage": "https://github.com/RunOnFlux/flux-indexer-explorer#readme",
   "bugs": {
-    "url": "https://github.com/Sikbik/flux-blockchain-explorer/issues"
+    "url": "https://github.com/RunOnFlux/flux-indexer-explorer/issues"
   },
   "dependencies": {
     "@clickhouse/client": "^1.8.1",

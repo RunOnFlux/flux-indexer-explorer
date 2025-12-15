@@ -74,7 +74,7 @@ Three-component stack:
 ### Deploy
 
 ```bash
-git clone https://github.com/Sikbik/flux-blockchain-explorer.git
+git clone https://github.com/RunOnFlux/flux-indexer-explorer.git
 cd flux-blockchain-explorer
 
 docker compose -f docker-compose.production.yml up -d
@@ -233,6 +233,6 @@ MIT License
 
 ## Links
 
-- [Flux Network](https://runonflux.io/)
+- [Flux Network](https://runonflux.com/)
 - [Flux Documentation](https://docs.runonflux.io)
 - [ClickHouse](https://clickhouse.com/)

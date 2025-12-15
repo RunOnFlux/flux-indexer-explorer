@@ -85,7 +85,7 @@ Complete guide for deploying Flux Explorer on the Flux network.
 
 ```bash
 # Clone the repository
-git clone https://github.com/Sikbik/flux-blockchain-explorer.git
+git clone https://github.com/RunOnFlux/flux-indexer-explorer.git
 cd flux-blockchain-explorer/flux-explorer
 
 # Build and run with Docker Compose
@@ -562,10 +562,10 @@ While not critical, consider these improvements for production:
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/Sikbik/flux-blockchain-explorer/issues)
-- **Repository**: [https://github.com/Sikbik/flux-blockchain-explorer](https://github.com/Sikbik/flux-blockchain-explorer)
+- **Issues**: [GitHub Issues](https://github.com/RunOnFlux/flux-indexer-explorer/issues)
+- **Repository**: [https://github.com/RunOnFlux/flux-indexer-explorer](https://github.com/RunOnFlux/flux-indexer-explorer)
 - **Security**: Report vulnerabilities via GitHub Issues
-- **Flux Support**: https://runonflux.io/
+- **Flux Support**: https://runonflux.com/
 - **Documentation**: Check [README.md](README.md)
 
 ---

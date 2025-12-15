@@ -345,16 +345,16 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Links
 
-- **GitHub Repository**: [https://github.com/Sikbik/flux-blockchain-explorer](https://github.com/Sikbik/flux-blockchain-explorer)
-- **Flux Website**: [https://runonflux.io/](https://runonflux.io/)
+- **GitHub Repository**: [https://github.com/RunOnFlux/flux-indexer-explorer](https://github.com/RunOnFlux/flux-indexer-explorer)
+- **Flux Website**: [https://runonflux.com/](https://runonflux.com/)
 - **Flux GitHub**: [https://github.com/RunOnFlux](https://github.com/RunOnFlux)
 - **FluxIndexer**: Located in [`../flux-indexer`](../flux-indexer)
 - **ClickHouse**: [https://clickhouse.com/](https://clickhouse.com/)
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/Sikbik/flux-blockchain-explorer/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/Sikbik/flux-blockchain-explorer/discussions)
+- **Issues**: [GitHub Issues](https://github.com/RunOnFlux/flux-indexer-explorer/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/RunOnFlux/flux-indexer-explorer/discussions)
 - **Flux Discord**: [https://discord.com/invite/runonflux](https://discord.com/invite/runonflux)
 
 ---
