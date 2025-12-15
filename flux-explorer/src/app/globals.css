@@ -1,91 +1,519 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-@layer utilities {
-  .text-balance {
-    text-wrap: balance;
-  }
-
-  .bg-grid-pattern {
-    background-image:
-      linear-gradient(to right, rgb(0 0 0 / 0.05) 1px, transparent 1px),
-      linear-gradient(to bottom, rgb(0 0 0 / 0.05) 1px, transparent 1px);
-    background-size: 24px 24px;
-  }
-
-  .dark .bg-grid-pattern {
-    background-image:
-      linear-gradient(to right, rgb(255 255 255 / 0.05) 1px, transparent 1px),
-      linear-gradient(to bottom, rgb(255 255 255 / 0.05) 1px, transparent 1px);
-  }
-}
-
-
+/* ========================================
+   FLUX EXPLORER - Electric Cosmos Theme
+   ======================================== */
 
 @layer base {
   :root {
-    --background: 222 26% 14%;
+    /* Core Flux Brand Colors */
+    --flux-cyan: #38e8ff;
+    --flux-cyan-rgb: 56, 232, 255;
+    --flux-purple: #a855f7;
+    --flux-purple-rgb: 168, 85, 247;
+    --flux-blue: #3b82f6;
+    --flux-orange: #fb923c;
+    --flux-green: #22c55e;
+    --flux-gold: #fbbf24;
+
+    /* Background Layers */
+    --flux-bg-deep: #020617;
+    --flux-bg-surface: #0f172a;
+    --flux-bg-elevated: #1e293b;
+
+    /* Text Hierarchy */
+    --flux-text-primary: #f1f5f9;
+    --flux-text-secondary: #cbd5e1;
+    --flux-text-muted: #94a3b8;
+    --flux-text-dim: #64748b;
+
+    /* Borders & Lines */
+    --flux-border: rgba(56, 232, 255, 0.12);
+    --flux-border-hover: rgba(56, 232, 255, 0.3);
+    --flux-border-strong: rgba(56, 232, 255, 0.5);
+
+    /* Glow Effects */
+    --flux-glow-cyan: 0 0 20px rgba(56, 232, 255, 0.3), 0 0 40px rgba(56, 232, 255, 0.15);
+    --flux-glow-purple: 0 0 20px rgba(168, 85, 247, 0.3), 0 0 40px rgba(168, 85, 247, 0.15);
+    --flux-glow-soft: 0 0 40px rgba(56, 232, 255, 0.1);
+
+    /* Glass Effect */
+    --flux-glass-bg: rgba(15, 23, 42, 0.7);
+    --flux-glass-border: rgba(255, 255, 255, 0.06);
+
+    /* Tier Colors (match Tailwind pink/purple/blue scheme) */
+    --tier-cumulus: #ec4899;
+    --tier-nimbus: #a855f7;
+    --tier-stratus: #3b82f6;
+
+    /* shadcn/ui Token Mapping */
+    --background: 222 47% 3%;
     --foreground: 210 40% 96%;
-    --card: 222 26% 16%;
+    --card: 222 47% 6%;
     --card-foreground: 210 40% 96%;
-    --popover: 222 26% 16%;
+    --popover: 222 47% 5%;
     --popover-foreground: 210 40% 96%;
-    --primary: 217 91% 60%;
-    --primary-foreground: 222 26% 10%;
-    --secondary: 222 26% 20%;
+    --primary: 187 100% 61%;
+    --primary-foreground: 222 47% 5%;
+    --secondary: 222 47% 12%;
     --secondary-foreground: 210 40% 96%;
-    --muted: 222 26% 20%;
+    --muted: 222 47% 12%;
     --muted-foreground: 215 20% 65%;
-    --accent: 199 89% 48%;
+    --accent: 270 91% 65%;
     --accent-foreground: 210 40% 98%;
-    --destructive: 0 84.2% 60.2%;
+    --destructive: 0 84% 60%;
     --destructive-foreground: 210 40% 98%;
-    --border: 222 26% 24%;
-    --input: 222 26% 20%;
-    --ring: 217 91% 60%;
-    --chart-1: 217 91% 60%;
-    --chart-2: 199 89% 48%;
-    --chart-3: 188 94% 45%;
-    --chart-4: 198 70% 50%;
-    --chart-5: 186 76% 53%;
-    --radius: 0.5rem;
+    --border: 222 47% 14%;
+    --input: 222 47% 10%;
+    --ring: 187 100% 61%;
+    --chart-1: 187 100% 61%;
+    --chart-2: 270 91% 65%;
+    --chart-3: 217 91% 60%;
+    --chart-4: 142 71% 45%;
+    --chart-5: 38 92% 50%;
+    --radius: 0.75rem;
   }
+
+  /* Dark mode is the default and only mode */
   .dark {
-    --background: 222 47% 8%;
-    --foreground: 210 40% 98%;
-    --card: 222 47% 11%;
-    --card-foreground: 210 40% 98%;
-    --popover: 222 47% 11%;
-    --popover-foreground: 210 40% 98%;
-    --primary: 217 91% 65%;
-    --primary-foreground: 222 47% 8%;
-    --secondary: 222 47% 15%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 222 47% 15%;
-    --muted-foreground: 215 20% 70%;
-    --accent: 199 89% 48%;
-    --accent-foreground: 210 40% 98%;
-    --destructive: 0 62.8% 50%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 222 47% 18%;
-    --input: 222 47% 15%;
-    --ring: 217 91% 65%;
-    --chart-1: 217 91% 65%;
-    --chart-2: 199 89% 48%;
-    --chart-3: 188 94% 45%;
-    --chart-4: 198 70% 50%;
-    --chart-5: 186 76% 53%;
+    --background: 222 47% 3%;
+    --foreground: 210 40% 96%;
   }
 }
-
-
 
 @layer base {
   * {
     @apply border-border;
   }
+
+  html {
+    color-scheme: dark;
+    scroll-behavior: smooth;
+  }
+
   body {
     @apply bg-background text-foreground;
+    font-family: 'Outfit', system-ui, sans-serif;
+    background: var(--flux-bg-deep);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
+
+  /* Typography defaults */
+  h1, h2, h3, h4, h5, h6 {
+    font-family: 'Outfit', system-ui, sans-serif;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: var(--flux-text-primary);
+  }
+
+  code, pre, .font-mono {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+  }
+}
+
+/* ========================================
+   Background Effects
+   ======================================== */
+
+@layer utilities {
+  /* Main cosmic background */
+  .flux-bg-cosmic {
+    background:
+      radial-gradient(ellipse 80% 50% at 50% -20%, rgba(56, 232, 255, 0.08) 0%, transparent 50%),
+      radial-gradient(ellipse 60% 40% at 80% 100%, rgba(168, 85, 247, 0.06) 0%, transparent 40%),
+      radial-gradient(ellipse 50% 30% at 10% 90%, rgba(251, 146, 60, 0.04) 0%, transparent 30%),
+      linear-gradient(180deg, #020617 0%, #0a0f1e 50%, #050b16 100%);
+  }
+
+  /* Grid pattern overlay */
+  .flux-grid-pattern {
+    background-image:
+      linear-gradient(to right, rgba(56, 232, 255, 0.03) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(56, 232, 255, 0.03) 1px, transparent 1px);
+    background-size: 60px 60px;
+    mask-image: radial-gradient(ellipse 70% 50% at center, black 20%, transparent 70%);
+  }
+
+  /* Noise texture overlay */
+  .flux-noise {
+    position: relative;
+  }
+
+  .flux-noise::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+    opacity: 0.03;
+    pointer-events: none;
+    mix-blend-mode: overlay;
+  }
+}
+
+/* ========================================
+   Glass Effects
+   ======================================== */
+
+@layer utilities {
+  .flux-glass {
+    background: var(--flux-glass-bg);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid var(--flux-glass-border);
+  }
+
+  .flux-glass-strong {
+    background: rgba(15, 23, 42, 0.85);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    border: 1px solid rgba(56, 232, 255, 0.1);
+  }
+
+  .flux-glass-card {
+    background: linear-gradient(135deg, rgba(255, 255, 255, 0.03) 0%, rgba(255, 255, 255, 0.01) 100%);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--flux-border);
+    box-shadow:
+      0 4px 24px rgba(0, 0, 0, 0.3),
+      inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  }
+
+  .flux-glass-card:hover {
+    border-color: var(--flux-border-hover);
+    box-shadow:
+      0 8px 32px rgba(0, 0, 0, 0.4),
+      0 0 40px rgba(56, 232, 255, 0.08),
+      inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+}
+
+/* ========================================
+   Glow & Border Effects
+   ======================================== */
+
+@layer utilities {
+  .flux-glow {
+    box-shadow: var(--flux-glow-cyan);
+  }
+
+  .flux-glow-purple {
+    box-shadow: var(--flux-glow-purple);
+  }
+
+  .flux-glow-soft {
+    box-shadow: var(--flux-glow-soft);
+  }
+
+  .flux-border-glow {
+    border: 1px solid var(--flux-border);
+    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .flux-border-glow:hover {
+    border-color: var(--flux-border-strong);
+    box-shadow: 0 0 30px rgba(56, 232, 255, 0.15);
+  }
+
+  /* Electric border animation */
+  .flux-electric-border {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .flux-electric-border::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: linear-gradient(90deg,
+      transparent 0%,
+      var(--flux-cyan) 20%,
+      var(--flux-purple) 50%,
+      var(--flux-cyan) 80%,
+      transparent 100%
+    );
+    background-size: 200% 100%;
+    animation: flux-electric-flow 3s linear infinite;
+    opacity: 0.6;
+  }
+
+  .flux-electric-border:hover::before {
+    opacity: 1;
+  }
+}
+
+/* ========================================
+   Text Effects
+   ======================================== */
+
+@layer utilities {
+  .flux-text-gradient {
+    background: linear-gradient(135deg, var(--flux-cyan) 0%, var(--flux-purple) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .flux-text-chrome {
+    background: linear-gradient(180deg,
+      #ffffff 0%,
+      #e0f7ff 40%,
+      var(--flux-cyan) 100%
+    );
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3));
+  }
+
+  .flux-text-glow {
+    text-shadow:
+      0 0 10px rgba(56, 232, 255, 0.5),
+      0 0 20px rgba(56, 232, 255, 0.3),
+      0 0 40px rgba(56, 232, 255, 0.15);
+  }
+
+  .flux-text-glow-purple {
+    text-shadow:
+      0 0 10px rgba(168, 85, 247, 0.5),
+      0 0 20px rgba(168, 85, 247, 0.3);
+  }
+}
+
+/* ========================================
+   Animations
+   ======================================== */
+
+@keyframes flux-electric-flow {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+@keyframes flux-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+@keyframes flux-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-8px); }
+}
+
+@keyframes flux-glow-pulse {
+  0%, 100% {
+    box-shadow: 0 0 20px rgba(56, 232, 255, 0.3), 0 0 40px rgba(56, 232, 255, 0.15);
+  }
+  50% {
+    box-shadow: 0 0 30px rgba(56, 232, 255, 0.5), 0 0 60px rgba(56, 232, 255, 0.25);
+  }
+}
+
+@keyframes flux-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes flux-fade-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes flux-slide-in {
+  from { opacity: 0; transform: translateX(-20px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes flux-scale-in {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes flux-spin-slow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@layer utilities {
+  .animate-flux-pulse {
+    animation: flux-pulse 2s ease-in-out infinite;
+  }
+
+  .animate-flux-float {
+    animation: flux-float 4s ease-in-out infinite;
+  }
+
+  .animate-flux-glow {
+    animation: flux-glow-pulse 2s ease-in-out infinite;
+  }
+
+  .animate-flux-shimmer {
+    background: linear-gradient(90deg,
+      transparent 0%,
+      rgba(56, 232, 255, 0.1) 50%,
+      transparent 100%
+    );
+    background-size: 200% 100%;
+    animation: flux-shimmer 2s infinite;
+  }
+
+  .animate-flux-fade-in {
+    animation: flux-fade-in 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+
+  .animate-flux-slide-in {
+    animation: flux-slide-in 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+
+  .animate-flux-scale-in {
+    animation: flux-scale-in 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+
+  .animate-flux-spin-slow {
+    animation: flux-spin-slow 8s linear infinite;
+  }
+}
+
+/* ========================================
+   Component Utilities
+   ======================================== */
+
+@layer utilities {
+  /* Status indicators */
+  .flux-status-live {
+    position: relative;
+  }
+
+  .flux-status-live::before {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: -16px;
+    width: 8px;
+    height: 8px;
+    background: var(--flux-green);
+    border-radius: 50%;
+    transform: translateY(-50%);
+    box-shadow: 0 0 10px var(--flux-green), 0 0 20px var(--flux-green);
+    animation: flux-pulse 1.5s ease-in-out infinite;
+  }
+
+  /* Tier badges */
+  .flux-tier-cumulus {
+    background: rgba(236, 72, 153, 0.15);
+    border: 1px solid rgba(236, 72, 153, 0.3);
+    color: var(--tier-cumulus);
+  }
+
+  .flux-tier-nimbus {
+    background: rgba(168, 85, 247, 0.15);
+    border: 1px solid rgba(168, 85, 247, 0.3);
+    color: var(--tier-nimbus);
+  }
+
+  .flux-tier-stratus {
+    background: rgba(59, 130, 246, 0.15);
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    color: var(--tier-stratus);
+  }
+
+  /* Stat cards */
+  .flux-stat-card {
+    @apply flux-glass-card rounded-xl p-6 transition-all duration-300;
+  }
+
+  .flux-stat-card:hover {
+    transform: translateY(-2px);
+  }
+
+  /* Links */
+  .flux-link {
+    color: var(--flux-cyan);
+    transition: all 0.2s ease;
+    text-decoration: none;
+  }
+
+  .flux-link:hover {
+    color: #7df3ff;
+    text-shadow: 0 0 10px rgba(56, 232, 255, 0.4);
+  }
+
+  /* Scrollbar styling */
+  .flux-scrollbar::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  .flux-scrollbar::-webkit-scrollbar-track {
+    background: var(--flux-bg-deep);
+    border-radius: 4px;
+  }
+
+  .flux-scrollbar::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, var(--flux-cyan), var(--flux-purple));
+    border-radius: 4px;
+  }
+
+  .flux-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(180deg, #5eecff, #c084fc);
+  }
+}
+
+/* ========================================
+   Animation Delays
+   ======================================== */
+
+@layer utilities {
+  .animation-delay-100 { animation-delay: 100ms; }
+  .animation-delay-200 { animation-delay: 200ms; }
+  .animation-delay-300 { animation-delay: 300ms; }
+  .animation-delay-400 { animation-delay: 400ms; }
+  .animation-delay-500 { animation-delay: 500ms; }
+  .animation-delay-700 { animation-delay: 700ms; }
+  .animation-delay-1000 { animation-delay: 1000ms; }
+}
+
+/* ========================================
+   Responsive Utilities
+   ======================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Mobile touch optimization */
+@media (hover: none) {
+  .flux-glass-card:hover {
+    transform: none;
+    border-color: var(--flux-border);
+    box-shadow:
+      0 4px 24px rgba(0, 0, 0, 0.3),
+      inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  }
+}
+
+/* Selection color */
+::selection {
+  background: rgba(56, 232, 255, 0.3);
+  color: var(--flux-text-primary);
+}
+
+/* Focus visible for accessibility */
+:focus-visible {
+  outline: 2px solid var(--flux-cyan);
+  outline-offset: 2px;
 }
