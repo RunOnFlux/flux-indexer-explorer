@@ -1,7 +1,7 @@
 {
   "version": 8,
   "name": "fluxexplorer",
-  "description": "Flux Explorer - Full blockchain explorer with ClickHouse indexer. Storage: ~225GB total (120GB ClickHouse + 100GB daemon + 5GB explorer). RAM: 22GB+ total (ClickHouse 16GB + indexer 4GB + explorer 0.5GB). Set CH_BOOTSTRAP_URL and BOOTSTRAP_URL for faster deployment. Requires Flux v7.1.0+ for shared volume support.",
+  "description": "Flux Explorer - Full blockchain explorer with ClickHouse indexer. Storage: ~245GB total (140GB ClickHouse + 100GB daemon + 5GB explorer). RAM: ~20.5GB total (ClickHouse 12GB + indexer 8GB + explorer 0.5GB). Set CH_BOOTSTRAP_URL and BOOTSTRAP_URL for faster deployment. Requires Flux v7.1.0+ for shared volume support.",
   "owner": "YOUR_ZELID_HERE",
   "instances": 3,
   "staticip": false,
@@ -9,7 +9,7 @@
   "compose": [
     {
       "name": "clickhouse",
-      "description": "ClickHouse database (~61GB final, 120GB with bootstrap overhead). Needs 16GB+ RAM to handle merge spikes safely.",
+      "description": "ClickHouse database (~75GB final, 140GB with bootstrap overhead). 12GB RAM works for steady state; increase to 16GB if you hit merge/query memory spikes.",
       "repotag": "clickhouse/clickhouse-server:24.3-alpine",
       "ports": [8123],
       "containerPorts": [8123],
@@ -22,14 +22,14 @@
       ],
       "commands": [],
       "containerData": "/var/lib/clickhouse|m:backup:/var/lib/clickhouse/backup",
-      "cpu": 4.0,
-      "ram": 16384,
-      "hdd": 120,
+      "cpu": 2.0,
+      "ram": 12288,
+      "hdd": 140,
       "tiered": false
     },
     {
       "name": "indexer",
-      "description": "Flux daemon (fluxd) + blockchain indexer + REST API (~50GB final, 100GB with bootstrap overhead). Daemon uses ~1.5GB RAM, indexer ~1GB.",
+      "description": "Flux daemon (fluxd) + blockchain indexer + REST API (~45GB final, 100GB with bootstrap overhead). 8GB RAM recommended (daemon + Node.js indexer + buffering during sync).",
       "repotag": "littlestache/flux-indexer:latest",
       "ports": [42067],
       "containerPorts": [42067],
@@ -55,8 +55,8 @@
       ],
       "commands": [],
       "containerData": "/home/flux/.flux|c:0:backup:/clickhouse-backup",
-      "cpu": 4.0,
-      "ram": 4096,
+      "cpu": 2.0,
+      "ram": 8192,
       "hdd": 100,
       "tiered": false
     },
