@@ -148,6 +148,12 @@ export const richListLabels: RichListLabelDefinition[] = [
     note: "Cold wallet",
   },
   {
+    address: "t1eELWS8QBkhRfEF2LBZnxKwCQaWvZ8j8hU",
+    label: "NoNKYC Exchange",
+    category: "Exchange",
+    note: "Cold wallet",
+  },
+  {
     address: "t3c4EfxLoXXSRZCRnPRF3RpjPi9mBzF5yoJ",
     label: "Titan",
     category: "Shared Nodes",
@@ -155,6 +161,11 @@ export const richListLabels: RichListLabelDefinition[] = [
   {
     address: "t3gCppaQdKhCViBA2mtYMphmJmtKY4BbR7d",
     label: "FluxNode Operations",
+    category: "InFlux",
+  },
+  {
+    address: "t1XktDZ9Z1QiefMYE5nMFohe8VG2c2BD5A5",
+    label: "Fiat Payments",
     category: "InFlux",
   },
   {
