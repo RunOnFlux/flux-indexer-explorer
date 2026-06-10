@@ -326,6 +326,9 @@ export class ClickHouseAPIServer {
       this.getMempoolAddressDeltas.bind(this)
     );
     this.app.use('/insight-api', createInsightCompatibilityRouter(insightService));
+    this.app.use('/insight-api', (req, res) => {
+      res.status(404).json({ status: 404, url: req.originalUrl, error: 'Not found' });
+    });
 
     // Status endpoints
     this.app.get('/api/v1/status', this.getStatus.bind(this));
@@ -379,10 +382,6 @@ export class ClickHouseAPIServer {
     this.app.use(express.static(frontendPath));
 
     this.app.get('*', (req, res) => {
-      if (req.path.startsWith('/insight-api/')) {
-        return res.status(404).json({ status: 404, url: req.originalUrl, error: 'Not found' });
-      }
-
       if (req.path.startsWith('/api/') || req.path === '/health') {
         return res.status(404).json({ error: 'Not found' });
       }

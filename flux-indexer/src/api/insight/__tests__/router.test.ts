@@ -36,7 +36,7 @@ function createApp(serviceOverrides: Partial<MockInsightRouterService> = {}) {
 }
 
 describe('Insight server mount', () => {
-  test('mounts Insight compatibility routes without changing API 404 behavior', async () => {
+  function createServerApp() {
     const ch = {
       query: jest.fn(),
       queryOne: jest.fn(),
@@ -45,8 +45,11 @@ describe('Insight server mount', () => {
     const rpc = {} as unknown as ConstructorParameters<typeof ClickHouseAPIServer>[1];
     const syncEngine = {} as unknown as ConstructorParameters<typeof ClickHouseAPIServer>[2];
     const server = new ClickHouseAPIServer(ch, rpc, syncEngine, 0);
-    const app = server.getApp();
+    return server.getApp();
+  }
 
+  test('returns legacy 404 for unmatched Insight GET paths', async () => {
+    const app = createServerApp();
     await withTestServer(app, async (baseUrl) => {
       const insightResponse = await fetch(`${baseUrl}/insight-api/not-real`);
 
@@ -56,7 +59,40 @@ describe('Insight server mount', () => {
         url: '/insight-api/not-real',
         error: 'Not found',
       });
+    });
+  });
 
+  test('returns legacy 404 for unmatched Insight POST paths', async () => {
+    const app = createServerApp();
+    await withTestServer(app, async (baseUrl) => {
+      const insightResponse = await fetch(`${baseUrl}/insight-api/not-real`, { method: 'POST' });
+
+      expect(insightResponse.status).toBe(404);
+      await expect(readJson(insightResponse)).resolves.toEqual({
+        status: 404,
+        url: '/insight-api/not-real',
+        error: 'Not found',
+      });
+    });
+  });
+
+  test('returns legacy 404 for exact Insight mount path', async () => {
+    const app = createServerApp();
+    await withTestServer(app, async (baseUrl) => {
+      const insightResponse = await fetch(`${baseUrl}/insight-api`);
+
+      expect(insightResponse.status).toBe(404);
+      await expect(readJson(insightResponse)).resolves.toEqual({
+        status: 404,
+        url: '/insight-api',
+        error: 'Not found',
+      });
+    });
+  });
+
+  test('preserves API 404 body', async () => {
+    const app = createServerApp();
+    await withTestServer(app, async (baseUrl) => {
       const apiResponse = await fetch(`${baseUrl}/api/not-real`);
 
       expect(apiResponse.status).toBe(404);
