@@ -10,7 +10,14 @@ import type {
   InsightTxRow,
   InsightUtxoRow,
 } from './types';
-import { isValidHash, normalizeHash, parseBlockDate, parseLimit } from './utils';
+import {
+  isValidHash,
+  normalizeHash,
+  parseBlockDate,
+  parseLimit,
+  zatoshisToFluxString,
+  zatoshisToSafeNumber,
+} from './utils';
 
 export type InsightClickHouse = Pick<ClickHouseConnection, 'query' | 'queryOne'>;
 
@@ -63,6 +70,15 @@ export interface InsightListBlocksServiceResult {
   blockDate: ReturnType<typeof parseBlockDate> | null;
 }
 
+export type InsightStatisticSeriesKind =
+  | 'supply'
+  | 'fees'
+  | 'network-hash'
+  | 'transactions'
+  | 'outputs'
+  | 'difficulty'
+  | 'active-addresses';
+
 type VersionedInsightBlockRow = InsightBlockRow & { is_valid?: number };
 type VersionedInsightTxRow = InsightTxRow & { is_valid?: number };
 type InsightUtxoQueryRow = Omit<InsightUtxoRow, 'confirmations'> & {
@@ -91,6 +107,30 @@ const DEFAULT_MEMPOOL_DELTA = { balanceDelta: 0n, txCount: 0 };
 const RECENT_BLOCK_LOOKBACK_BUFFER = 250;
 const MAX_UTXO_ADDRESSES = 100;
 const MAX_UTXO_ROWS = 5000;
+const MAX_ADDRESS_TX_LIMIT = 50;
+const DEFAULT_STATISTIC_DAYS = 365;
+const MAX_STATISTIC_DAYS = 730;
+const SATOSHIS_PER_FLUX = 100000000n;
+const RICH_LIST_LIMIT = 200;
+const BALANCE_INTERVALS = [
+  { label: '0-1 FLUX', min: 1n, max: 1n * SATOSHIS_PER_FLUX },
+  { label: '1-10 FLUX', min: 1n * SATOSHIS_PER_FLUX, max: 10n * SATOSHIS_PER_FLUX },
+  { label: '10-100 FLUX', min: 10n * SATOSHIS_PER_FLUX, max: 100n * SATOSHIS_PER_FLUX },
+  { label: '100-1,000 FLUX', min: 100n * SATOSHIS_PER_FLUX, max: 1000n * SATOSHIS_PER_FLUX },
+  { label: '1,000-10,000 FLUX', min: 1000n * SATOSHIS_PER_FLUX, max: 10000n * SATOSHIS_PER_FLUX },
+  { label: '10,000+ FLUX', min: 10000n * SATOSHIS_PER_FLUX, max: null },
+] as const;
+const RICHER_THAN_THRESHOLDS = [
+  1n,
+  10n,
+  100n,
+  1000n,
+  10000n,
+  100000n,
+].map((flux) => ({
+  flux,
+  zatoshis: flux * SATOSHIS_PER_FLUX,
+}));
 
 export class InsightCompatibilityService {
   constructor(
@@ -357,6 +397,111 @@ export class InsightCompatibilityService {
     });
   }
 
+  async getTransactionsByBlock(blockHash: string): Promise<InsightTransactionServiceResult[]> {
+    const block = await this.getBlock(blockHash);
+    if (block === null) {
+      return [];
+    }
+
+    const transactions = await Promise.all(
+      block.txids.map((txid) => this.getTransaction(txid))
+    );
+
+    return transactions.filter(isPresent);
+  }
+
+  async getTransactionsByAddress(address: string): Promise<InsightTransactionServiceResult[]> {
+    const result = await this.getAddressTransactions([address], { from: 0, to: 10, limit: 10 });
+    return result.items;
+  }
+
+  async getAddressTransactions(
+    _addresses: string[],
+    range: { from: number; to: number; limit: number }
+  ): Promise<{ totalItems: number; items: InsightTransactionServiceResult[] }> {
+    const addresses = normalizeAddressList(_addresses);
+    if (addresses.length === 0) {
+      return { totalItems: 0, items: [] };
+    }
+
+    const offset = normalizeNonNegativeSafeInteger(range.from, 0);
+    const limit = normalizeRangeLimit(range.limit);
+    const [rows, countRow] = await Promise.all([
+      this.ch.query<{ txid: string }>(`
+        SELECT txid
+        FROM (
+          SELECT txid, max(block_height) AS block_height, min(tx_index) AS tx_index
+          FROM (
+            SELECT address, txid, block_height, tx_index, is_valid
+            FROM address_transactions
+            WHERE address IN {addresses:Array(String)}
+            ORDER BY address, txid, _version DESC
+            LIMIT 1 BY address, txid
+          )
+          WHERE is_valid = 1
+          GROUP BY txid
+        )
+        ORDER BY block_height DESC, tx_index ASC, txid ASC
+        LIMIT {limit:UInt32}
+        OFFSET {offset:UInt32}
+      `, { addresses, limit, offset }),
+      this.ch.queryOne<{ totalItems?: string | number; total_items?: string | number }>(`
+        SELECT toString(uniqExact(txid)) AS totalItems
+        FROM (
+          SELECT txid
+          FROM (
+            SELECT address, txid, is_valid
+            FROM address_transactions
+            WHERE address IN {addresses:Array(String)}
+            ORDER BY address, txid, _version DESC
+            LIMIT 1 BY address, txid
+          )
+          WHERE is_valid = 1
+        )
+      `, { addresses }),
+    ]);
+
+    const transactions = await Promise.all(
+      rows.map((row) => this.getTransaction(row.txid))
+    );
+
+    return {
+      totalItems: safeCount(countRow?.totalItems ?? countRow?.total_items),
+      items: transactions.filter(isPresent),
+    };
+  }
+
+  async getAddressBalanceSum(_addresses: string[]): Promise<{
+    balance: string | number;
+    unconfirmedBalance: string | number;
+    immature: string | number;
+  }> {
+    const addresses = normalizeAddressList(_addresses);
+    if (addresses.length === 0) {
+      return { balance: 0, unconfirmedBalance: 0, immature: 0 };
+    }
+
+    const [row, mempoolDeltas] = await Promise.all([
+      this.ch.queryOne<{ balance?: string | number }>(`
+        SELECT toString(sumMerge(balance)) AS balance
+        FROM address_summary_agg
+        WHERE address IN {addresses:Array(String)}
+      `, { addresses }),
+      this.getMempoolAddressDeltas(),
+    ]);
+
+    const confirmedBalance = BigInt(zatoshiString(row?.balance));
+    const unconfirmedBalance = addresses.reduce((sum, address) => (
+      sum + (mempoolDeltas.get(address)?.balanceDelta ?? 0n)
+    ), 0n);
+
+    return {
+      balance: zatoshisToSafeNumber(confirmedBalance + unconfirmedBalance),
+      unconfirmedBalance: zatoshisToSafeNumber(unconfirmedBalance),
+      immature: 0,
+    };
+  }
+
   async sendRawTransaction(_rawtx: string): Promise<string> {
     return this.rpc.sendRawTransaction(_rawtx);
   }
@@ -481,6 +626,258 @@ export class InsightCompatibilityService {
     return zatoshiString(row?.total_supply);
   }
 
+  async getStatisticSeries(kind: InsightStatisticSeriesKind, rawDays?: string): Promise<unknown[]> {
+    const days = parseStatisticDays(rawDays);
+
+    switch (kind) {
+      case 'supply':
+        return this.getSupplyStatisticSeries(days);
+      case 'fees':
+        return this.getFeeStatisticSeries(days);
+      case 'network-hash':
+        return this.getBlockStatisticSeries(days, 'network-hash');
+      case 'transactions':
+        return this.getTransactionCountStatisticSeries(days);
+      case 'outputs':
+        return this.getOutputStatisticSeries(days);
+      case 'difficulty':
+        return this.getBlockStatisticSeries(days, 'difficulty');
+      case 'active-addresses':
+        return this.getActiveAddressStatisticSeries(days);
+      default:
+        throw new Error(`Unsupported statistic series: ${kind}`);
+    }
+  }
+
+  async getStatisticsTotal(): Promise<{
+    n_blocks_mined: number;
+    time_between_blocks: number;
+    mined_currency_amount: string;
+    transaction_fees: string;
+    number_of_transactions: number;
+    outputs_volume: string;
+    difficulty: number;
+    network_hash_ps: number;
+    blocks_by_pool: Array<{ pool_name: string; blocks_found: number; percent_total: number }>;
+  }> {
+    const cutoff = Math.max(0, Math.floor(Date.now() / 1000) - 86400);
+    const [blockStats, txStats, poolRows] = await Promise.all([
+      this.ch.queryOne<{
+        n_blocks_mined?: string | number;
+        time_between_blocks?: string | number;
+        mined_currency_amount?: string | number;
+        difficulty?: string | number;
+      }>(`
+        SELECT
+          toString(count()) AS n_blocks_mined,
+          ifNull(avg(timestamp - previous_timestamp), 0) AS time_between_blocks,
+          toString(sum(producer_reward)) AS mined_currency_amount,
+          ifNull(avg(difficulty), 0) AS difficulty
+        FROM (
+          SELECT
+            height,
+            timestamp,
+            producer_reward,
+            difficulty,
+            lagInFrame(timestamp) OVER (ORDER BY height) AS previous_timestamp
+          FROM (
+            SELECT height, timestamp, producer_reward, difficulty, is_valid
+            FROM blocks
+            WHERE timestamp >= {cutoff:UInt32}
+            ORDER BY height, _version DESC
+            LIMIT 1 BY height
+          )
+          WHERE is_valid = 1
+        )
+        WHERE previous_timestamp > 0 OR previous_timestamp IS NULL
+      `, { cutoff }),
+      this.ch.queryOne<{
+        number_of_transactions?: string | number;
+        transaction_fees?: string | number;
+        outputs_volume?: string | number;
+      }>(`
+        SELECT
+          toString(count()) AS number_of_transactions,
+          toString(sum(fee)) AS transaction_fees,
+          toString(sum(output_total)) AS outputs_volume
+        FROM (
+          SELECT txid, fee, output_total, is_valid
+          FROM transactions
+          WHERE timestamp >= {cutoff:UInt32}
+          ORDER BY txid, _version DESC
+          LIMIT 1 BY txid
+        )
+        WHERE is_valid = 1
+      `, { cutoff }),
+      this.queryPoolRows({ cutoff }),
+    ]);
+    const blocksByPool = formatPoolRows(poolRows);
+
+    return {
+      n_blocks_mined: safeCount(blockStats?.n_blocks_mined),
+      time_between_blocks: finiteNumber(blockStats?.time_between_blocks),
+      mined_currency_amount: zatoshisToFluxString(zatoshiString(blockStats?.mined_currency_amount)),
+      transaction_fees: zatoshisToFluxString(zatoshiString(txStats?.transaction_fees)),
+      number_of_transactions: safeCount(txStats?.number_of_transactions),
+      outputs_volume: zatoshisToFluxString(zatoshiString(txStats?.outputs_volume)),
+      difficulty: finiteNumber(blockStats?.difficulty),
+      network_hash_ps: finiteNumber(blockStats?.difficulty),
+      blocks_by_pool: blocksByPool,
+    };
+  }
+
+  async getPools(dateRaw?: string): Promise<{
+    date: string;
+    n_blocks_mined: number;
+    blocks_by_pool: Array<{ pool_name: string; blocks_found: number; percent_total: number }>;
+    pagination: { current: string; next: string; prev: string };
+  }> {
+    const blockDate = parseBlockDate(dateRaw);
+    const rows = await this.queryPoolRows({ start: blockDate.start, end: blockDate.end });
+    const blocksByPool = formatPoolRows(rows);
+
+    return {
+      date: blockDate.current,
+      n_blocks_mined: blocksByPool.reduce((sum, pool) => sum + pool.blocks_found, 0),
+      blocks_by_pool: blocksByPool,
+      pagination: {
+        current: blockDate.current,
+        next: blockDate.next,
+        prev: blockDate.prev,
+      },
+    };
+  }
+
+  async getPoolsLastHour(): Promise<{
+    n_blocks_mined: number;
+    blocks_by_pool: Array<{ pool_name: string; blocks_found: number; percent_total: number }>;
+  }> {
+    const cutoff = Math.max(0, Math.floor(Date.now() / 1000) - 3600);
+    const blocksByPool = formatPoolRows(await this.queryPoolRows({ cutoff }));
+
+    return {
+      n_blocks_mined: blocksByPool.reduce((sum, pool) => sum + pool.blocks_found, 0),
+      blocks_by_pool: blocksByPool,
+    };
+  }
+
+  async getBalanceIntervals(): Promise<Array<{
+    interval: string;
+    min: string;
+    max: string | null;
+    count: number;
+  }>> {
+    const rows = await this.ch.query<{ bucket: string; count?: string | number }>(`
+      SELECT bucket, toString(count()) AS count
+      FROM (
+        SELECT
+          multiIf(
+            balance >= {tenThousand:UInt64}, '10,000+ FLUX',
+            balance >= {oneThousand:UInt64}, '1,000-10,000 FLUX',
+            balance >= {oneHundred:UInt64}, '100-1,000 FLUX',
+            balance >= {ten:UInt64}, '10-100 FLUX',
+            balance >= {one:UInt64}, '1-10 FLUX',
+            '0-1 FLUX'
+          ) AS bucket
+        FROM (
+          SELECT address, sumMerge(balance) AS balance
+          FROM address_summary_agg
+          GROUP BY address
+          HAVING balance > 0
+        )
+      )
+      GROUP BY bucket
+    `, {
+      one: Number(SATOSHIS_PER_FLUX),
+      ten: Number(10n * SATOSHIS_PER_FLUX),
+      oneHundred: Number(100n * SATOSHIS_PER_FLUX),
+      oneThousand: Number(1000n * SATOSHIS_PER_FLUX),
+      tenThousand: Number(10000n * SATOSHIS_PER_FLUX),
+    });
+    const counts = new Map(rows.map((row) => [row.bucket, safeCount(row.count)]));
+
+    return BALANCE_INTERVALS.map((bucket) => ({
+      interval: bucket.label,
+      min: bucket.min.toString(),
+      max: bucket.max?.toString() ?? null,
+      count: counts.get(bucket.label) ?? 0,
+    }));
+  }
+
+  async getRicherThan(): Promise<{
+    currency: 'FLUX';
+    unit: 'flux';
+    thresholds: Array<{ flux: number; balance: string; count: number }>;
+  }> {
+    const rows = await this.ch.query<{ threshold?: string | number; count?: string | number }>(`
+      SELECT threshold, toString(count()) AS count
+      FROM (
+        SELECT balance, arrayJoin({thresholds:Array(UInt64)}) AS threshold
+        FROM (
+          SELECT address, sumMerge(balance) AS balance
+          FROM address_summary_agg
+          GROUP BY address
+          HAVING balance > 0
+        )
+      )
+      WHERE balance >= threshold
+      GROUP BY threshold
+    `, { thresholds: RICHER_THAN_THRESHOLDS.map((threshold) => Number(threshold.zatoshis)) });
+    const counts = new Map(rows.map((row) => [zatoshiString(row.threshold), safeCount(row.count)]));
+
+    return {
+      currency: 'FLUX',
+      unit: 'flux',
+      thresholds: RICHER_THAN_THRESHOLDS.map((threshold) => ({
+        flux: Number(threshold.flux),
+        balance: threshold.zatoshis.toString(),
+        count: counts.get(threshold.zatoshis.toString()) ?? 0,
+      })),
+    };
+  }
+
+  async getRichestAddressesList(): Promise<Array<{
+    address: string;
+    blocks_mined: number;
+    balance: string | number;
+  }>> {
+    const addresses = await this.ch.query<{ address: string; balance?: string | number }>(`
+      SELECT address, toString(balance) AS balance
+      FROM (
+        SELECT address, sumMerge(balance) AS balance
+        FROM address_summary_agg
+        GROUP BY address
+        HAVING balance > 0
+        ORDER BY balance DESC
+        LIMIT {limit:UInt32}
+      )
+    `, { limit: RICH_LIST_LIMIT });
+    if (addresses.length === 0) {
+      return [];
+    }
+
+    const addressList = addresses.map((row) => row.address);
+    const minedRows = await this.ch.query<{ address: string; blocks_mined?: string | number }>(`
+      SELECT producer AS address, toString(count()) AS blocks_mined
+      FROM (
+        SELECT height, producer, is_valid
+        FROM blocks
+        WHERE producer IN {addresses:Array(String)}
+        ORDER BY height, _version DESC
+        LIMIT 1 BY height
+      )
+      WHERE is_valid = 1
+      GROUP BY producer
+    `, { addresses: addressList });
+    const mined = new Map(minedRows.map((row) => [row.address, safeCount(row.blocks_mined)]));
+
+    return addresses.map((row) => ({
+      address: row.address,
+      blocks_mined: mined.get(row.address) ?? 0,
+      balance: zatoshisToSafeNumber(zatoshiString(row.balance)),
+    }));
+  }
+
   getCurrency(): { status: 'ok'; data: null; timestamp: string } {
     return { status: 'ok', data: null, timestamp: new Date().toISOString() };
   }
@@ -495,6 +892,183 @@ export class InsightCompatibilityService {
 
   async startList(): Promise<unknown> {
     return this.rpc.startList();
+  }
+
+  private async getSupplyStatisticSeries(days: number): Promise<Array<{ date: string; sum: string }>> {
+    const rows = await this.ch.query<{ date?: string; day?: string; total_supply?: string | number }>(`
+      SELECT toString(day) AS date, toString(total_supply) AS total_supply
+      FROM (
+        SELECT day, max_height, total_supply
+        FROM mv_daily_supply
+        WHERE day >= today() - {days:UInt16}
+        ORDER BY day DESC, max_height DESC
+        LIMIT 1 BY day
+      )
+      ORDER BY day ASC
+    `, { days });
+
+    return rows.map((row) => ({
+      date: dateText(row.date ?? row.day),
+      sum: zatoshisToFluxString(zatoshiString(row.total_supply)),
+    }));
+  }
+
+  private async getFeeStatisticSeries(days: number): Promise<Array<{ date: string; fee: number }>> {
+    const rows = await this.ch.query<{ date?: string; fee?: string | number }>(`
+      SELECT
+        toString(toDate(toDateTime(timestamp))) AS date,
+        ifNull(avg(fee), 0) / 100000000 AS fee
+      FROM (
+        SELECT txid, timestamp, fee, is_valid
+        FROM transactions
+        WHERE timestamp >= toUInt32(toUnixTimestamp(now() - toIntervalDay({days:UInt16})))
+        ORDER BY txid, _version DESC
+        LIMIT 1 BY txid
+      )
+      WHERE is_valid = 1
+      GROUP BY date
+      ORDER BY date ASC
+    `, { days });
+
+    return rows.map((row) => ({
+      date: dateText(row.date),
+      fee: finiteNumber(row.fee),
+    }));
+  }
+
+  private async getBlockStatisticSeries(
+    days: number,
+    kind: 'network-hash' | 'difficulty'
+  ): Promise<Array<{ date: string; sum: number }>> {
+    const rows = await this.ch.query<{ date?: string; sum?: string | number }>(`
+      SELECT
+        toString(toDate(toDateTime(timestamp))) AS date,
+        ifNull(avg(difficulty), 0) AS sum
+      FROM (
+        SELECT height, timestamp, difficulty, is_valid
+        FROM blocks
+        WHERE timestamp >= toUInt32(toUnixTimestamp(now() - toIntervalDay({days:UInt16})))
+        ORDER BY height, _version DESC
+        LIMIT 1 BY height
+      )
+      WHERE is_valid = 1
+      GROUP BY date
+      ORDER BY date ASC
+    `, { days });
+
+    void kind;
+    return rows.map((row) => ({
+      date: dateText(row.date),
+      sum: finiteNumber(row.sum),
+    }));
+  }
+
+  private async getTransactionCountStatisticSeries(days: number): Promise<Array<{
+    date: string;
+    transaction_count: number;
+    block_count: number;
+  }>> {
+    const rows = await this.ch.query<{
+      date?: string;
+      transaction_count?: string | number;
+      block_count?: string | number;
+    }>(`
+      SELECT
+        toString(toDate(hour)) AS date,
+        toString(sum(tx_count)) AS transaction_count,
+        toString(sum(block_count)) AS block_count
+      FROM mv_hourly_tx_count
+      WHERE hour >= now() - toIntervalDay({days:UInt16})
+      GROUP BY date
+      ORDER BY date ASC
+    `, { days });
+
+    return rows.map((row) => ({
+      date: dateText(row.date),
+      transaction_count: safeCount(row.transaction_count),
+      block_count: safeCount(row.block_count),
+    }));
+  }
+
+  private async getOutputStatisticSeries(days: number): Promise<Array<{ date: string; sum: string }>> {
+    const rows = await this.ch.query<{ date?: string; output_total?: string | number }>(`
+      SELECT
+        toString(toDate(toDateTime(timestamp))) AS date,
+        toString(sum(output_total)) AS output_total
+      FROM (
+        SELECT txid, timestamp, output_total, is_valid
+        FROM transactions
+        WHERE timestamp >= toUInt32(toUnixTimestamp(now() - toIntervalDay({days:UInt16})))
+        ORDER BY txid, _version DESC
+        LIMIT 1 BY txid
+      )
+      WHERE is_valid = 1
+      GROUP BY date
+      ORDER BY date ASC
+    `, { days });
+
+    return rows.map((row) => ({
+      date: dateText(row.date),
+      sum: zatoshisToFluxString(zatoshiString(row.output_total)),
+    }));
+  }
+
+  private async getActiveAddressStatisticSeries(days: number): Promise<Array<{ date: string; count: number }>> {
+    const rows = await this.ch.query<{ date?: string; count?: string | number }>(`
+      SELECT
+        toString(toDate(toDateTime(timestamp))) AS date,
+        toString(uniqExact(address)) AS count
+      FROM (
+        SELECT address, txid, timestamp, is_valid
+        FROM address_transactions
+        WHERE timestamp >= toUInt32(toUnixTimestamp(now() - toIntervalDay({days:UInt16})))
+        ORDER BY address, txid, _version DESC
+        LIMIT 1 BY address, txid
+      )
+      WHERE is_valid = 1
+      GROUP BY date
+      ORDER BY date ASC
+    `, { days });
+
+    return rows.map((row) => ({
+      date: dateText(row.date),
+      count: safeCount(row.count),
+    }));
+  }
+
+  private async queryPoolRows(range: { start: number; end: number } | { cutoff: number }): Promise<Array<{
+    producer?: string | null;
+    blocks_found?: string | number;
+  }>> {
+    if ('cutoff' in range) {
+      return this.ch.query<{ producer?: string | null; blocks_found?: string | number }>(`
+        SELECT producer, toString(count()) AS blocks_found
+        FROM (
+          SELECT height, producer, is_valid
+          FROM blocks
+          WHERE timestamp >= {cutoff:UInt32}
+          ORDER BY height, _version DESC
+          LIMIT 1 BY height
+        )
+        WHERE is_valid = 1
+        GROUP BY producer
+        ORDER BY blocks_found DESC, producer ASC
+      `, { cutoff: range.cutoff });
+    }
+
+    return this.ch.query<{ producer?: string | null; blocks_found?: string | number }>(`
+      SELECT producer, toString(count()) AS blocks_found
+      FROM (
+        SELECT height, producer, is_valid
+        FROM blocks
+        WHERE timestamp >= {start:UInt32} AND timestamp <= {end:UInt32}
+        ORDER BY height, _version DESC
+        LIMIT 1 BY height
+      )
+      WHERE is_valid = 1
+      GROUP BY producer
+      ORDER BY blocks_found DESC, producer ASC
+    `, { start: range.start, end: range.end });
   }
 
   private async getLatestBlockByHeight(height: number): Promise<VersionedInsightBlockRow | null> {
@@ -734,6 +1308,95 @@ function parseBlockLookup(heightOrHash: string | number): BlockLookup | null {
 
   const hash = normalizeHashOrNull(trimmed);
   return hash ? { kind: 'hash', hash } : null;
+}
+
+function normalizeAddressList(addresses: string[]): string[] {
+  return [...new Set(addresses.map((address) => address.trim()).filter(Boolean))]
+    .slice(0, MAX_UTXO_ADDRESSES);
+}
+
+function normalizeRangeLimit(raw: number): number {
+  if (!Number.isSafeInteger(raw) || raw <= 0) {
+    return 10;
+  }
+
+  return Math.min(raw, MAX_ADDRESS_TX_LIMIT);
+}
+
+function normalizeNonNegativeSafeInteger(raw: number, fallback: number): number {
+  return Number.isSafeInteger(raw) && raw >= 0 ? raw : fallback;
+}
+
+function parseStatisticDays(raw?: string): number {
+  if (raw?.trim().toLowerCase() === 'all') {
+    return MAX_STATISTIC_DAYS;
+  }
+
+  if (raw === undefined || raw.trim().length === 0) {
+    return DEFAULT_STATISTIC_DAYS;
+  }
+
+  if (!/^\d+$/.test(raw.trim())) {
+    return DEFAULT_STATISTIC_DAYS;
+  }
+
+  const parsed = Number(raw.trim());
+  if (!Number.isSafeInteger(parsed)) {
+    return DEFAULT_STATISTIC_DAYS;
+  }
+
+  return Math.min(MAX_STATISTIC_DAYS, Math.max(1, parsed));
+}
+
+function safeCount(value: unknown): number {
+  const parsed = parseNonNegativeHeightValue(value);
+  return parsed ?? 0;
+}
+
+function finiteNumber(value: unknown): number {
+  return parseFiniteNumber(value) ?? 0;
+}
+
+function dateText(value: unknown): string {
+  if (typeof value === 'string') {
+    return value.slice(0, 10);
+  }
+
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString().slice(0, 10);
+  }
+
+  return '';
+}
+
+function formatPoolRows(rows: Array<{ producer?: string | null; blocks_found?: string | number }>): Array<{
+  pool_name: string;
+  blocks_found: number;
+  percent_total: number;
+}> {
+  const pools = rows.map((row) => ({
+    pool_name: poolName(row.producer),
+    blocks_found: safeCount(row.blocks_found),
+  }));
+  const total = pools.reduce((sum, pool) => sum + pool.blocks_found, 0);
+
+  return pools.map((pool) => ({
+    ...pool,
+    percent_total: total > 0 ? roundPercent((pool.blocks_found / total) * 100) : 0,
+  }));
+}
+
+function poolName(value: string | null | undefined): string {
+  const trimmed = value?.trim() ?? '';
+  return trimmed.length > 0 ? trimmed : 'Unknown';
+}
+
+function roundPercent(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000;
+}
+
+function isPresent<T>(value: T | null | undefined): value is T {
+  return value !== null && value !== undefined;
 }
 
 function hasQueryValue(raw: unknown): boolean {

@@ -10,6 +10,7 @@ import type {
   InsightAddressSummaryServiceResult,
   InsightBlockServiceResult,
   InsightListBlocksServiceResult,
+  InsightStatisticSeriesKind,
   InsightTransactionServiceResult,
 } from './service';
 import type { InsightUtxoRow } from './types';
@@ -58,6 +59,13 @@ export interface InsightRouterService {
   getMarketsInfo?(): unknown | Promise<unknown>;
   dosList?(): Promise<unknown>;
   startList?(): Promise<unknown>;
+  getStatisticSeries?(kind: InsightStatisticSeriesKind, rawDays?: string): Promise<unknown>;
+  getStatisticsTotal?(): Promise<unknown>;
+  getPools?(dateRaw?: string): Promise<unknown>;
+  getPoolsLastHour?(): Promise<unknown>;
+  getBalanceIntervals?(): Promise<unknown>;
+  getRicherThan?(): Promise<unknown>;
+  getRichestAddressesList?(): Promise<unknown>;
 }
 
 type AsyncRouteHandler = (req: Request, res: Response) => Promise<void>;
@@ -459,6 +467,86 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
   router.get('/statistics/circulating-supply', circulatingSupplyHandler);
   router.get('/statistics/main-chain-circulating-locked', circulatingSupplyHandler);
 
+  const statisticSeriesHandler = (kind: InsightStatisticSeriesKind) => asyncHandler(async (req, res) => {
+    if (!service.getStatisticSeries) {
+      sendNotImplemented(res, 'Statistic series lookup is not implemented');
+      return;
+    }
+
+    res.json(await service.getStatisticSeries(kind, firstString(req.query.days)));
+  });
+  router.get('/statistics/supply', statisticSeriesHandler('supply'));
+  router.get('/statistics/fees', statisticSeriesHandler('fees'));
+  router.get('/statistics/network-hash', statisticSeriesHandler('network-hash'));
+  router.get('/statistics/transactions', statisticSeriesHandler('transactions'));
+  router.get('/statistics/outputs', statisticSeriesHandler('outputs'));
+  router.get('/statistics/difficulty', statisticSeriesHandler('difficulty'));
+  router.get('/statistics/active-addresses', statisticSeriesHandler('active-addresses'));
+
+  router.get('/statistics/pools', asyncHandler(async (req, res) => {
+    if (!service.getPools) {
+      sendNotImplemented(res, 'Pool statistics lookup is not implemented');
+      return;
+    }
+
+    try {
+      res.json(await service.getPools(firstString(req.query.date) ?? firstString(req.query.blockDate)));
+    } catch (error) {
+      const message = errorMessage(error, 'Invalid pool statistics query');
+      if (isBlockDateValidationError(message)) {
+        sendBadRequest(res, message);
+        return;
+      }
+
+      throw error;
+    }
+  }));
+
+  router.get('/statistics/pools-last-hour', asyncHandler(async (_req, res) => {
+    if (!service.getPoolsLastHour) {
+      sendNotImplemented(res, 'Pool statistics lookup is not implemented');
+      return;
+    }
+
+    res.json(await service.getPoolsLastHour());
+  }));
+
+  router.get('/statistics/total', asyncHandler(async (_req, res) => {
+    if (!service.getStatisticsTotal) {
+      sendNotImplemented(res, 'Total statistics lookup is not implemented');
+      return;
+    }
+
+    res.json(await service.getStatisticsTotal());
+  }));
+
+  router.get('/statistics/balance-intervals', asyncHandler(async (_req, res) => {
+    if (!service.getBalanceIntervals) {
+      sendNotImplemented(res, 'Balance interval lookup is not implemented');
+      return;
+    }
+
+    res.json(await service.getBalanceIntervals());
+  }));
+
+  router.get('/statistics/richer-than', asyncHandler(async (_req, res) => {
+    if (!service.getRicherThan) {
+      sendNotImplemented(res, 'Richer-than statistics lookup is not implemented');
+      return;
+    }
+
+    res.json(await service.getRicherThan());
+  }));
+
+  router.get('/statistics/richest-addresses-list', asyncHandler(async (_req, res) => {
+    if (!service.getRichestAddressesList) {
+      sendNotImplemented(res, 'Richest addresses lookup is not implemented');
+      return;
+    }
+
+    res.json(await service.getRichestAddressesList());
+  }));
+
   router.get('/currency', asyncHandler(async (_req, res) => {
     if (!service.getCurrency) {
       sendNotImplemented(res, 'Currency lookup is not implemented');
@@ -476,6 +564,10 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
 
     res.json(await service.getMarketsInfo());
   }));
+
+  router.use((req, res) => {
+    sendNotFound(res, req.originalUrl);
+  });
 
   return router;
 }

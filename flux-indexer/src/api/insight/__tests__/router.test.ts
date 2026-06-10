@@ -10,11 +10,11 @@ type MockInsightRouterService = {
     : InsightRouterService[K];
 };
 
-function createApp(serviceOverrides: Partial<MockInsightRouterService> = {}) {
+function createApp(serviceOverrides: Partial<MockInsightRouterService> & Record<string, any> = {}) {
   const app = express();
   app.use(express.json());
 
-  const service: MockInsightRouterService = {
+  const service = {
     getBlock: jest.fn(),
     getBlockHashByHeight: jest.fn(),
     getRawBlock: jest.fn(),
@@ -28,8 +28,15 @@ function createApp(serviceOverrides: Partial<MockInsightRouterService> = {}) {
     getAddressTransactions: jest.fn(),
     getAddressBalanceSum: jest.fn(),
     sendRawTransaction: jest.fn(),
+    getStatisticSeries: jest.fn(),
+    getStatisticsTotal: jest.fn(),
+    getPools: jest.fn(),
+    getPoolsLastHour: jest.fn(),
+    getBalanceIntervals: jest.fn(),
+    getRicherThan: jest.fn(),
+    getRichestAddressesList: jest.fn(),
     ...serviceOverrides,
-  };
+  } as MockInsightRouterService & Record<string, any>;
 
   app.use('/insight-api', createInsightCompatibilityRouter(service));
   return { app, service };
@@ -254,6 +261,40 @@ describe('Insight core routes', () => {
     });
   });
 
+  test('GET /txs?block returns block transactions from service hook', async () => {
+    const { app, service } = createApp({
+      getTransactionsByBlock: jest.fn().mockResolvedValue([{ txid: 'tx1' }, { txid: 'tx2' }]),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/txs?block=blockhash`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({
+        pagesTotal: 1,
+        txs: [{ txid: 'tx1' }, { txid: 'tx2' }],
+      });
+      expect(service.getTransactionsByBlock).toHaveBeenCalledWith('blockhash');
+    });
+  });
+
+  test('GET /txs?address returns address transactions from service hook', async () => {
+    const { app, service } = createApp({
+      getTransactionsByAddress: jest.fn().mockResolvedValue([{ txid: 'tx1' }]),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/txs?address=addr1`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({
+        pagesTotal: 1,
+        txs: [{ txid: 'tx1' }],
+      });
+      expect(service.getTransactionsByAddress).toHaveBeenCalledWith('addr1');
+    });
+  });
+
   test('GET /addr/:addr honors noTxList', async () => {
     const { app, service } = createApp({
       getAddressSummary: jest.fn().mockResolvedValue({
@@ -381,6 +422,53 @@ describe('Insight core routes', () => {
         message: 'Address transaction lookup is not implemented',
         code: 1,
       });
+    });
+  });
+
+  test('GET /addrs/:addrs/txs returns address transactions from service hook', async () => {
+    const { app, service } = createApp({
+      getAddressTransactions: jest.fn().mockResolvedValue({
+        totalItems: 3,
+        items: [{ txid: 'tx2' }, { txid: 'tx1' }],
+      }),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/addrs/addr1,addr2/txs?from=1&to=3`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({
+        totalItems: 3,
+        from: 1,
+        to: 3,
+        items: [{ txid: 'tx2' }, { txid: 'tx1' }],
+      });
+      expect(service.getAddressTransactions).toHaveBeenCalledWith(
+        ['addr1', 'addr2'],
+        { from: 1, to: 3, limit: 2 }
+      );
+    });
+  });
+
+  test('GET /addrs/:addrs/balance returns summed balance from service hook', async () => {
+    const { app, service } = createApp({
+      getAddressBalanceSum: jest.fn().mockResolvedValue({
+        balance: '9007199254740997',
+        unconfirmedBalance: 5,
+        immature: 0,
+      }),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/addrs/addr1,addr2/balance`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({
+        balance: '9007199254740997',
+        unconfirmedBalance: 5,
+        immature: 0,
+      });
+      expect(service.getAddressBalanceSum).toHaveBeenCalledWith(['addr1', 'addr2']);
     });
   });
 
@@ -703,6 +791,83 @@ describe('Insight core routes', () => {
     });
   });
 
+  test('GET /statistics/supply returns series data from service hook', async () => {
+    const getStatisticSeries = jest.fn().mockResolvedValue([
+      { date: '2026-06-10', sum: '1000.00000000' },
+    ]);
+    const { app } = createApp({ getStatisticSeries });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/statistics/supply?days=30`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual([
+        { date: '2026-06-10', sum: '1000.00000000' },
+      ]);
+      expect(getStatisticSeries).toHaveBeenCalledWith('supply', '30');
+    });
+  });
+
+  test('GET /statistics/total returns total statistics from service hook', async () => {
+    const getStatisticsTotal = jest.fn().mockResolvedValue({
+      n_blocks_mined: 10,
+      number_of_transactions: 25,
+      blocks_by_pool: [],
+    });
+    const { app } = createApp({ getStatisticsTotal });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/statistics/total`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({
+        n_blocks_mined: 10,
+        number_of_transactions: 25,
+        blocks_by_pool: [],
+      });
+      expect(getStatisticsTotal).toHaveBeenCalledWith();
+    });
+  });
+
+  test('GET /statistics/pools forwards requested date to service hook', async () => {
+    const getPools = jest.fn().mockResolvedValue({
+      date: '2026-06-10',
+      n_blocks_mined: 4,
+      blocks_by_pool: [],
+      pagination: { current: '2026-06-10', next: '2026-06-11', prev: '2026-06-09' },
+    });
+    const { app } = createApp({ getPools });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/statistics/pools?date=2026-06-10`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({
+        date: '2026-06-10',
+        n_blocks_mined: 4,
+        blocks_by_pool: [],
+        pagination: { current: '2026-06-10', next: '2026-06-11', prev: '2026-06-09' },
+      });
+      expect(getPools).toHaveBeenCalledWith('2026-06-10');
+    });
+  });
+
+  test('GET /statistics/fees returns not implemented when statistics hook is missing', async () => {
+    const { app } = createApp({
+      getStatisticSeries: undefined,
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/statistics/fees`);
+
+      expect(response.status).toBe(501);
+      await expect(readJson(response)).resolves.toEqual({
+        message: 'Statistic series lookup is not implemented',
+        code: 1,
+      });
+    });
+  });
+
   test('GET /peer returns not implemented when peer hook is missing', async () => {
     const { app } = createApp();
 
@@ -729,6 +894,21 @@ describe('Insight core routes', () => {
       await expect(readJson(response)).resolves.toEqual({
         status: 404,
         url: '/insight-api/block/missing',
+        error: 'Not found',
+      });
+    });
+  });
+
+  test('unmatched standalone router path returns legacy 404 body', async () => {
+    const { app } = createApp();
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/does-not-exist`);
+
+      expect(response.status).toBe(404);
+      await expect(readJson(response)).resolves.toEqual({
+        status: 404,
+        url: '/insight-api/does-not-exist',
         error: 'Not found',
       });
     });
