@@ -2,6 +2,7 @@ import express, { type NextFunction, type Request, type Response, type Router } 
 import {
   formatAddressSummary,
   formatBlock,
+  formatSupply,
   formatTransaction,
   formatUtxo,
 } from './formatters';
@@ -45,9 +46,32 @@ export interface InsightRouterService {
   getAddressTransactions?(addresses: string[], range: InsightRange): Promise<InsightAddressTransactionsResult>;
   getAddressBalanceSum?(addresses: string[]): Promise<InsightAddressBalanceSumResult>;
   sendRawTransaction(rawtx: string): Promise<string>;
+  getStatus?(query: string | undefined): Promise<unknown>;
+  getSync?(): Promise<unknown>;
+  getPeer?(): unknown | Promise<unknown>;
+  getVersion?(): Promise<unknown>;
+  estimateFees?(targets: number[]): Promise<Record<number, number>>;
+  verifyMessage?(address: string, signature: string, message: string): Promise<boolean>;
+  listFluxNodes?(filter?: string): Promise<unknown>;
+  getSupply?(): Promise<string>;
+  getCurrency?(): unknown | Promise<unknown>;
+  getMarketsInfo?(): unknown | Promise<unknown>;
+  dosList?(): Promise<unknown>;
+  startList?(): Promise<unknown>;
 }
 
 type AsyncRouteHandler = (req: Request, res: Response) => Promise<void>;
+
+const FLUXNODE_COLLATERAL_ZATOSHIS = new Set([
+  1000n * 100000000n,
+  10000n * 100000000n,
+  12500n * 100000000n,
+  25000n * 100000000n,
+  40000n * 100000000n,
+  100000n * 100000000n,
+]);
+const MAX_FEE_TARGETS = 20;
+const MAX_FEE_TARGET_BLOCKS = 1008;
 
 export function createInsightCompatibilityRouter(service: InsightRouterService): Router {
   const router = express.Router();
@@ -286,6 +310,173 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
     res.json(result);
   }));
 
+  router.get('/status', asyncHandler(async (req, res) => {
+    if (!service.getStatus) {
+      sendNotImplemented(res, 'Status lookup is not implemented');
+      return;
+    }
+
+    res.json(await service.getStatus(firstString(req.query.q)));
+  }));
+
+  router.get('/sync', asyncHandler(async (_req, res) => {
+    if (!service.getSync) {
+      sendNotImplemented(res, 'Sync status lookup is not implemented');
+      return;
+    }
+
+    res.json(await service.getSync());
+  }));
+
+  router.get('/peer', asyncHandler(async (_req, res) => {
+    if (!service.getPeer) {
+      sendNotImplemented(res, 'Peer lookup is not implemented');
+      return;
+    }
+
+    res.json(await service.getPeer());
+  }));
+
+  router.get('/version', asyncHandler(async (_req, res) => {
+    if (!service.getVersion) {
+      sendNotImplemented(res, 'Version lookup is not implemented');
+      return;
+    }
+
+    res.json(await service.getVersion());
+  }));
+
+  router.get('/utils/estimatefee', asyncHandler(async (req, res) => {
+    if (!service.estimateFees) {
+      sendNotImplemented(res, 'Fee estimation is not implemented');
+      return;
+    }
+
+    const targets = parseFeeTargets(req.query.nbBlocks);
+    if (targets === null) {
+      sendBadRequest(res, 'Invalid nbBlocks');
+      return;
+    }
+
+    res.json(await service.estimateFees(targets));
+  }));
+
+  router.all('/messages/verify', asyncHandler(async (req, res) => {
+    const address = trimmedString(req.body?.address) ?? trimmedString(req.query.address);
+    const signature = trimmedString(req.body?.signature) ?? trimmedString(req.query.signature);
+    const message = rawString(req.body?.message) ?? rawString(req.query.message);
+    if (!address || !signature || message === undefined || message.trim().length === 0) {
+      sendBadRequest(res, 'Missing address, signature, or message');
+      return;
+    }
+
+    if (!service.verifyMessage) {
+      sendNotImplemented(res, 'Message verification is not implemented');
+      return;
+    }
+
+    try {
+      res.json({ result: await service.verifyMessage(address, signature, message) });
+    } catch (error) {
+      if (!isMessageVerificationInputError(error)) {
+        throw error;
+      }
+
+      sendBadRequest(res, errorMessage(error, 'Message verification failed'));
+    }
+  }));
+
+  const listFluxNodesHandler = asyncHandler(async (req, res) => {
+    if (!service.listFluxNodes) {
+      sendNotImplemented(res, 'FluxNode list lookup is not implemented');
+      return;
+    }
+
+    res.json(await service.listFluxNodes(fluxNodeFilter(req)));
+  });
+  router.get('/fluxnode/listfluxnodes', listFluxNodesHandler);
+  router.get('/fluxnode/listfluxnodes/:filter', listFluxNodesHandler);
+  router.post('/fluxnode/listfluxnodes', listFluxNodesHandler);
+  router.post('/fluxnode/listfluxnodes/:filter', listFluxNodesHandler);
+  router.get('/zelnode/listfluxnodes', listFluxNodesHandler);
+  router.get('/zelnode/listfluxnodes/:filter', listFluxNodesHandler);
+  router.post('/zelnode/listfluxnodes', listFluxNodesHandler);
+  router.post('/zelnode/listfluxnodes/:filter', listFluxNodesHandler);
+
+  router.get('/fluxnode/addrs/:addrs/utxo', asyncHandler(async (req, res) => {
+    const addresses = parseAddressList(req.params.addrs);
+    const rows = await service.getAddressUtxos(addresses, true);
+    res.json(rows.filter(isFluxNodeCollateralUtxo).map(formatUtxo));
+  }));
+
+  router.post('/fluxnode/addrs/utxo', asyncHandler(async (req, res) => {
+    const addresses = parseAddressList(undefined, req.body);
+    const rows = await service.getAddressUtxos(addresses, true);
+    res.json(rows.filter(isFluxNodeCollateralUtxo).map(formatUtxo));
+  }));
+
+  router.get('/fluxnode/doslist', asyncHandler(async (_req, res) => {
+    if (!service.dosList) {
+      sendNotImplemented(res, 'FluxNode DoS list lookup is not implemented');
+      return;
+    }
+
+    res.json(await service.dosList());
+  }));
+
+  router.get('/fluxnode/startlist', asyncHandler(async (_req, res) => {
+    if (!service.startList) {
+      sendNotImplemented(res, 'FluxNode start list lookup is not implemented');
+      return;
+    }
+
+    res.json(await service.startList());
+  }));
+
+  const supplyHandler = asyncHandler(async (req, res) => {
+    if (!service.getSupply) {
+      sendNotImplemented(res, 'Supply lookup is not implemented');
+      return;
+    }
+
+    const supply = await service.getSupply();
+    if (firstString(req.query.format)?.toLowerCase() === 'object') {
+      res.json(formatSupply(supply, supplyObjectKey(req.path)));
+      return;
+    }
+
+    sendPlainText(res, formatSupply(supply));
+  });
+  router.get('/supply', supplyHandler);
+  router.get('/total-supply', supplyHandler);
+  router.get('/statistics/total-supply', supplyHandler);
+
+  const circulatingSupplyHandler = (_req: Request, res: Response) => {
+    sendNotImplemented(res, 'Circulating supply lookup is not implemented');
+  };
+  router.get('/circulating-supply', circulatingSupplyHandler);
+  router.get('/circulation', circulatingSupplyHandler);
+  router.get('/statistics/circulating-supply', circulatingSupplyHandler);
+  router.get('/statistics/main-chain-circulating-locked', circulatingSupplyHandler);
+
+  router.get('/currency', asyncHandler(async (_req, res) => {
+    if (!service.getCurrency) {
+      sendNotImplemented(res, 'Currency lookup is not implemented');
+      return;
+    }
+
+    res.json(await service.getCurrency());
+  }));
+
+  router.get('/markets/info', asyncHandler(async (_req, res) => {
+    if (!service.getMarketsInfo) {
+      sendNotImplemented(res, 'Markets info lookup is not implemented');
+      return;
+    }
+
+    res.json(await service.getMarketsInfo());
+  }));
+
   return router;
 }
 
@@ -361,6 +552,80 @@ function parseNonNegativeSafeInteger(raw: string): number | null {
   return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
+function parseFeeTargets(raw: unknown): number[] | null {
+  const parts = stringParamParts(raw);
+  const rawTargets = (parts.length > 0 ? parts : ['2'])
+    .flatMap((part) => part.split(','))
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  if (rawTargets.length === 0) {
+    return [2];
+  }
+
+  const targets: number[] = [];
+  const seen = new Set<number>();
+  for (const rawTarget of rawTargets) {
+    const target = parseNonNegativeSafeInteger(rawTarget);
+    if (target === null || target <= 0 || target > MAX_FEE_TARGET_BLOCKS) {
+      return null;
+    }
+
+    if (seen.has(target)) {
+      continue;
+    }
+
+    seen.add(target);
+    targets.push(target);
+    if (targets.length > MAX_FEE_TARGETS) {
+      return null;
+    }
+  }
+
+  return targets;
+}
+
+function stringParamParts(raw: unknown): string[] {
+  if (raw === undefined || raw === null) {
+    return [];
+  }
+
+  if (Array.isArray(raw)) {
+    return raw.flatMap(stringParamParts);
+  }
+
+  return [typeof raw === 'string' ? raw : String(raw)];
+}
+
+function fluxNodeFilter(req: Request): string | undefined {
+  return firstString(req.params.filter)
+    ?? firstString(req.body?.filter)
+    ?? firstString(req.body?.filters)
+    ?? firstString(req.body?.node)
+    ?? firstString(req.query.filter);
+}
+
+function isFluxNodeCollateralUtxo(row: InsightUtxoRow): boolean {
+  const value = zatoshiBigInt(row.value);
+  return value !== null && FLUXNODE_COLLATERAL_ZATOSHIS.has(value);
+}
+
+function zatoshiBigInt(value: string | number): bigint | null {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : null;
+  }
+
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return null;
+  }
+
+  return BigInt(trimmed);
+}
+
+function supplyObjectKey(path: string): 'supply' | 'circulatingSupply' {
+  return path.includes('total-supply') ? 'supply' : 'circulatingSupply';
+}
+
 function satoshiText(value: unknown): string {
   if (typeof value === 'bigint') {
     return value.toString();
@@ -398,6 +663,33 @@ function errorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
+function isMessageVerificationInputError(error: unknown): boolean {
+  const message = errorMessage(error, '').toLowerCase();
+  if (
+    message.includes('invalid address')
+    || message.includes('invalid signature')
+    || message.includes('malformed')
+    || message.includes('bad signature')
+  ) {
+    return true;
+  }
+
+  const code = errorCode(error);
+  return code === -32602 || code === -5;
+}
+
+function errorCode(error: unknown): number | null {
+  if (!isRecord(error)) {
+    return null;
+  }
+
+  if (typeof error.rpcCode === 'number' && Number.isFinite(error.rpcCode)) {
+    return error.rpcCode;
+  }
+
+  return typeof error.code === 'number' && Number.isFinite(error.code) ? error.code : null;
+}
+
 function isBlockDateValidationError(message: string): boolean {
   return message.includes('Invalid blockDate');
 }
@@ -417,6 +709,19 @@ function firstString(value: unknown): string | undefined {
   }
 
   return typeof value === 'string' ? value : String(value);
+}
+
+function trimmedString(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function rawString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
 }
 
 function toRecord(value: unknown): Record<string, unknown> {

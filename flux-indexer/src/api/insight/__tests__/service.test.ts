@@ -25,6 +25,16 @@ function createService() {
     getRawTransaction: jest.fn(),
     sendRawTransaction: jest.fn(),
     estimateFee: jest.fn(),
+    getDifficulty: jest.fn(),
+    getBestBlockHash: jest.fn(),
+    getMiningInfo: jest.fn(),
+    getPeerInfo: jest.fn(),
+    getInfo: jest.fn(),
+    getVersion: jest.fn(),
+    verifyMessage: jest.fn(),
+    viewDeterministicFluxNodeList: jest.fn(),
+    dosList: jest.fn(),
+    startList: jest.fn(),
   };
   const getMempoolAddressDeltas = jest.fn().mockResolvedValue(new Map());
 
@@ -498,6 +508,135 @@ describe('InsightCompatibilityService', () => {
     expect(rpc.estimateFee).toHaveBeenNthCalledWith(1, 2);
     expect(rpc.estimateFee).toHaveBeenNthCalledWith(2, 6);
     expect(rpc.estimateFee).toHaveBeenNthCalledWith(3, 24);
+  });
+
+  test('gets status wrappers from RPC helpers', async () => {
+    const { service, rpc } = createService();
+    rpc.getDifficulty.mockResolvedValue(123.456);
+    rpc.getBestBlockHash.mockResolvedValue('besthash');
+    rpc.getInfo.mockResolvedValue({ blocks: 100 });
+
+    await expect(service.getStatus('getDifficulty')).resolves.toEqual({ difficulty: 123.456 });
+    await expect(service.getStatus('getLastBlockHash')).resolves.toEqual({
+      syncTipHash: 'besthash',
+      lastblockhash: 'besthash',
+    });
+    await expect(service.getStatus(undefined)).resolves.toEqual({ info: { blocks: 100 } });
+  });
+
+  test('returns sync_state in legacy sync shape with string numeric fields parsed safely', async () => {
+    const { service, ch } = createService();
+    ch.queryOne.mockResolvedValue({
+      current_height: '99',
+      chain_height: '100',
+      sync_percentage: '99.5',
+      is_syncing: '1',
+    });
+
+    await expect(service.getSync()).resolves.toEqual({
+      status: 'syncing',
+      blockChainHeight: 100,
+      syncPercentage: 99.5,
+      height: 99,
+      error: null,
+      type: 'bitcore node',
+    });
+  });
+
+  test('normalizes fresh sync_state seed to nonnegative syncing state', async () => {
+    const { service, ch } = createService();
+    ch.queryOne.mockResolvedValue({
+      current_height: -1,
+      chain_height: 0,
+      sync_percentage: 0,
+      is_syncing: 0,
+    });
+
+    await expect(service.getSync()).resolves.toEqual({
+      status: 'syncing',
+      blockChainHeight: 0,
+      syncPercentage: 0,
+      height: 0,
+      error: null,
+      type: 'bitcore node',
+    });
+  });
+
+  test('reports syncing when progress is incomplete even if sync_state flag is false', async () => {
+    const { service, ch } = createService();
+    ch.queryOne.mockResolvedValue({
+      current_height: 10,
+      chain_height: 100,
+      sync_percentage: 10,
+      is_syncing: 0,
+    });
+
+    await expect(service.getSync()).resolves.toMatchObject({
+      status: 'syncing',
+      blockChainHeight: 100,
+      syncPercentage: 10,
+      height: 10,
+    });
+  });
+
+  test('filters deterministic FluxNode list by collateral outpoint while preserving RPC envelope', async () => {
+    const { service, rpc } = createService();
+    const first = { txhash: 'abc', outidx: 1, ip: '1.2.3.4:16125', status: 'ENABLED' };
+    const second = { txhash: 'def', outidx: 0, ip: '5.6.7.8:16125', status: 'ENABLED' };
+    rpc.viewDeterministicFluxNodeList.mockResolvedValue({
+      result: [first, second],
+      error: null,
+      id: 'flux',
+    });
+
+    await expect(service.listFluxNodes('abc-1')).resolves.toEqual({
+      result: [first],
+      error: null,
+      id: 'flux',
+    });
+  });
+
+  test('filters deterministic FluxNode list by exact collateral outpoint', async () => {
+    const { service, rpc } = createService();
+    const txhash = 'a'.repeat(64);
+    const first = { txhash, outidx: 1, ip: '1.2.3.4:16125', status: 'ENABLED' };
+    const second = { txhash, outidx: 10, ip: '5.6.7.8:16125', status: 'ENABLED' };
+    rpc.viewDeterministicFluxNodeList.mockResolvedValue({
+      result: [first, second],
+      error: null,
+      id: 'flux',
+    });
+
+    await expect(service.listFluxNodes(`${txhash}-1`)).resolves.toEqual({
+      result: [first],
+      error: null,
+      id: 'flux',
+    });
+  });
+
+  test('gets latest supply as a zatoshis string using schema-correct ordering', async () => {
+    const { service, ch } = createService();
+    ch.queryOne.mockResolvedValue({ total_supply: '123456789' });
+
+    await expect(service.getSupply()).resolves.toBe('123456789');
+
+    const [sql] = ch.queryOne.mock.calls[0];
+    expect(sql).toContain('FROM supply_stats');
+    expect(sql).toContain('ORDER BY block_height DESC, _version DESC');
+  });
+
+  test('delegates message and auxiliary RPC helpers', async () => {
+    const { service, rpc } = createService();
+    rpc.verifyMessage.mockResolvedValue(true);
+    rpc.getVersion.mockResolvedValue({ version: 9000000 });
+    rpc.dosList.mockResolvedValue(['banned']);
+    rpc.startList.mockResolvedValue(['started']);
+
+    await expect(service.verifyMessage('addr', 'sig', 'msg')).resolves.toBe(true);
+    await expect(service.getVersion()).resolves.toEqual({ version: 9000000 });
+    await expect(service.dosList()).resolves.toEqual(['banned']);
+    await expect(service.startList()).resolves.toEqual(['started']);
+    expect(rpc.verifyMessage).toHaveBeenCalledWith('addr', 'sig', 'msg');
   });
 });
 

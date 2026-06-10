@@ -1,4 +1,5 @@
 import express from 'express';
+import { RPCError } from '../../../types';
 import { createInsightCompatibilityRouter, type InsightRouterService } from '../router';
 import { readJson, withTestServer } from './http-test-utils';
 
@@ -327,6 +328,323 @@ describe('Insight core routes', () => {
       expect(response.status).toBe(501);
       await expect(readJson(response)).resolves.toEqual({
         message: 'Address balance lookup is not implemented',
+        code: 1,
+      });
+    });
+  });
+
+  test('GET /status?q=getDifficulty returns service status wrapper', async () => {
+    const getStatus = jest.fn().mockResolvedValue({ difficulty: 123.456 });
+    const { app } = createApp({ getStatus });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/status?q=getDifficulty`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({ difficulty: 123.456 });
+      expect(getStatus).toHaveBeenCalledWith('getDifficulty');
+    });
+  });
+
+  test('GET /sync returns legacy sync fields', async () => {
+    const legacySync = {
+      status: 'syncing',
+      blockChainHeight: 100,
+      syncPercentage: 99.5,
+      height: 99,
+      error: null,
+      type: 'bitcore node',
+    };
+    const getSync = jest.fn().mockResolvedValue(legacySync);
+    const { app } = createApp({ getSync });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/sync`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual(legacySync);
+      expect(getSync).toHaveBeenCalledWith();
+    });
+  });
+
+  test('GET /utils/estimatefee supports multiple targets', async () => {
+    const estimateFees = jest.fn().mockResolvedValue({ 2: 0.002, 6: 0.006 });
+    const { app } = createApp({ estimateFees });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/utils/estimatefee?nbBlocks=2,6`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({ 2: 0.002, 6: 0.006 });
+      expect(estimateFees).toHaveBeenCalledWith([2, 6]);
+    });
+  });
+
+  test('GET /utils/estimatefee deduplicates repeated targets', async () => {
+    const estimateFees = jest.fn().mockResolvedValue({ 2: 0.002, 6: 0.006 });
+    const { app } = createApp({ estimateFees });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/utils/estimatefee?nbBlocks=2,6,2`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({ 2: 0.002, 6: 0.006 });
+      expect(estimateFees).toHaveBeenCalledWith([2, 6]);
+    });
+  });
+
+  test('GET /utils/estimatefee rejects too-large targets', async () => {
+    const estimateFees = jest.fn().mockResolvedValue({ 1009: 1.009 });
+    const { app } = createApp({ estimateFees });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/utils/estimatefee?nbBlocks=1009`);
+
+      expect(response.status).toBe(400);
+      await expect(readJson(response)).resolves.toEqual({ message: 'Invalid nbBlocks', code: 1 });
+      expect(estimateFees).not.toHaveBeenCalled();
+    });
+  });
+
+  test('POST /messages/verify requires address signature and message', async () => {
+    const verifyMessage = jest.fn().mockResolvedValue(true);
+    const { app } = createApp({ verifyMessage });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/messages/verify`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ address: 'taddr', message: 'hello' }),
+      });
+
+      expect(response.status).toBe(400);
+      await expect(readJson(response)).resolves.toEqual({
+        message: 'Missing address, signature, or message',
+        code: 1,
+      });
+      expect(verifyMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  test('POST /messages/verify rejects non-string JSON fields', async () => {
+    const verifyMessage = jest.fn().mockResolvedValue(true);
+    const { app } = createApp({ verifyMessage });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/messages/verify`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ address: 'taddr', signature: { value: 'sig' }, message: 'hello' }),
+      });
+
+      expect(response.status).toBe(400);
+      await expect(readJson(response)).resolves.toEqual({
+        message: 'Missing address, signature, or message',
+        code: 1,
+      });
+      expect(verifyMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  test('POST /messages/verify rejects blank string fields', async () => {
+    const verifyMessage = jest.fn().mockResolvedValue(true);
+    const { app } = createApp({ verifyMessage });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/messages/verify`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ address: 'taddr', signature: '   ', message: 'hello' }),
+      });
+
+      expect(response.status).toBe(400);
+      await expect(readJson(response)).resolves.toEqual({
+        message: 'Missing address, signature, or message',
+        code: 1,
+      });
+      expect(verifyMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  test('POST /messages/verify returns service verification result', async () => {
+    const verifyMessage = jest.fn().mockResolvedValue(true);
+    const { app } = createApp({ verifyMessage });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/messages/verify`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ address: ' taddr ', signature: ' sig ', message: ' hello ' }),
+      });
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({ result: true });
+      expect(verifyMessage).toHaveBeenCalledWith('taddr', 'sig', ' hello ');
+    });
+  });
+
+  test('POST /messages/verify returns bad request when verification rejects', async () => {
+    const verifyMessage = jest.fn().mockRejectedValue(new Error('Invalid address'));
+    const { app } = createApp({ verifyMessage });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/messages/verify`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ address: 'taddr', signature: 'sig', message: 'hello' }),
+      });
+
+      expect(response.status).toBe(400);
+      await expect(readJson(response)).resolves.toEqual({ message: 'Invalid address', code: 1 });
+      expect(verifyMessage).toHaveBeenCalledWith('taddr', 'sig', 'hello');
+    });
+  });
+
+  test('POST /messages/verify returns bad request for invalid-parameter RPC errors', async () => {
+    const verifyMessage = jest.fn().mockRejectedValue(new RPCError('Invalid parameter', -32602));
+    const { app } = createApp({ verifyMessage });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/messages/verify`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ address: 'taddr', signature: 'sig', message: 'hello' }),
+      });
+
+      expect(response.status).toBe(400);
+      await expect(readJson(response)).resolves.toEqual({ message: 'Invalid parameter', code: 1 });
+      expect(verifyMessage).toHaveBeenCalledWith('taddr', 'sig', 'hello');
+    });
+  });
+
+  test('POST /messages/verify lets operational verification errors reach error handling', async () => {
+    const verifyMessage = jest.fn().mockRejectedValue(new Error('RPC timeout'));
+    const { app } = createApp({ verifyMessage });
+    const errorHandler: express.ErrorRequestHandler = (error, _req, res, _next) => {
+      res.status(500).json({ error: error.message });
+    };
+    app.use(errorHandler);
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/messages/verify`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ address: 'taddr', signature: 'sig', message: 'hello' }),
+      });
+
+      expect(response.status).toBe(500);
+      await expect(readJson(response)).resolves.toEqual({ error: 'RPC timeout' });
+      expect(verifyMessage).toHaveBeenCalledWith('taddr', 'sig', 'hello');
+    });
+  });
+
+  test('GET /fluxnode/listfluxnodes/:filter calls service filter hook', async () => {
+    const listFluxNodes = jest.fn().mockResolvedValue({
+      result: [{ txhash: 'abc', outidx: 1 }],
+      error: null,
+      id: null,
+    });
+    const { app } = createApp({ listFluxNodes });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/fluxnode/listfluxnodes/abc-1`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({
+        result: [{ txhash: 'abc', outidx: 1 }],
+        error: null,
+        id: null,
+      });
+      expect(listFluxNodes).toHaveBeenCalledWith('abc-1');
+    });
+  });
+
+  test('GET /fluxnode/addrs/:addrs/utxo filters collateral UTXOs and formats them', async () => {
+    const getAddressUtxos = jest.fn().mockResolvedValue([
+      {
+        address: 'addr1',
+        txid: '1'.repeat(64),
+        vout: 0,
+        script_pubkey: '76a914',
+        value: '100000000000',
+        block_height: 10,
+        confirmations: 5,
+      },
+      {
+        address: 'addr1',
+        txid: '2'.repeat(64),
+        vout: 1,
+        script_pubkey: '76a914',
+        value: '42',
+        block_height: 11,
+        confirmations: 4,
+      },
+      {
+        address: 'addr2',
+        txid: '3'.repeat(64),
+        vout: 2,
+        script_pubkey: '76a914',
+        value: '4000000000000',
+        block_height: 12,
+        confirmations: 3,
+      },
+    ]);
+    const { app } = createApp({ getAddressUtxos });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/fluxnode/addrs/addr1,addr2/utxo`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual([
+        expect.objectContaining({ txid: '1'.repeat(64), amount: 1000, satoshis: 100000000000 }),
+        expect.objectContaining({ txid: '3'.repeat(64), amount: 40000, satoshis: 4000000000000 }),
+      ]);
+      expect(getAddressUtxos).toHaveBeenCalledWith(['addr1', 'addr2'], true);
+    });
+  });
+
+  test('GET /supply returns text by default and circulatingSupply object with format=object', async () => {
+    const getSupply = jest.fn().mockResolvedValue('100000000');
+    const { app } = createApp({ getSupply });
+
+    await withTestServer(app, async (baseUrl) => {
+      const textResponse = await fetch(`${baseUrl}/insight-api/supply`);
+      expect(textResponse.status).toBe(200);
+      expect(textResponse.headers.get('content-type')).toContain('text/plain');
+      await expect(textResponse.text()).resolves.toBe('1');
+
+      const objectResponse = await fetch(`${baseUrl}/insight-api/supply?format=object`);
+      expect(objectResponse.status).toBe(200);
+      await expect(readJson(objectResponse)).resolves.toEqual({ circulatingSupply: '1' });
+      expect(getSupply).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  test('GET /statistics/circulating-supply is explicit not implemented', async () => {
+    const getSupply = jest.fn().mockResolvedValue('100000000');
+    const { app } = createApp({ getSupply });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/statistics/circulating-supply`);
+
+      expect(response.status).toBe(501);
+      await expect(readJson(response)).resolves.toEqual({
+        message: 'Circulating supply lookup is not implemented',
+        code: 1,
+      });
+      expect(getSupply).not.toHaveBeenCalled();
+    });
+  });
+
+  test('GET /peer returns not implemented when peer hook is missing', async () => {
+    const { app } = createApp();
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/peer`);
+
+      expect(response.status).toBe(501);
+      await expect(readJson(response)).resolves.toEqual({
+        message: 'Peer lookup is not implemented',
         code: 1,
       });
     });

@@ -14,7 +14,21 @@ import { isValidHash, normalizeHash, parseBlockDate, parseLimit } from './utils'
 
 export type InsightClickHouse = Pick<ClickHouseConnection, 'query' | 'queryOne'>;
 
-export type InsightRPC = Pick<FluxRPCClient, 'estimateFee' | 'sendRawTransaction'> & {
+export type InsightRPC = Pick<
+  FluxRPCClient,
+  | 'estimateFee'
+  | 'sendRawTransaction'
+  | 'getDifficulty'
+  | 'getBestBlockHash'
+  | 'getMiningInfo'
+  | 'getPeerInfo'
+  | 'getInfo'
+  | 'getVersion'
+  | 'verifyMessage'
+  | 'viewDeterministicFluxNodeList'
+  | 'dosList'
+  | 'startList'
+> & {
   getBlock(hashOrHeight: string | number, verbosity?: 0 | 1 | 2): Promise<unknown>;
   getRawTransaction(txid: string, verbose?: boolean): Promise<unknown>;
 };
@@ -359,6 +373,130 @@ export class InsightCompatibilityService {
     return Object.fromEntries(entries) as Record<number, number>;
   }
 
+  async getStatus(query: string | undefined): Promise<unknown> {
+    switch (query) {
+      case 'getDifficulty':
+        return { difficulty: await this.rpc.getDifficulty() };
+      case 'getBestBlockHash':
+        return { bestblockhash: await this.rpc.getBestBlockHash() };
+      case 'getLastBlockHash': {
+        const hash = await this.rpc.getBestBlockHash();
+        return { syncTipHash: hash, lastblockhash: hash };
+      }
+      case 'getMiningInfo':
+        return { miningInfo: await this.rpc.getMiningInfo() };
+      case 'getPeerInfo':
+        return { peerInfo: await this.rpc.getPeerInfo() };
+      case 'getFluxNodes':
+        return { fluxNodes: await this.rpc.viewDeterministicFluxNodeList() };
+      case 'getZelNodes':
+        return { zelNodes: await this.rpc.viewDeterministicFluxNodeList() };
+      case 'getInfo':
+      default:
+        return { info: await this.rpc.getInfo() };
+    }
+  }
+
+  async getSync(): Promise<{
+    status: 'syncing' | 'finished';
+    blockChainHeight: number;
+    syncPercentage: number;
+    height: number;
+    error: null;
+    type: 'bitcore node';
+  }> {
+    const sync = await this.ch.queryOne<{
+      current_height?: string | number;
+      chain_height?: string | number;
+      sync_percentage?: string | number;
+      is_syncing?: string | number | boolean;
+    }>(`
+      SELECT
+        argMax(current_height, updated_at) AS current_height,
+        argMax(chain_height, updated_at) AS chain_height,
+        argMax(sync_percentage, updated_at) AS sync_percentage,
+        argMax(is_syncing, updated_at) AS is_syncing
+      FROM sync_state
+      WHERE id = 1
+    `);
+    const rawHeight = parseSignedSafeInteger(sync?.current_height) ?? 0;
+    const height = Math.max(0, rawHeight);
+    const blockChainHeight = parseNonNegativeHeightValue(sync?.chain_height)
+      ?? height;
+    const syncPercentage = normalizePercentage(
+      sync?.sync_percentage,
+      height,
+      blockChainHeight
+    );
+    const isSyncing = parseBooleanFlag(sync?.is_syncing) === true
+      || syncPercentage < 100
+      || height < blockChainHeight;
+
+    return {
+      status: isSyncing ? 'syncing' : 'finished',
+      blockChainHeight,
+      syncPercentage,
+      height,
+      error: null,
+      type: 'bitcore node',
+    };
+  }
+
+  getPeer(): { connected: true; host: '127.0.0.1'; port: null } {
+    return { connected: true, host: '127.0.0.1', port: null };
+  }
+
+  async getVersion(): Promise<unknown> {
+    return this.rpc.getVersion();
+  }
+
+  async verifyMessage(address: string, signature: string, message: string): Promise<boolean> {
+    return this.rpc.verifyMessage(address, signature, message);
+  }
+
+  async listFluxNodes(filter?: string): Promise<unknown> {
+    const response = await this.rpc.viewDeterministicFluxNodeList();
+    const trimmedFilter = filter?.trim();
+
+    if (!trimmedFilter) {
+      return response;
+    }
+
+    const envelope = normalizeFluxNodeEnvelope(response);
+    return {
+      result: filterFluxNodeResult(envelope.result, trimmedFilter),
+      error: envelope.error,
+      id: envelope.id,
+    };
+  }
+
+  async getSupply(): Promise<string> {
+    const row = await this.ch.queryOne<{ total_supply?: string | number | bigint }>(`
+      SELECT toString(total_supply) AS total_supply
+      FROM supply_stats
+      ORDER BY block_height DESC, _version DESC
+      LIMIT 1
+    `);
+
+    return zatoshiString(row?.total_supply);
+  }
+
+  getCurrency(): { status: 'ok'; data: null; timestamp: string } {
+    return { status: 'ok', data: null, timestamp: new Date().toISOString() };
+  }
+
+  getMarketsInfo(): { rate: null; currency: 'USD'; source: null; timestamp: string } {
+    return { rate: null, currency: 'USD', source: null, timestamp: new Date().toISOString() };
+  }
+
+  async dosList(): Promise<unknown> {
+    return this.rpc.dosList();
+  }
+
+  async startList(): Promise<unknown> {
+    return this.rpc.startList();
+  }
+
   private async getLatestBlockByHeight(height: number): Promise<VersionedInsightBlockRow | null> {
     return this.ch.queryOne<VersionedInsightBlockRow>(`
       SELECT height, hash, prev_hash, merkle_root, timestamp, bits, nonce, version,
@@ -644,6 +782,107 @@ function parseHeightValue(value: unknown): number | null {
   return parseHeight(Number(trimmed));
 }
 
+function parseSignedSafeInteger(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) ? value : null;
+  }
+
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!/^-?\d+$/.test(trimmed)) {
+    return null;
+  }
+
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function parseFiniteNumber(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizePercentage(value: unknown, height: number, chainHeight: number): number {
+  const parsed = parseFiniteNumber(value);
+  if (parsed !== null) {
+    return clampPercentage(parsed);
+  }
+
+  if (chainHeight > 0 && height >= 0) {
+    return clampPercentage((height / chainHeight) * 100);
+  }
+
+  return 0;
+}
+
+function clampPercentage(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+
+  return Math.min(100, Math.max(0, value));
+}
+
+function parseBooleanFlag(value: unknown): boolean | null {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'number') {
+    if (value === 1) return true;
+    if (value === 0) return false;
+    return null;
+  }
+
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === '1' || normalized === 'true') {
+    return true;
+  }
+
+  if (normalized === '0' || normalized === 'false') {
+    return false;
+  }
+
+  return null;
+}
+
+function zatoshiString(value: unknown): string {
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && Number.isInteger(value) ? value.toString() : '0';
+  }
+
+  if (typeof value !== 'string') {
+    return '0';
+  }
+
+  const trimmed = value.trim();
+  return /^-?\d+$/.test(trimmed) ? trimmed : '0';
+}
+
 function normalizeHashOrNull(hash: string): string | null {
   if (!isValidHash(hash)) {
     return null;
@@ -742,6 +981,161 @@ function parseVout(value: unknown): number | null {
 
   const parsed = Number(trimmed);
   return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function normalizeFluxNodeEnvelope(response: unknown): { result: unknown; error: unknown; id: unknown } {
+  if (isRecord(response) && 'result' in response) {
+    return {
+      result: response.result,
+      error: 'error' in response ? response.error : null,
+      id: 'id' in response ? response.id : null,
+    };
+  }
+
+  return { result: response, error: null, id: null };
+}
+
+function filterFluxNodeResult(result: unknown, filter: string): unknown {
+  const filters = filter
+    .split(',')
+    .map((part) => part.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (filters.length === 0) {
+    return result;
+  }
+
+  if (Array.isArray(result)) {
+    return result.filter((node) => filters.some((entry) => fluxNodeMatches(node, entry)));
+  }
+
+  if (isRecord(result)) {
+    return Object.fromEntries(
+      Object.entries(result).filter(([key, node]) => (
+        filters.some((entry) => fluxNodeMatches(node, entry, key))
+      ))
+    );
+  }
+
+  return filters.some((entry) => fluxNodeMatches(result, entry)) ? result : [];
+}
+
+function fluxNodeMatches(node: unknown, filter: string, key?: string): boolean {
+  const collateralFilter = parseCollateralFilter(filter);
+  if (collateralFilter) {
+    return fluxNodeCollateralMatches(node, collateralFilter, key);
+  }
+
+  if (key && key.toLowerCase().includes(filter)) {
+    return true;
+  }
+
+  if (isRecord(node)) {
+    if (fluxNodeOutpoints(node).some((outpoint) => outpoint.toLowerCase().includes(filter))) {
+      return true;
+    }
+
+    if (fluxNodeIps(node).some((ip) => ip.toLowerCase().includes(filter))) {
+      return true;
+    }
+  }
+
+  return stringifyForSearch(node).includes(filter);
+}
+
+function parseCollateralFilter(filter: string): { outpoint: string; txhash: string; outidx: string } | null {
+  const match = /^([0-9a-f]{1,64})-(\d+)$/.exec(filter);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    outpoint: `${match[1]}-${match[2]}`,
+    txhash: match[1],
+    outidx: match[2],
+  };
+}
+
+function fluxNodeCollateralMatches(
+  node: unknown,
+  filter: { outpoint: string; txhash: string; outidx: string },
+  key?: string
+): boolean {
+  if (key && key.toLowerCase() === filter.outpoint) {
+    return true;
+  }
+
+  if (!isRecord(node)) {
+    return stringValue(node)?.toLowerCase() === filter.outpoint;
+  }
+
+  return fluxNodeOutpoints(node).some((outpoint) => outpoint.toLowerCase() === filter.outpoint);
+}
+
+function fluxNodeOutpoints(node: Record<string, unknown>): string[] {
+  const hashes = [
+    node.txhash,
+    node.txid,
+    node.collateralHash,
+    node.collateral_hash,
+    node.collateralTxHash,
+    node.collateral_txhash,
+    node.collateral_txid,
+  ].map(stringValue).filter((value): value is string => value !== null);
+  const indexes = [
+    node.outidx,
+    node.vout,
+    node.outputIndex,
+    node.output_index,
+    node.collateralIndex,
+    node.collateral_index,
+  ].map(stringValue).filter((value): value is string => value !== null);
+  const explicit = [
+    node.collateral,
+    node.outpoint,
+    node.vin,
+  ].map(stringValue).filter((value): value is string => value !== null);
+
+  return [
+    ...explicit,
+    ...hashes.flatMap((hash) => indexes.map((index) => `${hash}-${index}`)),
+  ];
+}
+
+function fluxNodeIps(node: Record<string, unknown>): string[] {
+  return [
+    node.ip,
+    node.addr,
+    node.address,
+    node.ip_address,
+    node.networkAddress,
+    node.network_address,
+  ].map(stringValue).filter((value): value is string => value !== null);
+}
+
+function stringValue(value: unknown): string | null {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+
+  return null;
+}
+
+function stringifyForSearch(value: unknown): string {
+  try {
+    return JSON.stringify(value)?.toLowerCase() ?? '';
+  } catch {
+    return '';
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
