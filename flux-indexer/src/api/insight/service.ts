@@ -678,7 +678,7 @@ export class InsightCompatibilityService {
       }>(`
         SELECT
           toString(count()) AS n_blocks_mined,
-          ifNull(avg(timestamp - previous_timestamp), 0) AS time_between_blocks,
+          ifNull(avgIf(timestamp - previous_timestamp, previous_timestamp > 0), 0) AS time_between_blocks,
           toString(sum(producer_reward)) AS mined_currency_amount,
           ifNull(avg(difficulty), 0) AS difficulty
         FROM (
@@ -697,7 +697,6 @@ export class InsightCompatibilityService {
           )
           WHERE is_valid = 1
         )
-        WHERE previous_timestamp > 0 OR previous_timestamp IS NULL
       `, { cutoff }),
       this.ch.queryOne<{
         number_of_transactions?: string | number;

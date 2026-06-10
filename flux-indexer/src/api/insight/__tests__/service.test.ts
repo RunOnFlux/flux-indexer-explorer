@@ -938,6 +938,10 @@ describe('InsightCompatibilityService', () => {
         { address: 'pool-b', poolName: 'pool-b', url: null, blocks_found: 1, percent_total: 33.333333 },
       ],
     });
+    const blockSql = ch.queryOne.mock.calls[0][0];
+    expect(blockSql).toContain('toString(count()) AS n_blocks_mined');
+    expect(blockSql).toContain('avgIf(timestamp - previous_timestamp, previous_timestamp > 0)');
+    expect(blockSql).not.toMatch(/WHERE\s+previous_timestamp/i);
     const poolSql = ch.query.mock.calls[0][0];
     expect(poolSql).toContain('count() AS blocks_found_count');
     expect(poolSql).toContain('toString(blocks_found_count) AS blocks_found');
