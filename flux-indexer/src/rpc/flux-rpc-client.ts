@@ -260,6 +260,14 @@ export class FluxRPCClient {
     return this.call('getrawtransaction', [txid, verboseInt]);
   }
 
+  async sendRawTransaction(rawtx: string): Promise<string> {
+    return this.call('sendrawtransaction', [rawtx]);
+  }
+
+  async verifyMessage(address: string, signature: string, message: string): Promise<boolean> {
+    return this.call('verifymessage', [address, signature, message]);
+  }
+
   /**
    * Get raw mempool
    * @param verbose - If true, returns detailed info; if false, returns txids
@@ -345,6 +353,68 @@ export class FluxRPCClient {
     relayfee: number;
   }> {
     return this.call('getnetworkinfo');
+  }
+
+  async getPeerInfo(): Promise<any[]> {
+    return this.call('getpeerinfo');
+  }
+
+  async getMiningInfo(): Promise<any> {
+    return this.call('getmininginfo');
+  }
+
+  async getInfo(): Promise<any> {
+    try {
+      return await this.call('getinfo');
+    } catch (error) {
+      if (!(error instanceof RPCError) || error.rpcCode !== -32601) {
+        throw error;
+      }
+
+      const [chain, network] = await Promise.all([
+        this.getBlockchainInfo(),
+        this.getNetworkInfo(),
+      ]);
+      return {
+        version: network.version,
+        protocolversion: network.protocolversion,
+        walletversion: 0,
+        blocks: chain.blocks,
+        timeoffset: 0,
+        connections: network.connections,
+        proxy: '',
+        difficulty: chain.difficulty,
+        testnet: chain.chain !== 'main',
+        relayfee: network.relayfee,
+        errors: '',
+        network: chain.chain,
+        reward: 0,
+      };
+    }
+  }
+
+  async getVersion(): Promise<any> {
+    return this.call('getnetworkinfo');
+  }
+
+  async viewDeterministicFluxNodeList(): Promise<any> {
+    try {
+      return await this.call('viewdeterministiczelnodelist', []);
+    } catch (error) {
+      if (!(error instanceof RPCError) || error.rpcCode !== -32601) {
+        throw error;
+      }
+
+      return this.call('listfluxnodes', []);
+    }
+  }
+
+  async dosList(): Promise<any> {
+    return this.call('getdoslist');
+  }
+
+  async startList(): Promise<any> {
+    return this.call('getstartlist');
   }
 
   /**
