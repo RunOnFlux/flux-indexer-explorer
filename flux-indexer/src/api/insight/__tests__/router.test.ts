@@ -1,5 +1,6 @@
 import express from 'express';
 import { RPCError } from '../../../types';
+import { ClickHouseAPIServer } from '../../server';
 import { createInsightCompatibilityRouter, type InsightRouterService } from '../router';
 import { readJson, withTestServer } from './http-test-utils';
 
@@ -33,6 +34,36 @@ function createApp(serviceOverrides: Partial<MockInsightRouterService> = {}) {
   app.use('/insight-api', createInsightCompatibilityRouter(service));
   return { app, service };
 }
+
+describe('Insight server mount', () => {
+  test('mounts Insight compatibility routes without changing API 404 behavior', async () => {
+    const ch = {
+      query: jest.fn(),
+      queryOne: jest.fn(),
+      queryCount: jest.fn(),
+    } as unknown as ConstructorParameters<typeof ClickHouseAPIServer>[0];
+    const rpc = {} as unknown as ConstructorParameters<typeof ClickHouseAPIServer>[1];
+    const syncEngine = {} as unknown as ConstructorParameters<typeof ClickHouseAPIServer>[2];
+    const server = new ClickHouseAPIServer(ch, rpc, syncEngine, 0);
+    const app = server.getApp();
+
+    await withTestServer(app, async (baseUrl) => {
+      const insightResponse = await fetch(`${baseUrl}/insight-api/not-real`);
+
+      expect(insightResponse.status).toBe(404);
+      await expect(readJson(insightResponse)).resolves.toEqual({
+        status: 404,
+        url: '/insight-api/not-real',
+        error: 'Not found',
+      });
+
+      const apiResponse = await fetch(`${baseUrl}/api/not-real`);
+
+      expect(apiResponse.status).toBe(404);
+      await expect(readJson(apiResponse)).resolves.toEqual({ error: 'Not found' });
+    });
+  });
+});
 
 describe('Insight core routes', () => {
   test('GET /block/:hash returns legacy block shape', async () => {

@@ -14,6 +14,8 @@ import { ClickHouseSyncEngine } from '../indexer/sync-engine';
 import type { Transaction } from '../types';
 import { logger } from '../utils/logger';
 import { extractTransactionFromBlock } from '../parsers/block-parser';
+import { createInsightCompatibilityRouter } from './insight/router';
+import { InsightCompatibilityService } from './insight/service';
 
 export class ClickHouseAPIServer {
   private app: express.Application;
@@ -318,6 +320,13 @@ export class ClickHouseAPIServer {
   }
 
   private setupRoutes(): void {
+    const insightService = new InsightCompatibilityService(
+      this.ch,
+      this.rpc,
+      this.getMempoolAddressDeltas.bind(this)
+    );
+    this.app.use('/insight-api', createInsightCompatibilityRouter(insightService));
+
     // Status endpoints
     this.app.get('/api/v1/status', this.getStatus.bind(this));
     this.app.get('/api/v1/sync', this.getSyncStatus.bind(this));
@@ -370,11 +379,19 @@ export class ClickHouseAPIServer {
     this.app.use(express.static(frontendPath));
 
     this.app.get('*', (req, res) => {
+      if (req.path.startsWith('/insight-api/')) {
+        return res.status(404).json({ status: 404, url: req.originalUrl, error: 'Not found' });
+      }
+
       if (req.path.startsWith('/api/') || req.path === '/health') {
         return res.status(404).json({ error: 'Not found' });
       }
       res.sendFile(path.join(frontendPath, 'index.html'));
     });
+  }
+
+  public getApp(): express.Application {
+    return this.app;
   }
 
   private setupErrorHandling(): void {
