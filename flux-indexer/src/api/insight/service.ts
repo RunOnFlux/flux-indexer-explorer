@@ -85,6 +85,13 @@ type InsightUtxoQueryRow = Omit<InsightUtxoRow, 'confirmations'> & {
   confirmations?: number;
   script_type?: string | null;
 };
+type PoolStatisticRow = {
+  address: string;
+  poolName: string;
+  url: null;
+  blocks_found: number;
+  percent_total: number;
+};
 
 export interface InsightFluxnodeTransactionRow {
   type: number;
@@ -107,13 +114,14 @@ const DEFAULT_MEMPOOL_DELTA = { balanceDelta: 0n, txCount: 0 };
 const RECENT_BLOCK_LOOKBACK_BUFFER = 250;
 const MAX_UTXO_ADDRESSES = 100;
 const MAX_UTXO_ROWS = 5000;
+const MAX_BLOCK_TRANSACTION_LOOKUP = 200;
 const MAX_ADDRESS_TX_LIMIT = 50;
 const DEFAULT_STATISTIC_DAYS = 365;
 const MAX_STATISTIC_DAYS = 730;
 const SATOSHIS_PER_FLUX = 100000000n;
 const RICH_LIST_LIMIT = 200;
 const BALANCE_INTERVALS = [
-  { label: '0-1 FLUX', min: 1n, max: 1n * SATOSHIS_PER_FLUX },
+  { label: '0-1 FLUX', min: 0n, max: 1n * SATOSHIS_PER_FLUX },
   { label: '1-10 FLUX', min: 1n * SATOSHIS_PER_FLUX, max: 10n * SATOSHIS_PER_FLUX },
   { label: '10-100 FLUX', min: 10n * SATOSHIS_PER_FLUX, max: 100n * SATOSHIS_PER_FLUX },
   { label: '100-1,000 FLUX', min: 100n * SATOSHIS_PER_FLUX, max: 1000n * SATOSHIS_PER_FLUX },
@@ -404,7 +412,7 @@ export class InsightCompatibilityService {
     }
 
     const transactions = await Promise.all(
-      block.txids.map((txid) => this.getTransaction(txid))
+      block.txids.slice(0, MAX_BLOCK_TRANSACTION_LOOKUP).map((txid) => this.getTransaction(txid))
     );
 
     return transactions.filter(isPresent);
@@ -496,7 +504,7 @@ export class InsightCompatibilityService {
     ), 0n);
 
     return {
-      balance: zatoshisToSafeNumber(confirmedBalance + unconfirmedBalance),
+      balance: zatoshisToSafeNumber(confirmedBalance),
       unconfirmedBalance: zatoshisToSafeNumber(unconfirmedBalance),
       immature: 0,
     };
@@ -635,7 +643,7 @@ export class InsightCompatibilityService {
       case 'fees':
         return this.getFeeStatisticSeries(days);
       case 'network-hash':
-        return this.getBlockStatisticSeries(days, 'network-hash');
+        throw new Error('Network hash statistics are not implemented');
       case 'transactions':
         return this.getTransactionCountStatisticSeries(days);
       case 'outputs':
@@ -658,7 +666,7 @@ export class InsightCompatibilityService {
     outputs_volume: string;
     difficulty: number;
     network_hash_ps: number;
-    blocks_by_pool: Array<{ pool_name: string; blocks_found: number; percent_total: number }>;
+    blocks_by_pool: PoolStatisticRow[];
   }> {
     const cutoff = Math.max(0, Math.floor(Date.now() / 1000) - 86400);
     const [blockStats, txStats, poolRows] = await Promise.all([
@@ -721,7 +729,7 @@ export class InsightCompatibilityService {
       number_of_transactions: safeCount(txStats?.number_of_transactions),
       outputs_volume: zatoshisToFluxString(zatoshiString(txStats?.outputs_volume)),
       difficulty: finiteNumber(blockStats?.difficulty),
-      network_hash_ps: finiteNumber(blockStats?.difficulty),
+      network_hash_ps: 0,
       blocks_by_pool: blocksByPool,
     };
   }
@@ -729,7 +737,7 @@ export class InsightCompatibilityService {
   async getPools(dateRaw?: string): Promise<{
     date: string;
     n_blocks_mined: number;
-    blocks_by_pool: Array<{ pool_name: string; blocks_found: number; percent_total: number }>;
+    blocks_by_pool: PoolStatisticRow[];
     pagination: { current: string; next: string; prev: string };
   }> {
     const blockDate = parseBlockDate(dateRaw);
@@ -750,7 +758,7 @@ export class InsightCompatibilityService {
 
   async getPoolsLastHour(): Promise<{
     n_blocks_mined: number;
-    blocks_by_pool: Array<{ pool_name: string; blocks_found: number; percent_total: number }>;
+    blocks_by_pool: PoolStatisticRow[];
   }> {
     const cutoff = Math.max(0, Math.floor(Date.now() / 1000) - 3600);
     const blocksByPool = formatPoolRows(await this.queryPoolRows({ cutoff }));
@@ -762,13 +770,13 @@ export class InsightCompatibilityService {
   }
 
   async getBalanceIntervals(): Promise<Array<{
-    interval: string;
     min: string;
     max: string | null;
     count: number;
+    sum: string | number;
   }>> {
-    const rows = await this.ch.query<{ bucket: string; count?: string | number }>(`
-      SELECT bucket, toString(count()) AS count
+    const rows = await this.ch.query<{ bucket: string; count?: string | number; sum?: string | number }>(`
+      SELECT bucket, toString(count()) AS count, toString(sum(balance)) AS sum
       FROM (
         SELECT
           multiIf(
@@ -795,20 +803,20 @@ export class InsightCompatibilityService {
       tenThousand: Number(10000n * SATOSHIS_PER_FLUX),
     });
     const counts = new Map(rows.map((row) => [row.bucket, safeCount(row.count)]));
+    const sums = new Map(rows.map((row) => [row.bucket, zatoshisToSafeNumber(zatoshiString(row.sum))]));
 
     return BALANCE_INTERVALS.map((bucket) => ({
-      interval: bucket.label,
       min: bucket.min.toString(),
       max: bucket.max?.toString() ?? null,
       count: counts.get(bucket.label) ?? 0,
+      sum: sums.get(bucket.label) ?? 0,
     }));
   }
 
-  async getRicherThan(): Promise<{
-    currency: 'FLUX';
-    unit: 'flux';
-    thresholds: Array<{ flux: number; balance: string; count: number }>;
-  }> {
+  async getRicherThan(): Promise<Array<{
+    amount_flux: number;
+    count_addresses: number;
+  }>> {
     const rows = await this.ch.query<{ threshold?: string | number; count?: string | number }>(`
       SELECT threshold, toString(count()) AS count
       FROM (
@@ -825,15 +833,10 @@ export class InsightCompatibilityService {
     `, { thresholds: RICHER_THAN_THRESHOLDS.map((threshold) => Number(threshold.zatoshis)) });
     const counts = new Map(rows.map((row) => [zatoshiString(row.threshold), safeCount(row.count)]));
 
-    return {
-      currency: 'FLUX',
-      unit: 'flux',
-      thresholds: RICHER_THAN_THRESHOLDS.map((threshold) => ({
-        flux: Number(threshold.flux),
-        balance: threshold.zatoshis.toString(),
-        count: counts.get(threshold.zatoshis.toString()) ?? 0,
-      })),
-    };
+    return RICHER_THAN_THRESHOLDS.map((threshold) => ({
+      amount_flux: Number(threshold.flux),
+      count_addresses: counts.get(threshold.zatoshis.toString()) ?? 0,
+    }));
   }
 
   async getRichestAddressesList(): Promise<Array<{
@@ -974,12 +977,43 @@ export class InsightCompatibilityService {
       block_count?: string | number;
     }>(`
       SELECT
-        toString(toDate(hour)) AS date,
-        toString(sum(tx_count)) AS transaction_count,
-        toString(sum(block_count)) AS block_count
-      FROM mv_hourly_tx_count
-      WHERE hour >= now() - toIntervalDay({days:UInt16})
-      GROUP BY date
+        date,
+        toString(ifNull(transaction_count, 0)) AS transaction_count,
+        toString(ifNull(block_count, 0)) AS block_count
+      FROM (
+        SELECT date, transaction_count
+        FROM (
+          SELECT
+            toString(toDate(toDateTime(timestamp))) AS date,
+            count() AS transaction_count
+          FROM (
+            SELECT txid, timestamp, is_valid
+            FROM transactions
+            WHERE timestamp >= toUInt32(toUnixTimestamp(now() - toIntervalDay({days:UInt16})))
+            ORDER BY txid, _version DESC
+            LIMIT 1 BY txid
+          )
+          WHERE is_valid = 1
+          GROUP BY date
+        )
+      ) AS tx_by_day
+      FULL OUTER JOIN (
+        SELECT date, block_count
+        FROM (
+          SELECT
+            toString(toDate(toDateTime(timestamp))) AS date,
+            count() AS block_count
+          FROM (
+            SELECT height, timestamp, is_valid
+            FROM blocks
+            WHERE timestamp >= toUInt32(toUnixTimestamp(now() - toIntervalDay({days:UInt16})))
+            ORDER BY height, _version DESC
+            LIMIT 1 BY height
+          )
+          WHERE is_valid = 1
+          GROUP BY date
+        )
+      ) AS blocks_by_day USING date
       ORDER BY date ASC
     `, { days });
 
@@ -1369,19 +1403,18 @@ function dateText(value: unknown): string {
   return '';
 }
 
-function formatPoolRows(rows: Array<{ producer?: string | null; blocks_found?: string | number }>): Array<{
-  pool_name: string;
-  blocks_found: number;
-  percent_total: number;
-}> {
+function formatPoolRows(rows: Array<{ producer?: string | null; blocks_found?: string | number }>): PoolStatisticRow[] {
   const pools = rows.map((row) => ({
-    pool_name: poolName(row.producer),
+    name: poolName(row.producer),
     blocks_found: safeCount(row.blocks_found),
   }));
   const total = pools.reduce((sum, pool) => sum + pool.blocks_found, 0);
 
   return pools.map((pool) => ({
-    ...pool,
+    address: pool.name,
+    poolName: pool.name,
+    url: null,
+    blocks_found: pool.blocks_found,
     percent_total: total > 0 ? roundPercent((pool.blocks_found / total) * 100) : 0,
   }));
 }

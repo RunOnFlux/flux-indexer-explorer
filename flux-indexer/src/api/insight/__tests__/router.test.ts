@@ -808,6 +808,22 @@ describe('Insight core routes', () => {
     });
   });
 
+  test('GET /statistics/network-hash is explicit not implemented', async () => {
+    const getStatisticSeries = jest.fn().mockResolvedValue([{ date: '2026-06-10', sum: 42 }]);
+    const { app } = createApp({ getStatisticSeries });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/statistics/network-hash`);
+
+      expect(response.status).toBe(501);
+      await expect(readJson(response)).resolves.toEqual({
+        message: 'Network hash statistics lookup is not implemented',
+        code: 1,
+      });
+      expect(getStatisticSeries).not.toHaveBeenCalled();
+    });
+  });
+
   test('GET /statistics/total returns total statistics from service hook', async () => {
     const getStatisticsTotal = jest.fn().mockResolvedValue({
       n_blocks_mined: 10,

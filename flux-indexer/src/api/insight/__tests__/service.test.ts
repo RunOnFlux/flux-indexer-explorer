@@ -607,6 +607,38 @@ describe('InsightCompatibilityService', () => {
     expect(ch.query.mock.calls[0][0]).toContain('OFFSET {offset:UInt32}');
   });
 
+  test('caps multi-address transaction range limit before fetching full tx details', async () => {
+    const { service, ch } = createService();
+    let txLookupParams: Record<string, unknown> | undefined;
+
+    ch.query.mockImplementation(async (sql: string, params?: Record<string, unknown>) => {
+      if (sql.includes('FROM address_transactions')) {
+        txLookupParams = params;
+        return [];
+      }
+
+      throw new Error(`Unexpected query: ${sql}`);
+    });
+    ch.queryOne.mockImplementation(async (sql: string) => {
+      if (sql.includes('FROM address_transactions') && sql.includes('uniqExact(txid)')) {
+        return { totalItems: '0' };
+      }
+
+      throw new Error(`Unexpected queryOne: ${sql}`);
+    });
+
+    const insight = service as unknown as {
+      getAddressTransactions(
+        addresses: string[],
+        range: { from: number; to: number; limit: number }
+      ): Promise<{ totalItems: number; items: unknown[] }>;
+    };
+
+    await expect(insight.getAddressTransactions(['alpha'], { from: 0, to: 500, limit: 500 }))
+      .resolves.toEqual({ totalItems: 0, items: [] });
+    expect(txLookupParams).toMatchObject({ limit: 50, offset: 0 });
+  });
+
   test('sums multi-address balances with requested mempool deltas using safe zatoshi output', async () => {
     const { service, ch, getMempoolAddressDeltas } = createService();
     ch.queryOne.mockResolvedValue({ balance: '9007199254740992' });
@@ -626,7 +658,7 @@ describe('InsightCompatibilityService', () => {
 
     await expect(insight.getAddressBalanceSum([' alpha ', 'beta', 'alpha', '']))
       .resolves.toEqual({
-        balance: '9007199254740997',
+        balance: '9007199254740992',
         unconfirmedBalance: 5,
         immature: 0,
       });
@@ -635,6 +667,32 @@ describe('InsightCompatibilityService', () => {
     expect(sql).toContain('sumMerge(balance)');
     expect(sql).toContain('address IN {addresses:Array(String)}');
     expect(params).toEqual({ addresses: ['alpha', 'beta'] });
+  });
+
+  test('caps block transaction list lookups before fetching full tx details', async () => {
+    const { service } = createService();
+    const txids = Array.from({ length: 205 }, (_, index) => `${index}`.padStart(64, '0'));
+    jest.spyOn(service, 'getBlock').mockResolvedValue({
+      block: { hash: 'a'.repeat(64), height: 1 } as any,
+      txids,
+      confirmations: 1,
+      nextBlockHash: null,
+    });
+    const getTransaction = jest.spyOn(service, 'getTransaction')
+      .mockImplementation(async (txid: string) => ({
+        tx: { txid } as any,
+        outputs: [],
+        inputs: [],
+        confirmations: 1,
+        blockHash: 'a'.repeat(64),
+      }));
+
+    const result = await service.getTransactionsByBlock('a'.repeat(64));
+
+    expect(result).toHaveLength(200);
+    expect(getTransaction).toHaveBeenCalledTimes(200);
+    expect(getTransaction).toHaveBeenNthCalledWith(1, txids[0]);
+    expect(getTransaction).toHaveBeenNthCalledWith(200, txids[199]);
   });
 
   test('broadcasts raw transaction and returns txid', async () => {
@@ -797,6 +855,132 @@ describe('InsightCompatibilityService', () => {
     expect(params).toEqual({ days: 30 });
   });
 
+  test('does not alias network hash statistic series to difficulty', async () => {
+    const { service, ch } = createService();
+    const insight = service as unknown as {
+      getStatisticSeries(kind: string, rawDays?: string): Promise<unknown[]>;
+    };
+
+    await expect(insight.getStatisticSeries('network-hash', '30'))
+      .rejects.toThrow('Network hash statistics are not implemented');
+    expect(ch.query).not.toHaveBeenCalled();
+  });
+
+  test('gets transaction statistic series from latest valid transaction and block rows', async () => {
+    const { service, ch } = createService();
+    ch.query.mockResolvedValue([
+      { date: '2026-06-10', transaction_count: '7', block_count: '2' },
+    ]);
+    const insight = service as unknown as {
+      getStatisticSeries(
+        kind: string,
+        rawDays?: string
+      ): Promise<Array<{ date: string; transaction_count: number; block_count: number }>>;
+    };
+
+    await expect(insight.getStatisticSeries('transactions', '14')).resolves.toEqual([
+      { date: '2026-06-10', transaction_count: 7, block_count: 2 },
+    ]);
+
+    const [sql, params] = ch.query.mock.calls[0];
+    expect(sql).toContain('FROM transactions');
+    expect(sql).toContain('FROM blocks');
+    expect(sql).toContain('LIMIT 1 BY txid');
+    expect(sql).toContain('LIMIT 1 BY height');
+    expect(sql).not.toContain('mv_hourly_tx_count');
+    expect(params).toEqual({ days: 14 });
+  });
+
+  test('gets total statistics with legacy pool keys and no fake network hash', async () => {
+    const { service, ch } = createService();
+    ch.queryOne.mockImplementation(async (sql: string) => {
+      if (sql.includes('n_blocks_mined')) {
+        return {
+          n_blocks_mined: '3',
+          time_between_blocks: 120,
+          mined_currency_amount: '15000000000',
+          difficulty: 42,
+        };
+      }
+
+      if (sql.includes('number_of_transactions')) {
+        return {
+          number_of_transactions: '9',
+          transaction_fees: '123000000',
+          outputs_volume: '456000000',
+        };
+      }
+
+      throw new Error(`Unexpected queryOne: ${sql}`);
+    });
+    ch.query.mockResolvedValue([
+      { producer: 'pool-a', blocks_found: '2' },
+      { producer: 'pool-b', blocks_found: '1' },
+    ]);
+
+    const insight = service as unknown as {
+      getStatisticsTotal(): Promise<{
+        network_hash_ps: number;
+        blocks_by_pool: Array<{
+          address: string;
+          poolName: string;
+          url: string | null;
+          blocks_found: number;
+          percent_total: number;
+        }>;
+      }>;
+    };
+
+    await expect(insight.getStatisticsTotal()).resolves.toMatchObject({
+      network_hash_ps: 0,
+      blocks_by_pool: [
+        { address: 'pool-a', poolName: 'pool-a', url: null, blocks_found: 2, percent_total: 66.666667 },
+        { address: 'pool-b', poolName: 'pool-b', url: null, blocks_found: 1, percent_total: 33.333333 },
+      ],
+    });
+  });
+
+  test('gets balance intervals with legacy count and sum fields', async () => {
+    const { service, ch } = createService();
+    ch.query.mockResolvedValue([
+      { bucket: '1-10 FLUX', count: '2', sum: '300000000' },
+      { bucket: '10,000+ FLUX', count: 1, sum: '1000000000000' },
+    ]);
+
+    const insight = service as unknown as {
+      getBalanceIntervals(): Promise<Array<{ min: string; max: string | null; count: number; sum: string | number }>>;
+    };
+
+    const result = await insight.getBalanceIntervals();
+
+    expect(result).toEqual(expect.arrayContaining([
+      { min: '100000000', max: '1000000000', count: 2, sum: 300000000 },
+      { min: '1000000000000', max: null, count: 1, sum: 1000000000000 },
+    ]));
+    const [sql] = ch.query.mock.calls[0];
+    expect(sql).toContain('toString(sum(balance)) AS sum');
+  });
+
+  test('gets richer-than statistics as a FLUX-denominated array', async () => {
+    const { service, ch } = createService();
+    ch.query.mockResolvedValue([
+      { threshold: '100000000', count: '3' },
+      { threshold: '1000000000', count: 2 },
+    ]);
+
+    const insight = service as unknown as {
+      getRicherThan(): Promise<Array<{ amount_flux: number; count_addresses: number }>>;
+    };
+
+    const result = await insight.getRicherThan();
+
+    expect(Array.isArray(result)).toBe(true);
+    expect(result).toEqual(expect.arrayContaining([
+      { amount_flux: 1, count_addresses: 3 },
+      { amount_flux: 10, count_addresses: 2 },
+    ]));
+  });
+
   test('gets pool statistics for a validated date with pagination metadata', async () => {
     const { service, ch } = createService();
     ch.query.mockResolvedValue([
@@ -808,7 +992,13 @@ describe('InsightCompatibilityService', () => {
       getPools(dateRaw?: string): Promise<{
         date: string;
         n_blocks_mined: number;
-        blocks_by_pool: Array<{ pool_name: string; blocks_found: number; percent_total: number }>;
+        blocks_by_pool: Array<{
+          address: string;
+          poolName: string;
+          url: string | null;
+          blocks_found: number;
+          percent_total: number;
+        }>;
         pagination: { current: string; next: string; prev: string };
       }>;
     };
@@ -817,8 +1007,8 @@ describe('InsightCompatibilityService', () => {
       date: '2026-06-10',
       n_blocks_mined: 4,
       blocks_by_pool: [
-        { pool_name: 'pool-a', blocks_found: 3, percent_total: 75 },
-        { pool_name: 'Unknown', blocks_found: 1, percent_total: 25 },
+        { address: 'pool-a', poolName: 'pool-a', url: null, blocks_found: 3, percent_total: 75 },
+        { address: 'Unknown', poolName: 'Unknown', url: null, blocks_found: 1, percent_total: 25 },
       ],
       pagination: {
         current: '2026-06-10',

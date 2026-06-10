@@ -477,7 +477,9 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
   });
   router.get('/statistics/supply', statisticSeriesHandler('supply'));
   router.get('/statistics/fees', statisticSeriesHandler('fees'));
-  router.get('/statistics/network-hash', statisticSeriesHandler('network-hash'));
+  router.get('/statistics/network-hash', (_req, res) => {
+    sendNotImplemented(res, 'Network hash statistics lookup is not implemented');
+  });
   router.get('/statistics/transactions', statisticSeriesHandler('transactions'));
   router.get('/statistics/outputs', statisticSeriesHandler('outputs'));
   router.get('/statistics/difficulty', statisticSeriesHandler('difficulty'));
