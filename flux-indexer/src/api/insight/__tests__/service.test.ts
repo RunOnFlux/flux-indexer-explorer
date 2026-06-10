@@ -959,6 +959,7 @@ describe('InsightCompatibilityService', () => {
     ]));
     const [sql] = ch.query.mock.calls[0];
     expect(sql).toContain('toString(sum(balance)) AS sum');
+    expect(sql).toMatch(/multiIf\([\s\S]+?\)\s+AS bucket,\s*balance\s+FROM \(/);
   });
 
   test('gets richer-than statistics as a FLUX-denominated array', async () => {

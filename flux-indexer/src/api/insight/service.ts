@@ -786,7 +786,8 @@ export class InsightCompatibilityService {
             balance >= {ten:UInt64}, '10-100 FLUX',
             balance >= {one:UInt64}, '1-10 FLUX',
             '0-1 FLUX'
-          ) AS bucket
+          ) AS bucket,
+          balance
         FROM (
           SELECT address, sumMerge(balance) AS balance
           FROM address_summary_agg
