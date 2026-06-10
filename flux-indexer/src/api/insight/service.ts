@@ -1077,32 +1077,38 @@ export class InsightCompatibilityService {
   }>> {
     if ('cutoff' in range) {
       return this.ch.query<{ producer?: string | null; blocks_found?: string | number }>(`
-        SELECT producer, toString(count()) AS blocks_found
+        SELECT producer, toString(blocks_found_count) AS blocks_found
+        FROM (
+          SELECT producer, count() AS blocks_found_count
+          FROM (
+            SELECT height, producer, is_valid
+            FROM blocks
+            WHERE timestamp >= {cutoff:UInt32}
+            ORDER BY height, _version DESC
+            LIMIT 1 BY height
+          )
+          WHERE is_valid = 1
+          GROUP BY producer
+        )
+        ORDER BY blocks_found_count DESC, producer ASC
+      `, { cutoff: range.cutoff });
+    }
+
+    return this.ch.query<{ producer?: string | null; blocks_found?: string | number }>(`
+      SELECT producer, toString(blocks_found_count) AS blocks_found
+      FROM (
+        SELECT producer, count() AS blocks_found_count
         FROM (
           SELECT height, producer, is_valid
           FROM blocks
-          WHERE timestamp >= {cutoff:UInt32}
+          WHERE timestamp >= {start:UInt32} AND timestamp <= {end:UInt32}
           ORDER BY height, _version DESC
           LIMIT 1 BY height
         )
         WHERE is_valid = 1
         GROUP BY producer
-        ORDER BY blocks_found DESC, producer ASC
-      `, { cutoff: range.cutoff });
-    }
-
-    return this.ch.query<{ producer?: string | null; blocks_found?: string | number }>(`
-      SELECT producer, toString(count()) AS blocks_found
-      FROM (
-        SELECT height, producer, is_valid
-        FROM blocks
-        WHERE timestamp >= {start:UInt32} AND timestamp <= {end:UInt32}
-        ORDER BY height, _version DESC
-        LIMIT 1 BY height
       )
-      WHERE is_valid = 1
-      GROUP BY producer
-      ORDER BY blocks_found DESC, producer ASC
+      ORDER BY blocks_found_count DESC, producer ASC
     `, { start: range.start, end: range.end });
   }
 

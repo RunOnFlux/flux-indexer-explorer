@@ -938,6 +938,11 @@ describe('InsightCompatibilityService', () => {
         { address: 'pool-b', poolName: 'pool-b', url: null, blocks_found: 1, percent_total: 33.333333 },
       ],
     });
+    const poolSql = ch.query.mock.calls[0][0];
+    expect(poolSql).toContain('count() AS blocks_found_count');
+    expect(poolSql).toContain('toString(blocks_found_count) AS blocks_found');
+    expect(poolSql).toContain('ORDER BY blocks_found_count DESC, producer ASC');
+    expect(poolSql).not.toContain('ORDER BY blocks_found DESC');
   });
 
   test('gets balance intervals with legacy count and sum fields', async () => {
@@ -1022,6 +1027,10 @@ describe('InsightCompatibilityService', () => {
     expect(sql).toContain('FROM blocks');
     expect(sql).toContain('timestamp >= {start:UInt32}');
     expect(sql).toContain('timestamp <= {end:UInt32}');
+    expect(sql).toContain('count() AS blocks_found_count');
+    expect(sql).toContain('toString(blocks_found_count) AS blocks_found');
+    expect(sql).toContain('ORDER BY blocks_found_count DESC, producer ASC');
+    expect(sql).not.toContain('ORDER BY blocks_found DESC');
     expect(params).toEqual({ start: 1781049600, end: 1781135999 });
   });
 
