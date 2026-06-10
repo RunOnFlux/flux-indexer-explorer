@@ -7,7 +7,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
-    "test": "jest",
+    "test": "npm run build && jest --runInBand --passWithNoTests",
     "debug:block": "tsx src/scripts/debug-block-parser.ts",
     "inspect:block": "tsx src/scripts/inspect-block.ts"
   },
