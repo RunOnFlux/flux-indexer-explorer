@@ -262,6 +262,98 @@ describe('Insight core routes', () => {
     });
   });
 
+  test('GET /blocks builds date pagination from truncation and the oldest block', async () => {
+    const listBlocks = jest.fn().mockResolvedValue({
+      blocks: [
+        { height: 102, hash: 'c'.repeat(64), timestamp: 1577900000, size: 200, tx_count: 2, producer: 'pool' },
+        { height: 101, hash: 'b'.repeat(64), timestamp: 1577890000, size: 100, tx_count: 1, producer: '' },
+      ],
+      blockDate: {
+        start: 1577836800,
+        end: 1577923199,
+        current: '2020-01-01',
+        next: '2020-01-02',
+        prev: '2019-12-31',
+      },
+      more: true,
+    });
+    const { app } = createApp({ listBlocks });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(
+        `${baseUrl}/insight-api/blocks?blockDate=2020-01-01&startTimestamp=1577910000`
+      );
+
+      expect(response.status).toBe(200);
+      const body = await readJson(response) as { length: number; pagination: unknown };
+      expect(body.length).toBe(2);
+      expect(body.pagination).toEqual({
+        next: '2020-01-02',
+        prev: '2019-12-31',
+        currentTs: 1577923199,
+        current: '2020-01-01',
+        isToday: false,
+        more: true,
+        moreTs: 1577889999,
+      });
+      expect(listBlocks).toHaveBeenCalledWith(
+        expect.objectContaining({ blockDate: '2020-01-01', startTimestamp: '1577910000' })
+      );
+    });
+  });
+
+  test('GET /blocks reports no further pages when the date window is exhausted', async () => {
+    const listBlocks = jest.fn().mockResolvedValue({
+      blocks: [],
+      blockDate: {
+        start: 1577836800,
+        end: 1577923199,
+        current: '2020-01-01',
+        next: '2020-01-02',
+        prev: '2019-12-31',
+      },
+      more: false,
+    });
+    const { app } = createApp({ listBlocks });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/blocks?blockDate=2020-01-01`);
+
+      expect(response.status).toBe(200);
+      const body = await readJson(response) as { pagination: { more: boolean; moreTs: number } };
+      expect(body.pagination.more).toBe(false);
+      expect(body.pagination.moreTs).toBe(1577923199);
+    });
+  });
+
+  test('GET /blocks without blockDate keeps the recent-blocks pagination shape', async () => {
+    const listBlocks = jest.fn().mockResolvedValue({
+      blocks: [
+        { height: 102, hash: 'c'.repeat(64), timestamp: 2000, size: 200, tx_count: 2, producer: '' },
+        { height: 101, hash: 'b'.repeat(64), timestamp: 1500, size: 100, tx_count: 1, producer: '' },
+      ],
+      blockDate: null,
+      more: true,
+    });
+    const { app } = createApp({ listBlocks });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/blocks`);
+
+      expect(response.status).toBe(200);
+      const body = await readJson(response) as { pagination: unknown };
+      expect(body.pagination).toEqual({
+        next: null,
+        prev: null,
+        currentTs: 2000,
+        current: null,
+        isToday: true,
+        more: true,
+        moreTs: 2000,
+      });
+    });
+  });
+
   test('GET /blocks returns bad request when query parsing fails', async () => {
     const { app } = createApp({
       listBlocks: jest.fn().mockRejectedValue(new InsightValidationError('Invalid blockDate (expected YYYY-MM-DD)')),

@@ -11,6 +11,7 @@ import type {
   InsightUtxoRow,
 } from './types';
 import {
+  InsightValidationError,
   isValidHash,
   normalizeHash,
   parseBlockDate,
@@ -68,6 +69,7 @@ export interface InsightAddressSummaryServiceResult {
 export interface InsightListBlocksServiceResult {
   blocks: VersionedInsightBlockRow[];
   blockDate: ReturnType<typeof parseBlockDate> | null;
+  more: boolean;
 }
 
 export type InsightStatisticSeriesKind =
@@ -112,6 +114,9 @@ type BlockLookup =
 const UINT32_MAX = 0xffffffff;
 const DEFAULT_MEMPOOL_DELTA = { balanceDelta: 0n, txCount: 0 };
 const RECENT_BLOCK_LOOKBACK_BUFFER = 250;
+// Flux produces ~720 blocks per UTC day, so one default page covers a date
+// window in a handful of startTimestamp-driven requests.
+const BLOCK_LIST_LIMIT = 200;
 const MAX_UTXO_ADDRESSES = 100;
 const MAX_UTXO_ROWS = 5000;
 const MAX_BLOCK_TRANSACTION_LOOKUP = 200;
@@ -213,9 +218,18 @@ export class InsightCompatibilityService {
 
   async listBlocks(_query: Record<string, unknown> = {}): Promise<InsightListBlocksServiceResult> {
     const blockDate = hasQueryValue(_query.blockDate) ? parseBlockDate(_query.blockDate) : null;
-    const limit = parseLimit(_query.limit, 50, 100);
-    const blocks = blockDate
-      ? await this.ch.query<VersionedInsightBlockRow>(`
+    const startTimestamp = parseStartTimestamp(_query.startTimestamp);
+    const limit = parseLimit(_query.limit, BLOCK_LIST_LIMIT, BLOCK_LIST_LIMIT);
+
+    if (!blockDate) {
+      return this.listRecentBlocks(limit);
+    }
+
+    // startTimestamp is the legacy Insight paging cursor: an upper timestamp
+    // bound inside the requested UTC day. Fetch one extra row so `more`
+    // reflects actual truncation.
+    const end = startTimestamp === null ? blockDate.end : Math.min(blockDate.end, startTimestamp);
+    const rows = await this.ch.query<VersionedInsightBlockRow>(`
         SELECT height, hash, prev_hash, merkle_root, timestamp, bits, nonce, version,
                size, tx_count, producer, producer_reward, difficulty, chainwork, is_valid
         FROM (
@@ -227,18 +241,28 @@ export class InsightCompatibilityService {
           LIMIT 1 BY height
         )
         WHERE is_valid = 1
-        ORDER BY height DESC
+        ORDER BY timestamp DESC, height DESC
         LIMIT {limit:UInt32}
-      `, { start: blockDate.start, end: blockDate.end, limit })
-      : await this.listRecentBlocks(limit);
+      `, { start: blockDate.start, end, limit: limit + 1 });
 
     return {
-      blocks,
+      blocks: rows.slice(0, limit),
       blockDate,
+      more: rows.length > limit,
     };
   }
 
-  private async listRecentBlocks(limit: number): Promise<VersionedInsightBlockRow[]> {
+  private async listRecentBlocks(limit: number): Promise<InsightListBlocksServiceResult> {
+    const blocks = await this.queryRecentBlocks(limit + 1);
+
+    return {
+      blocks: blocks.slice(0, limit),
+      blockDate: null,
+      more: blocks.length > limit,
+    };
+  }
+
+  private async queryRecentBlocks(limit: number): Promise<VersionedInsightBlockRow[]> {
     const maxHeight = await this.getIndexedTipHeight();
     // Inclusive lower bound so the genesis block stays reachable when the
     // lookback window extends to height zero.
@@ -1450,6 +1474,21 @@ function hasQueryValue(raw: unknown): boolean {
   }
 
   return String(raw).trim().length > 0;
+}
+
+function parseStartTimestamp(raw: unknown): number | null {
+  if (!hasQueryValue(raw)) {
+    return null;
+  }
+
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  const text = String(value).trim();
+  const parsed = /^\d+$/.test(text) ? Number(text) : null;
+  if (parsed === null || !Number.isSafeInteger(parsed) || parsed < 1 || parsed > UINT32_MAX) {
+    throw new InsightValidationError(`Invalid startTimestamp (must be an integer between 1 and ${UINT32_MAX})`);
+  }
+
+  return parsed;
 }
 
 function parseHeight(height: number): number | null {

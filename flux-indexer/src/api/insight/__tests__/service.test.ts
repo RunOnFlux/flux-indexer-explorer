@@ -5,6 +5,7 @@ jest.mock('../../../parsers/block-parser', () => ({
 import { extractTransactionFromBlock } from '../../../parsers/block-parser';
 import { encodeFluxAddress } from '../../../utils/script-utils';
 import { InsightCompatibilityService } from '../service';
+import { InsightValidationError } from '../utils';
 
 const extractTransactionFromBlockMock = extractTransactionFromBlock as jest.MockedFunction<typeof extractTransactionFromBlock>;
 
@@ -223,6 +224,7 @@ describe('InsightCompatibilityService', () => {
     await expect(service.listBlocks({ limit: '2' })).resolves.toEqual({
       blocks,
       blockDate: null,
+      more: false,
     });
 
     const [sql, params] = ch.query.mock.calls[0];
@@ -231,8 +233,25 @@ describe('InsightCompatibilityService', () => {
     expect(sql).not.toContain('timestamp <=');
     expect(sql).toContain('height <= {maxHeight:UInt32}');
     expect(sql).toContain('height >= {minHeight:UInt32}');
-    expect(params).toEqual({ limit: 2, maxHeight: 1000, minHeight: 749 });
+    expect(params).toEqual({ limit: 3, maxHeight: 1000, minHeight: 748 });
     expect(ch.queryOne).toHaveBeenCalledWith(expect.stringContaining('FROM sync_state'));
+  });
+
+  test('reports more recent blocks when the page is truncated', async () => {
+    const { service, ch } = createService();
+    const blocks = [
+      { hash: 'd'.repeat(64), height: 103, is_valid: 1 },
+      { hash: 'c'.repeat(64), height: 102, is_valid: 1 },
+      { hash: 'b'.repeat(64), height: 101, is_valid: 1 },
+    ];
+    ch.queryOne.mockResolvedValue({ chain_height: 1000, current_height: 1000 });
+    ch.query.mockResolvedValue(blocks);
+
+    await expect(service.listBlocks({ limit: '2' })).resolves.toEqual({
+      blocks: blocks.slice(0, 2),
+      blockDate: null,
+      more: true,
+    });
   });
 
   test('lists recent blocks from indexed current height when chain height is ahead', async () => {
@@ -247,10 +266,11 @@ describe('InsightCompatibilityService', () => {
     await expect(service.listBlocks({ limit: '2' })).resolves.toEqual({
       blocks,
       blockDate: null,
+      more: false,
     });
 
     const [, params] = ch.query.mock.calls[0];
-    expect(params).toEqual({ limit: 2, maxHeight: 500, minHeight: 249 });
+    expect(params).toEqual({ limit: 3, maxHeight: 500, minHeight: 248 });
   });
 
   test('includes the genesis block when the recent window reaches height zero', async () => {
@@ -281,7 +301,63 @@ describe('InsightCompatibilityService', () => {
         next: '2026-06-11',
         prev: '2026-06-09',
       },
+      more: false,
     });
+  });
+
+  test('caps the blockDate window with startTimestamp and reports truncation', async () => {
+    const { service, ch } = createService();
+    const rows = [
+      { hash: 'c'.repeat(64), height: 102, timestamp: 1781100000, is_valid: 1 },
+      { hash: 'b'.repeat(64), height: 101, timestamp: 1781099000, is_valid: 1 },
+    ];
+    ch.query.mockResolvedValue(rows);
+
+    const result = await service.listBlocks({
+      blockDate: '2026-06-10',
+      startTimestamp: '1781100500',
+      limit: '1',
+    });
+
+    expect(result.blocks).toEqual([rows[0]]);
+    expect(result.more).toBe(true);
+
+    const [sql, params] = ch.query.mock.calls[0];
+    expect(sql).toContain('timestamp >= {start:UInt32}');
+    expect(sql).toContain('timestamp <= {end:UInt32}');
+    expect(sql).toContain('ORDER BY timestamp DESC, height DESC');
+    expect(params).toEqual({ start: 1781049600, end: 1781100500, limit: 2 });
+  });
+
+  test('clamps startTimestamp to the end of the requested blockDate', async () => {
+    const { service, ch } = createService();
+    ch.query.mockResolvedValue([]);
+
+    await expect(service.listBlocks({
+      blockDate: '2026-06-10',
+      startTimestamp: '4294967295',
+      limit: '1',
+    })).resolves.toEqual({
+      blocks: [],
+      blockDate: expect.objectContaining({ end: 1781135999 }),
+      more: false,
+    });
+
+    const [, params] = ch.query.mock.calls[0];
+    expect(params).toEqual({ start: 1781049600, end: 1781135999, limit: 2 });
+  });
+
+  test('rejects invalid startTimestamp values', async () => {
+    const { service } = createService();
+
+    await expect(service.listBlocks({ blockDate: '2026-06-10', startTimestamp: 'abc' }))
+      .rejects.toBeInstanceOf(InsightValidationError);
+    await expect(service.listBlocks({ blockDate: '2026-06-10', startTimestamp: 'abc' }))
+      .rejects.toThrow('Invalid startTimestamp (must be an integer between 1 and 4294967295)');
+    await expect(service.listBlocks({ blockDate: '2026-06-10', startTimestamp: '0' }))
+      .rejects.toThrow('Invalid startTimestamp (must be an integer between 1 and 4294967295)');
+    await expect(service.listBlocks({ blockDate: '2026-06-10', startTimestamp: '4294967296' }))
+      .rejects.toThrow('Invalid startTimestamp (must be an integer between 1 and 4294967295)');
   });
 
   test('orders transaction inputs by decoded RPC vin order', async () => {

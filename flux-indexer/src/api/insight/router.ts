@@ -138,6 +138,9 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
 
     const blocks = result.blocks.map(formatBlockListItem);
     const blockDate = result.blockDate;
+    const more = result.more === true;
+    // Feeding moreTs back as startTimestamp pages strictly older blocks.
+    const oldestTime = blocks.length > 0 ? blocks[blocks.length - 1].time : null;
 
     res.json({
       blocks,
@@ -149,8 +152,8 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
           currentTs: blockDate.end,
           current: blockDate.current,
           isToday: blockDate.current === new Date().toISOString().slice(0, 10),
-          more: blocks.length > 0,
-          moreTs: blockDate.end + 1,
+          more,
+          moreTs: oldestTime !== null ? oldestTime - 1 : blockDate.end,
         }
         : {
           next: null,
@@ -158,7 +161,7 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
           currentTs: blocks[0]?.time ?? null,
           current: null,
           isToday: true,
-          more: blocks.length > 0,
+          more,
           moreTs: blocks[0]?.time ?? null,
         },
     });
