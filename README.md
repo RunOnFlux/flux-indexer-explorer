@@ -154,7 +154,7 @@ flux-blockchain-explorer/
 
 ### Insight Compatibility
 
-Legacy Insight-compatible REST endpoints are available under `/insight-api` on the indexer API port. This compatibility layer is API-only and does not include the old Insight UI or websocket event API. Unsupported legacy statistics such as network hash and circulating supply return explicit `501` JSON responses instead of placeholder data.
+Legacy Insight-compatible REST endpoints are available under `/insight-api` on the indexer API port. This compatibility layer is API-only and does not include the old Insight UI or websocket event API. Supply endpoints cover total supply (`/supply`, `/total-supply`), circulating supply (`/circulating-supply`, `/circulation`, `/statistics/circulating-supply`), and the theoretical main chain supply (`/statistics/main-chain-circulating-locked`). Unsupported legacy statistics such as network hash return explicit `501` JSON responses instead of placeholder data.
 
 Common routes:
 - `GET /insight-api/block/:hash`
@@ -171,6 +171,7 @@ Common routes:
 - `GET /insight-api/sync`
 - `GET /insight-api/utils/estimatefee`
 - `GET /insight-api/supply`
+- `GET /insight-api/circulating-supply`
 
 ## Performance
 

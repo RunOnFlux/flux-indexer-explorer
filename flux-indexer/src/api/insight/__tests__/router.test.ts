@@ -1220,7 +1220,7 @@ describe('Insight core routes', () => {
     });
   });
 
-  test('GET /supply returns text by default and circulatingSupply object with format=object', async () => {
+  test('GET /supply returns text by default and supply object with format=object', async () => {
     const getSupply = jest.fn().mockResolvedValue('100000000');
     const { app } = createApp({ getSupply });
 
@@ -1232,14 +1232,66 @@ describe('Insight core routes', () => {
 
       const objectResponse = await fetch(`${baseUrl}/insight-api/supply?format=object`);
       expect(objectResponse.status).toBe(200);
-      await expect(readJson(objectResponse)).resolves.toEqual({ circulatingSupply: '1' });
-      expect(getSupply).toHaveBeenCalledTimes(2);
+      await expect(readJson(objectResponse)).resolves.toEqual({ supply: '1' });
+
+      const totalSupplyObject = await fetch(`${baseUrl}/insight-api/total-supply?format=object`);
+      expect(totalSupplyObject.status).toBe(200);
+      await expect(readJson(totalSupplyObject)).resolves.toEqual({ supply: '1' });
+
+      const statisticsTotalObject = await fetch(`${baseUrl}/insight-api/statistics/total-supply?format=object`);
+      expect(statisticsTotalObject.status).toBe(200);
+      await expect(readJson(statisticsTotalObject)).resolves.toEqual({ supply: '1' });
+
+      expect(getSupply).toHaveBeenCalledTimes(4);
     });
   });
 
-  test('GET /statistics/circulating-supply is explicit not implemented', async () => {
+  test('GET circulating supply routes serve the circulating value, not total supply', async () => {
     const getSupply = jest.fn().mockResolvedValue('100000000');
-    const { app } = createApp({ getSupply });
+    const getCirculatingSupply = jest.fn().mockResolvedValue('250000000');
+    const { app } = createApp({ getSupply, getCirculatingSupply });
+
+    await withTestServer(app, async (baseUrl) => {
+      for (const path of ['/circulating-supply', '/circulation', '/statistics/circulating-supply']) {
+        const textResponse = await fetch(`${baseUrl}/insight-api${path}`);
+        expect(textResponse.status).toBe(200);
+        expect(textResponse.headers.get('content-type')).toContain('text/plain');
+        await expect(textResponse.text()).resolves.toBe('2.5');
+
+        const objectResponse = await fetch(`${baseUrl}/insight-api${path}?format=object`);
+        expect(objectResponse.status).toBe(200);
+        await expect(readJson(objectResponse)).resolves.toEqual({ circulatingSupply: '2.5' });
+      }
+
+      expect(getCirculatingSupply).toHaveBeenCalledTimes(6);
+      expect(getSupply).not.toHaveBeenCalled();
+    });
+  });
+
+  test('GET /statistics/main-chain-circulating-locked serves the main chain supply', async () => {
+    const getCirculatingSupply = jest.fn().mockResolvedValue('250000000');
+    const getMainChainCirculatingLockedSupply = jest.fn().mockResolvedValue('400000000');
+    const { app } = createApp({ getCirculatingSupply, getMainChainCirculatingLockedSupply });
+
+    await withTestServer(app, async (baseUrl) => {
+      const textResponse = await fetch(`${baseUrl}/insight-api/statistics/main-chain-circulating-locked`);
+      expect(textResponse.status).toBe(200);
+      expect(textResponse.headers.get('content-type')).toContain('text/plain');
+      await expect(textResponse.text()).resolves.toBe('4');
+
+      const objectResponse = await fetch(
+        `${baseUrl}/insight-api/statistics/main-chain-circulating-locked?format=object`
+      );
+      expect(objectResponse.status).toBe(200);
+      await expect(readJson(objectResponse)).resolves.toEqual({ supply: '4' });
+
+      expect(getMainChainCirculatingLockedSupply).toHaveBeenCalledTimes(2);
+      expect(getCirculatingSupply).not.toHaveBeenCalled();
+    });
+  });
+
+  test('GET /statistics/circulating-supply is 501 without a service hook', async () => {
+    const { app } = createApp();
 
     await withTestServer(app, async (baseUrl) => {
       const response = await fetch(`${baseUrl}/insight-api/statistics/circulating-supply`);
@@ -1249,7 +1301,6 @@ describe('Insight core routes', () => {
         message: 'Circulating supply lookup is not implemented',
         code: 1,
       });
-      expect(getSupply).not.toHaveBeenCalled();
     });
   });
 

@@ -2,6 +2,7 @@ import type { ClickHouseConnection } from '../../database/connection';
 import { extractTransactionFromBlock } from '../../parsers/block-parser';
 import type { FluxRPCClient } from '../../rpc/flux-rpc-client';
 import { getScriptPubkey } from '../../utils/script-utils';
+import { calculateCirculatingSupplyAllChains, calculateMainchainSupply } from '../../utils/supply-helper';
 import type {
   InsightAddressSummaryRow,
   InsightBlockRow,
@@ -709,14 +710,53 @@ export class InsightCompatibilityService {
   }
 
   async getSupply(): Promise<string> {
-    const row = await this.ch.queryOne<{ total_supply?: string | number | bigint }>(`
-      SELECT toString(total_supply) AS total_supply
+    const stats = await this.queryLatestSupplyStats();
+    return stats ? stats.totalSupply.toString() : '0';
+  }
+
+  // Mirrors getSupplyStats in server.ts: circulating supply anchors the
+  // indexed on-chain total to the theoretical locked parallel-asset delta.
+  async getCirculatingSupply(): Promise<string> {
+    const stats = await this.queryLatestSupplyStats();
+    if (!stats) {
+      return '0';
+    }
+
+    const lockedParallelAssets = calculateMainchainSupply(stats.height)
+      - calculateCirculatingSupplyAllChains(stats.height);
+    return (stats.totalSupply - lockedParallelAssets).toString();
+  }
+
+  // Legacy Insight serves the theoretical main chain supply (circulating plus
+  // the parallel assets still locked on the main chain) on this route.
+  async getMainChainCirculatingLockedSupply(): Promise<string> {
+    const stats = await this.queryLatestSupplyStats();
+    if (!stats) {
+      return '0';
+    }
+
+    return calculateMainchainSupply(stats.height).toString();
+  }
+
+  private async queryLatestSupplyStats(): Promise<{ height: number; totalSupply: bigint } | null> {
+    const row = await this.ch.queryOne<{
+      block_height?: string | number;
+      total_supply?: string | number | bigint;
+    }>(`
+      SELECT block_height, toString(total_supply) AS total_supply
       FROM supply_stats
       ORDER BY block_height DESC, _version DESC
       LIMIT 1
     `);
 
-    return zatoshiString(row?.total_supply);
+    if (!row) {
+      return null;
+    }
+
+    return {
+      height: parseNonNegativeHeightValue(row.block_height) ?? 0,
+      totalSupply: BigInt(zatoshiString(row.total_supply)),
+    };
   }
 
   async getStatisticSeries(kind: InsightStatisticSeriesKind, rawDays?: string): Promise<unknown[]> {

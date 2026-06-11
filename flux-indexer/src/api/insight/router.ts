@@ -68,6 +68,8 @@ export interface InsightRouterService {
   verifyMessage?(address: string, signature: string, message: string): Promise<boolean>;
   listFluxNodes?(filter?: string): Promise<unknown>;
   getSupply?(): Promise<string>;
+  getCirculatingSupply?(): Promise<string>;
+  getMainChainCirculatingLockedSupply?(): Promise<string>;
   getCurrency?(): unknown | Promise<unknown>;
   getMarketsInfo?(): unknown | Promise<unknown>;
   dosList?(): Promise<unknown>;
@@ -484,13 +486,16 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
     res.json(await service.startList());
   }));
 
-  const supplyHandler = asyncHandler(async (req, res) => {
-    if (!service.getSupply) {
-      sendNotImplemented(res, 'Supply lookup is not implemented');
+  const createSupplyHandler = (
+    fetchSupply: (() => Promise<string>) | undefined,
+    notImplementedMessage: string
+  ) => asyncHandler(async (req, res) => {
+    if (!fetchSupply) {
+      sendNotImplemented(res, notImplementedMessage);
       return;
     }
 
-    const supply = await service.getSupply();
+    const supply = await fetchSupply();
     if (firstString(req.query.format)?.toLowerCase() === 'object') {
       res.json(formatSupply(supply, supplyObjectKey(req.path)));
       return;
@@ -498,17 +503,29 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
 
     sendPlainText(res, formatSupply(supply));
   });
+
+  const supplyHandler = createSupplyHandler(
+    service.getSupply?.bind(service),
+    'Supply lookup is not implemented'
+  );
   router.get('/supply', supplyHandler);
   router.get('/total-supply', supplyHandler);
   router.get('/statistics/total-supply', supplyHandler);
 
-  const circulatingSupplyHandler = (_req: Request, res: Response) => {
-    sendNotImplemented(res, 'Circulating supply lookup is not implemented');
-  };
+  const circulatingSupplyHandler = createSupplyHandler(
+    service.getCirculatingSupply?.bind(service),
+    'Circulating supply lookup is not implemented'
+  );
   router.get('/circulating-supply', circulatingSupplyHandler);
   router.get('/circulation', circulatingSupplyHandler);
   router.get('/statistics/circulating-supply', circulatingSupplyHandler);
-  router.get('/statistics/main-chain-circulating-locked', circulatingSupplyHandler);
+
+  // Legacy Insight returns the theoretical main chain supply (circulating +
+  // locked parallel assets) on this route, not the circulating value.
+  router.get('/statistics/main-chain-circulating-locked', createSupplyHandler(
+    service.getMainChainCirculatingLockedSupply?.bind(service),
+    'Main chain circulating locked supply lookup is not implemented'
+  ));
 
   const statisticSeriesHandler = (kind: InsightStatisticSeriesKind) => asyncHandler(async (req, res) => {
     if (!service.getStatisticSeries) {
@@ -822,7 +839,18 @@ function zatoshiBigInt(value: string | number): bigint | null {
 }
 
 function supplyObjectKey(path: string): 'supply' | 'circulatingSupply' {
-  return path.includes('total-supply') ? 'supply' : 'circulatingSupply';
+  // /supply, /total-supply, and /statistics/main-chain-circulating-locked all
+  // serve supply totals; only the circulating routes may carry the
+  // circulatingSupply label aggregators feed into market-cap math.
+  if (
+    path === '/supply'
+    || path.includes('total-supply')
+    || path.includes('main-chain-circulating-locked')
+  ) {
+    return 'supply';
+  }
+
+  return 'circulatingSupply';
 }
 
 function satoshiText(value: unknown): string {

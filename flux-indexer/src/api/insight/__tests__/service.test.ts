@@ -1381,6 +1381,37 @@ describe('InsightCompatibilityService', () => {
     expect(sql).toContain('ORDER BY block_height DESC, _version DESC');
   });
 
+  test('anchors circulating supply to the indexed total minus the locked parallel-asset delta', async () => {
+    const { service, ch } = createService();
+    // At height 2676212 the theoretical locked delta is 1455519600085160
+    // zatoshis (mainchain 42616569450000000 - all chains 41161049849914840,
+    // pinned against the legacy insight-api).
+    ch.queryOne.mockResolvedValue({ block_height: 2676212, total_supply: '42000000000000000' });
+
+    await expect(service.getCirculatingSupply()).resolves.toBe('40544480399914840');
+
+    const [sql] = ch.queryOne.mock.calls[0];
+    expect(sql).toContain('FROM supply_stats');
+    expect(sql).toContain('block_height');
+    expect(sql).toContain('ORDER BY block_height DESC, _version DESC');
+  });
+
+  test('serves the theoretical main chain supply for circulating-locked lookups', async () => {
+    const { service, ch } = createService();
+    ch.queryOne.mockResolvedValue({ block_height: 2676212, total_supply: '42000000000000000' });
+
+    await expect(service.getMainChainCirculatingLockedSupply()).resolves.toBe('42616569450000000');
+  });
+
+  test('returns zero supplies when no supply stats row exists', async () => {
+    const { service, ch } = createService();
+    ch.queryOne.mockResolvedValue(undefined);
+
+    await expect(service.getSupply()).resolves.toBe('0');
+    await expect(service.getCirculatingSupply()).resolves.toBe('0');
+    await expect(service.getMainChainCirculatingLockedSupply()).resolves.toBe('0');
+  });
+
   test('gets a supply statistic series from daily supply rows', async () => {
     const { service, ch } = createService();
     ch.query.mockResolvedValue([
