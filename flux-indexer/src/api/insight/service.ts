@@ -479,9 +479,13 @@ export class InsightCompatibilityService {
         };
       });
 
+    // A transaction that confirms while the mempool snapshot (5s TTL) is still
+    // fresh appears in both sources; the confirmed row wins.
+    const confirmedOutpoints = new Set(confirmed.map((row) => `${row.txid}:${row.vout}`));
     return [
       ...confirmed,
-      ...buildMempoolUtxoRows(mempoolDeltas, addresses, mempoolSpent, valueFilter),
+      ...buildMempoolUtxoRows(mempoolDeltas, addresses, mempoolSpent, valueFilter)
+        .filter((row) => !confirmedOutpoints.has(`${row.txid}:${row.vout}`)),
     ];
   }
 

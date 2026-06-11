@@ -345,7 +345,8 @@ export class ClickHouseAPIServer {
     // legacy-compatible limits, so skip the default JSON parser for it.
     const jsonParser = express.json();
     this.app.use((req, res, next) => {
-      if (req.path.startsWith('/insight-api')) {
+      // Express mounts routes case-insensitively, so match the skip the same way.
+      if (req.path.toLowerCase().startsWith('/insight-api')) {
         next();
         return;
       }

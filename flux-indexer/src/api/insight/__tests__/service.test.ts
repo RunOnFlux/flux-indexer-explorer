@@ -942,6 +942,38 @@ describe('InsightCompatibilityService', () => {
     ]);
   });
 
+  test('does not duplicate a utxo that confirmed while the mempool snapshot is still cached', async () => {
+    const { service, ch, getMempoolAddressDeltas } = createService();
+    const confirmedTxid = '3'.repeat(64);
+    ch.queryOne.mockResolvedValue({ chain_height: 105, current_height: 105 });
+    ch.query.mockResolvedValue([
+      {
+        address: P2PKH_ADDRESS,
+        txid: confirmedTxid,
+        vout: 0,
+        script_pubkey: '',
+        script_type: 'pubkeyhash',
+        value: '500',
+        block_height: 105,
+      },
+    ]);
+    getMempoolAddressDeltas.mockResolvedValue(new Map([
+      [P2PKH_ADDRESS, {
+        balanceDelta: 500n,
+        txCount: 1,
+        spentOutpoints: new Set<string>(),
+        // Stale snapshot still lists the now-confirmed output as mempool-created.
+        createdUtxos: [{ txid: confirmedTxid, vout: 0, value: 500n, scriptPubkey: '51' }],
+      }],
+    ]));
+
+    const result = await service.getAddressUtxos([P2PKH_ADDRESS], true);
+
+    expect(result).toEqual([
+      expect.objectContaining({ txid: confirmedTxid, vout: 0, value: '500', confirmations: 1 }),
+    ]);
+  });
+
   test('returns confirmed-only utxos without touching the mempool provider when queryMempool is false', async () => {
     const { service, ch, getMempoolAddressDeltas } = createService();
     const spentTxid = '1'.repeat(64);
