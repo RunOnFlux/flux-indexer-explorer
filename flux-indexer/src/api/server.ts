@@ -13,7 +13,11 @@ import { FluxRPCClient } from '../rpc/flux-rpc-client';
 import { ClickHouseSyncEngine } from '../indexer/sync-engine';
 import type { Transaction } from '../types';
 import { logger } from '../utils/logger';
+import { calculateCirculatingSupplyAllChains, calculateMainchainSupply } from '../utils/supply-helper';
 import { extractTransactionFromBlock } from '../parsers/block-parser';
+import { createInsightCompatibilityRouter } from './insight/router';
+import { InsightCompatibilityService } from './insight/service';
+import type { MempoolAddressDeltas, MempoolCreatedUtxo } from './insight/service';
 
 export class ClickHouseAPIServer {
   private app: express.Application;
@@ -27,11 +31,11 @@ export class ClickHouseAPIServer {
   private statusCache: { data: any | null; timestamp: number } = { data: null, timestamp: 0 };
   private static readonly STATUS_CACHE_TTL = 30000; // 30s for status (doesn't need to be instant)
   private static readonly STATS_CACHE_TTL = 2000;   // 2s for dashboard stats (matches frontend polling)
-  private mempoolAddressCache: { data: Map<string, { balanceDelta: bigint; txCount: number }>; timestamp: number } = {
+  private mempoolAddressCache: { data: MempoolAddressDeltas; timestamp: number } = {
     data: new Map(),
     timestamp: 0,
   };
-  private mempoolAddressCacheInFlight: Promise<Map<string, { balanceDelta: bigint; txCount: number }>> | null = null;
+  private mempoolAddressCacheInFlight: Promise<MempoolAddressDeltas> | null = null;
   private static readonly MEMPOOL_ADDRESS_CACHE_TTL = 5000; // 5s (fast enough for UX, low enough RPC load)
 
   constructor(
@@ -136,7 +140,7 @@ export class ClickHouseAPIServer {
     return !!address && address !== 'UNKNOWN' && address !== 'SHIELDED_OR_NONSTANDARD';
   }
 
-  private async getMempoolAddressDeltas(): Promise<Map<string, { balanceDelta: bigint; txCount: number }>> {
+  private async getMempoolAddressDeltas(): Promise<MempoolAddressDeltas> {
     const now = Date.now();
     if ((now - this.mempoolAddressCache.timestamp) < ClickHouseAPIServer.MEMPOOL_ADDRESS_CACHE_TTL) {
       return this.mempoolAddressCache.data;
@@ -164,7 +168,7 @@ export class ClickHouseAPIServer {
     return this.mempoolAddressCacheInFlight;
   }
 
-  private async computeMempoolAddressDeltas(): Promise<Map<string, { balanceDelta: bigint; txCount: number }>> {
+  private async computeMempoolAddressDeltas(): Promise<MempoolAddressDeltas> {
     const mempoolTxidsResult = await this.rpc.getRawMempool(false);
     const mempoolTxids = Array.isArray(mempoolTxidsResult)
       ? mempoolTxidsResult
@@ -264,12 +268,15 @@ export class ClickHouseAPIServer {
       }
     }
 
-    // Aggregate per-address deltas and tx counts.
+    // Aggregate per-address deltas, tx counts, and outpoint-level activity.
     const balanceDeltaByAddress = new Map<string, bigint>();
     const txCountByAddress = new Map<string, number>();
+    const spentOutpointsByAddress = new Map<string, Set<string>>();
+    const createdUtxosByAddress = new Map<string, MempoolCreatedUtxo[]>();
 
     for (const tx of mempoolTxs) {
       const touchedAddresses = new Set<string>();
+      const txid = ClickHouseAPIServer.padFixedString64(tx.txid);
 
       for (const output of tx.vout || []) {
         const address = output.scriptPubKey?.addresses?.[0];
@@ -277,6 +284,18 @@ export class ClickHouseAPIServer {
         const valueSat = BigInt(Math.round(output.value * 100000000));
         balanceDeltaByAddress.set(address, (balanceDeltaByAddress.get(address) ?? BigInt(0)) + valueSat);
         touchedAddresses.add(address);
+
+        let createdUtxos = createdUtxosByAddress.get(address);
+        if (!createdUtxos) {
+          createdUtxos = [];
+          createdUtxosByAddress.set(address, createdUtxos);
+        }
+        createdUtxos.push({
+          txid,
+          vout: output.n,
+          value: valueSat,
+          scriptPubkey: output.scriptPubKey?.hex ?? '',
+        });
       }
 
       for (const input of tx.vin || []) {
@@ -291,6 +310,13 @@ export class ClickHouseAPIServer {
           (balanceDeltaByAddress.get(prevOut.address) ?? BigInt(0)) - prevOut.value
         );
         touchedAddresses.add(prevOut.address);
+
+        let spentOutpoints = spentOutpointsByAddress.get(prevOut.address);
+        if (!spentOutpoints) {
+          spentOutpoints = new Set();
+          spentOutpointsByAddress.set(prevOut.address, spentOutpoints);
+        }
+        spentOutpoints.add(key);
       }
 
       for (const addr of touchedAddresses) {
@@ -298,9 +324,14 @@ export class ClickHouseAPIServer {
       }
     }
 
-    const result = new Map<string, { balanceDelta: bigint; txCount: number }>();
+    const result: MempoolAddressDeltas = new Map();
     for (const [address, txCount] of txCountByAddress) {
-      result.set(address, { balanceDelta: balanceDeltaByAddress.get(address) ?? BigInt(0), txCount });
+      result.set(address, {
+        balanceDelta: balanceDeltaByAddress.get(address) ?? BigInt(0),
+        txCount,
+        spentOutpoints: spentOutpointsByAddress.get(address) ?? new Set(),
+        createdUtxos: createdUtxosByAddress.get(address) ?? [],
+      });
     }
 
     return result;
@@ -309,7 +340,19 @@ export class ClickHouseAPIServer {
   private setupMiddleware(): void {
     this.app.use(compression({ threshold: 1024, level: 6 }));
     this.app.use(cors());
-    this.app.use(express.json());
+
+    // The Insight compatibility router registers its own body parsers with
+    // legacy-compatible limits, so skip the default JSON parser for it.
+    const jsonParser = express.json();
+    this.app.use((req, res, next) => {
+      // Express mounts routes case-insensitively, so match the skip the same way.
+      if (req.path.toLowerCase().startsWith('/insight-api')) {
+        next();
+        return;
+      }
+
+      jsonParser(req, res, next);
+    });
 
     this.app.use((req, res, next) => {
       logger.debug(`${req.method} ${req.path}`, { query: req.query });
@@ -318,6 +361,16 @@ export class ClickHouseAPIServer {
   }
 
   private setupRoutes(): void {
+    const insightService = new InsightCompatibilityService(
+      this.ch,
+      this.rpc,
+      this.getMempoolAddressDeltas.bind(this)
+    );
+    this.app.use('/insight-api', createInsightCompatibilityRouter(insightService));
+    this.app.use('/insight-api', (req, res) => {
+      res.status(404).json({ status: 404, url: req.originalUrl, error: 'Not found' });
+    });
+
     // Status endpoints
     this.app.get('/api/v1/status', this.getStatus.bind(this));
     this.app.get('/api/v1/sync', this.getSyncStatus.bind(this));
@@ -377,10 +430,19 @@ export class ClickHouseAPIServer {
     });
   }
 
+  public getApp(): express.Application {
+    return this.app;
+  }
+
   private setupErrorHandling(): void {
     this.app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
       logger.error('API error', { error: err.message, path: req.path });
-      res.status(500).json({ error: err.message || 'Internal server error' });
+      const rawStatus = (err as { status?: unknown }).status
+        ?? (err as { statusCode?: unknown }).statusCode;
+      const status = typeof rawStatus === 'number' && Number.isInteger(rawStatus) && rawStatus >= 400 && rawStatus <= 599
+        ? rawStatus
+        : 500;
+      res.status(status).json({ error: err.message || 'Internal server error' });
     });
   }
 
@@ -1991,150 +2053,6 @@ export class ClickHouseAPIServer {
 
   // ========== Supply Stats ==========
 
-  /**
-   * Calculate mainchain-only supply (without parallel asset distributions)
-   * Based on SupplyHelper.getCirculatingSupplyByHeight from insight-api
-   * Does NOT include: exchange fund, snapshot amounts, chain funds, or parallel asset mining
-   */
-  private calculateMainchainSupply(height: number): bigint {
-    const PON_HEIGHT = 2020000;
-    const FIRST_HALVING = 657850;
-    const HALVING_INTERVAL = 655350;
-
-    // Time-locked fund releases (12 releases)
-    const FUND_RELEASES = [
-      { height: 836274, amount: 7500000 },
-      { height: 836994, amount: 2500000 },
-      { height: 837714, amount: 22000000 },
-      { height: 859314, amount: 22000000 },
-      { height: 880914, amount: 22000000 },
-      { height: 902514, amount: 22000000 },
-      { height: 924114, amount: 22000000 },
-      { height: 945714, amount: 22000000 },
-      { height: 967314, amount: 22000000 },
-      { height: 988914, amount: 22000000 },
-      { height: 1010514, amount: 22000000 },
-      { height: 1032114, amount: 22000000 },
-    ];
-
-    let subsidy = 150;
-    const miningHeight = Math.min(height, PON_HEIGHT - 1);
-    const halvings = Math.min(2, Math.floor((miningHeight - 2500) / HALVING_INTERVAL));
-
-    // Initial supply: slow start + premine + dev fund
-    let coins = (FIRST_HALVING - 5000) * 150 + 375000 + 13020000;
-
-    // Calculate traditional mining rewards through halvings
-    for (let i = 1; i <= halvings; i++) {
-      subsidy = subsidy / 2;
-
-      if (i === halvings) {
-        const nBlocksMain = miningHeight - FIRST_HALVING - ((i - 1) * HALVING_INTERVAL);
-        coins += nBlocksMain * subsidy;
-      } else {
-        coins += HALVING_INTERVAL * subsidy;
-      }
-    }
-
-    // Add time-locked fund releases
-    for (const release of FUND_RELEASES) {
-      if (height >= release.height) {
-        coins += release.amount;
-      }
-    }
-
-    // Add PON rewards after PON_HEIGHT (mainchain only)
-    if (height >= PON_HEIGHT) {
-      coins += (height - PON_HEIGHT + 1) * 14;
-    }
-
-    return BigInt(Math.floor(coins * 100000000));
-  }
-
-  /**
-   * Calculate circulating supply including all parallel asset chains
-   * Based on insight-api getCirculatingSupplyAllChains implementation
-   */
-  private calculateCirculatingSupplyAllChains(height: number): bigint {
-    const PON_HEIGHT = 2020000;
-    const ASSET_MINING_START = 825000;
-    const FIRST_HALVING = 657850;
-    const HALVING_INTERVAL = 655350;
-    const EXCHANGE_FUND_HEIGHT = 835554;
-    const EXCHANGE_FUND_AMOUNT = 10000000;
-    const CHAIN_FUND_AMOUNT = 1000000; // dev + exchange fund allocated per chain launch
-    const SNAPSHOT_AMOUNT = 12313785.94991485; // user snapshot per chain
-
-    // Parallel asset chain launch heights
-    const CHAINS = [
-      { name: 'KDA', launchHeight: 825000 },
-      { name: 'BSC', launchHeight: 883000 },
-      { name: 'ETH', launchHeight: 883000 },
-      { name: 'SOL', launchHeight: 969500 },
-      { name: 'TRX', launchHeight: 969500 },
-      { name: 'AVAX', launchHeight: 1170000 },
-      { name: 'ERGO', launchHeight: 1210000 },
-      { name: 'ALGO', launchHeight: 1330000 },
-      { name: 'MATIC', launchHeight: 1414000 },
-      { name: 'BASE', launchHeight: 1738000 },
-    ];
-
-    let subsidy = 150;
-    const miningHeight = Math.min(height, PON_HEIGHT - 1);
-    const halvings = Math.min(2, Math.floor((miningHeight - 2500) / HALVING_INTERVAL));
-
-    // Initial supply: slow start + premine + dev fund
-    let coins = (FIRST_HALVING - 5000) * 150 + 375000 + 13020000;
-
-    // Add exchange fund if height reached
-    if (height >= EXCHANGE_FUND_HEIGHT) {
-      coins += EXCHANGE_FUND_AMOUNT;
-    }
-
-    // Add snapshot amounts and chain funds for launched chains
-    for (const chain of CHAINS) {
-      if (height > chain.launchHeight) {
-        coins += CHAIN_FUND_AMOUNT + SNAPSHOT_AMOUNT;
-      }
-    }
-
-    // Calculate traditional mining rewards through halvings
-    for (let i = 1; i <= halvings; i++) {
-      subsidy = subsidy / 2;
-
-      if (i === halvings) {
-        // Current/last halving period - partial blocks
-        const nBlocksMain = miningHeight - FIRST_HALVING - ((i - 1) * HALVING_INTERVAL);
-        coins += nBlocksMain * subsidy;
-
-        // Add parallel asset mining rewards (1/10 of main chain subsidy)
-        if (miningHeight > ASSET_MINING_START) {
-          const activeChains = CHAINS.filter(chain => miningHeight > chain.launchHeight).length;
-          coins += nBlocksMain * subsidy * activeChains / 10;
-        }
-      } else {
-        // Completed halving period - full interval
-        coins += HALVING_INTERVAL * subsidy;
-
-        // Add parallel asset mining for the completed period
-        if (miningHeight > ASSET_MINING_START) {
-          const nBlocksAsset = HALVING_INTERVAL - (ASSET_MINING_START - FIRST_HALVING);
-          const activeChains = CHAINS.filter(chain => miningHeight > chain.launchHeight).length;
-          coins += nBlocksAsset * subsidy * activeChains / 10;
-        }
-      }
-    }
-
-    // Add PON (Proof of Node) rewards after PON_HEIGHT - × 2 for parallel assets
-    if (height >= PON_HEIGHT) {
-      coins += (height - PON_HEIGHT + 1) * 14 * 2;
-    }
-
-    // Convert to zatoshis (1 FLUX = 100,000,000 zatoshis)
-    // Use Math.floor to handle decimal from SNAPSHOT_AMOUNT
-    return BigInt(Math.floor(coins * 100000000));
-  }
-
   private async getSupplyStats(_req: Request, res: Response): Promise<void> {
     try {
       // FINAL needed for ReplacingMergeTree deduplication
@@ -2165,8 +2083,8 @@ export class ClickHouseAPIServer {
       // Calculate circulating supply
       // Circulating = Total supply - Locked parallel assets
       // Where locked = theoretical mainchain supply - theoretical distributed to parallel chains
-      const theoreticalMainchain = this.calculateMainchainSupply(blockHeight);
-      const theoreticalAllChains = this.calculateCirculatingSupplyAllChains(blockHeight);
+      const theoreticalMainchain = calculateMainchainSupply(blockHeight);
+      const theoreticalAllChains = calculateCirculatingSupplyAllChains(blockHeight);
       const lockedParallelAssets = theoreticalMainchain - theoreticalAllChains;
       const circulatingSupply = totalSupply - lockedParallelAssets;
 
