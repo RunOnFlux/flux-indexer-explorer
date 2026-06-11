@@ -28,6 +28,11 @@ export interface InsightAddressTransactionsResult {
   items: unknown[];
 }
 
+export interface InsightBlockTransactionsResult {
+  pagesTotal: number;
+  txs: unknown[];
+}
+
 export interface InsightAddressBalanceSumResult {
   balance: string | number;
   unconfirmedBalance: string | number;
@@ -41,8 +46,7 @@ export interface InsightRouterService {
   listBlocks(query: Record<string, unknown>): Promise<InsightListBlocksServiceResult>;
   getTransaction(txid: string): Promise<InsightTransactionServiceResult | null>;
   getRawTransaction(txid: string): Promise<string | null>;
-  getTransactionsByBlock?(blockHash: string): Promise<unknown[]>;
-  getTransactionsByAddress?(address: string): Promise<unknown[]>;
+  getTransactionsByBlock?(blockHash: string, pageNum: number): Promise<InsightBlockTransactionsResult>;
   getAddressSummary(address: string, noTxList: boolean): Promise<InsightAddressSummaryServiceResult>;
   getAddressUtxos(addresses: string[], queryMempool: boolean): Promise<InsightUtxoRow[]>;
   getAddressTransactions?(addresses: string[], range: InsightRange): Promise<InsightAddressTransactionsResult>;
@@ -81,6 +85,11 @@ const FLUXNODE_COLLATERAL_ZATOSHIS = new Set([
 ]);
 const MAX_FEE_TARGETS = 20;
 const MAX_FEE_TARGET_BLOCKS = 1008;
+const MAX_UINT32 = 4294967295;
+// Legacy Insight pages /txs results ten transactions at a time.
+const TXS_PAGE_SIZE = 10;
+// Keeps pageNum * TXS_PAGE_SIZE within the UInt32 offsets ClickHouse accepts.
+const MAX_TXS_PAGE_NUM = Math.floor(MAX_UINT32 / TXS_PAGE_SIZE) - 1;
 
 export function createInsightCompatibilityRouter(service: InsightRouterService): Router {
   const router = express.Router();
@@ -188,25 +197,41 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
   }));
 
   router.get('/txs', asyncHandler(async (req, res) => {
+    const pageNum = parsePageNum(req.query.pageNum);
+    if (pageNum === null) {
+      sendBadRequest(res, 'Invalid pageNum');
+      return;
+    }
+
     if (typeof req.query.block === 'string') {
       if (!service.getTransactionsByBlock) {
         sendNotImplemented(res, 'Block transaction lookup is not implemented');
         return;
       }
 
-      const txs = await service.getTransactionsByBlock(req.query.block);
-      res.json({ pagesTotal: txs.length > 0 ? 1 : 0, txs: txs.map(formatTransactionListItem) });
+      const result = await service.getTransactionsByBlock(req.query.block, pageNum);
+      res.json({ pagesTotal: result.pagesTotal, txs: result.txs.map(formatTransactionListItem) });
       return;
     }
 
     if (typeof req.query.address === 'string') {
-      if (!service.getTransactionsByAddress) {
+      if (!service.getAddressTransactions) {
         sendNotImplemented(res, 'Address transaction lookup is not implemented');
         return;
       }
 
-      const txs = await service.getTransactionsByAddress(req.query.address);
-      res.json({ pagesTotal: txs.length > 0 ? 1 : 0, txs: txs.map(formatTransactionListItem) });
+      const from = pageNum * TXS_PAGE_SIZE;
+      const result = await service.getAddressTransactions([req.query.address], {
+        from,
+        to: from + TXS_PAGE_SIZE,
+        limit: TXS_PAGE_SIZE,
+      });
+      const totalItems = normalizeTotalItems(result.totalItems, result.items.length);
+
+      res.json({
+        pagesTotal: Math.ceil(totalItems / TXS_PAGE_SIZE),
+        txs: result.items.map(formatTransactionListItem),
+      });
       return;
     }
 
@@ -672,6 +697,16 @@ function parseNonNegativeSafeInteger(raw: string): number | null {
 
   const parsed = Number(trimmed);
   return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function parsePageNum(raw: unknown): number | null {
+  const value = firstString(raw)?.trim();
+  if (value === undefined || value.length === 0) {
+    return 0;
+  }
+
+  const parsed = parseNonNegativeSafeInteger(value);
+  return parsed === null || parsed > MAX_TXS_PAGE_NUM ? null : parsed;
 }
 
 function parseFeeTargets(raw: unknown): number[] | null {

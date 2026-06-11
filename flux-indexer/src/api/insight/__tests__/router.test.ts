@@ -23,7 +23,6 @@ function createApp(serviceOverrides: Partial<MockInsightRouterService> & Record<
     getTransaction: jest.fn(),
     getRawTransaction: jest.fn(),
     getTransactionsByBlock: jest.fn(),
-    getTransactionsByAddress: jest.fn(),
     getAddressSummary: jest.fn(),
     getAddressUtxos: jest.fn(),
     getAddressTransactions: jest.fn(),
@@ -460,9 +459,12 @@ describe('Insight core routes', () => {
     });
   });
 
-  test('GET /txs?block returns block transactions from service hook', async () => {
+  test('GET /txs?block returns paged block transactions from service hook', async () => {
     const { app, service } = createApp({
-      getTransactionsByBlock: jest.fn().mockResolvedValue([{ txid: 'tx1' }, { txid: 'tx2' }]),
+      getTransactionsByBlock: jest.fn().mockResolvedValue({
+        pagesTotal: 3,
+        txs: [{ txid: 'tx1' }, { txid: 'tx2' }],
+      }),
     });
 
     await withTestServer(app, async (baseUrl) => {
@@ -470,16 +472,50 @@ describe('Insight core routes', () => {
 
       expect(response.status).toBe(200);
       await expect(readJson(response)).resolves.toEqual({
-        pagesTotal: 1,
+        pagesTotal: 3,
         txs: [{ txid: 'tx1' }, { txid: 'tx2' }],
       });
-      expect(service.getTransactionsByBlock).toHaveBeenCalledWith('blockhash');
+      expect(service.getTransactionsByBlock).toHaveBeenCalledWith('blockhash', 0);
     });
   });
 
-  test('GET /txs?address returns address transactions from service hook', async () => {
+  test('GET /txs?block forwards the requested pageNum', async () => {
     const { app, service } = createApp({
-      getTransactionsByAddress: jest.fn().mockResolvedValue([{ txid: 'tx1' }]),
+      getTransactionsByBlock: jest.fn().mockResolvedValue({ pagesTotal: 3, txs: [] }),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/txs?block=blockhash&pageNum=2`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({ pagesTotal: 3, txs: [] });
+      expect(service.getTransactionsByBlock).toHaveBeenCalledWith('blockhash', 2);
+    });
+  });
+
+  test('GET /txs rejects invalid pageNum values', async () => {
+    const { app, service } = createApp({
+      getTransactionsByBlock: jest.fn().mockResolvedValue({ pagesTotal: 1, txs: [] }),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      for (const pageNum of ['-1', 'abc', '1.5']) {
+        const response = await fetch(`${baseUrl}/insight-api/txs?block=blockhash&pageNum=${pageNum}`);
+
+        expect(response.status).toBe(400);
+        await expect(readJson(response)).resolves.toEqual({ message: 'Invalid pageNum', code: 1 });
+      }
+
+      expect(service.getTransactionsByBlock).not.toHaveBeenCalled();
+    });
+  });
+
+  test('GET /txs?address pages address transactions through the range hook', async () => {
+    const { app, service } = createApp({
+      getAddressTransactions: jest.fn().mockResolvedValue({
+        totalItems: 25,
+        items: [{ txid: 'tx1' }],
+      }),
     });
 
     await withTestServer(app, async (baseUrl) => {
@@ -487,10 +523,46 @@ describe('Insight core routes', () => {
 
       expect(response.status).toBe(200);
       await expect(readJson(response)).resolves.toEqual({
-        pagesTotal: 1,
+        pagesTotal: 3,
         txs: [{ txid: 'tx1' }],
       });
-      expect(service.getTransactionsByAddress).toHaveBeenCalledWith('addr1');
+      expect(service.getAddressTransactions).toHaveBeenCalledWith(
+        ['addr1'],
+        { from: 0, to: 10, limit: 10 }
+      );
+    });
+  });
+
+  test('GET /txs?address forwards the requested pageNum window', async () => {
+    const { app, service } = createApp({
+      getAddressTransactions: jest.fn().mockResolvedValue({ totalItems: 25, items: [] }),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/txs?address=addr1&pageNum=2`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({ pagesTotal: 3, txs: [] });
+      expect(service.getAddressTransactions).toHaveBeenCalledWith(
+        ['addr1'],
+        { from: 20, to: 30, limit: 10 }
+      );
+    });
+  });
+
+  test('GET /txs?address returns not implemented when address transaction hook is missing', async () => {
+    const { app } = createApp({
+      getAddressTransactions: undefined,
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/txs?address=addr1`);
+
+      expect(response.status).toBe(501);
+      await expect(readJson(response)).resolves.toEqual({
+        message: 'Address transaction lookup is not implemented',
+        code: 1,
+      });
     });
   });
 

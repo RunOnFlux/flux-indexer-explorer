@@ -119,7 +119,8 @@ const RECENT_BLOCK_LOOKBACK_BUFFER = 250;
 const BLOCK_LIST_LIMIT = 200;
 const MAX_UTXO_ADDRESSES = 100;
 const MAX_UTXO_ROWS = 5000;
-const MAX_BLOCK_TRANSACTION_LOOKUP = 200;
+// Legacy Insight pages /txs results ten transactions at a time.
+const TRANSACTIONS_PAGE_SIZE = 10;
 const MAX_ADDRESS_TX_LIMIT = 50;
 const DEFAULT_STATISTIC_DAYS = 365;
 const MAX_STATISTIC_DAYS = 730;
@@ -312,7 +313,7 @@ export class InsightCompatibilityService {
     return parseNonNegativeHeightValue(row?.height) ?? 0;
   }
 
-  async getTransaction(_txid: string): Promise<InsightTransactionServiceResult | null> {
+  async getTransaction(_txid: string, _knownCurrentHeight?: number): Promise<InsightTransactionServiceResult | null> {
     const txid = normalizeHashOrNull(_txid);
     if (!txid) {
       return null;
@@ -336,7 +337,7 @@ export class InsightCompatibilityService {
       this.getTransactionOutputs(txid),
       this.getTransactionInputs(txid),
       this.getTransactionBlock(tx.block_height),
-      this.getCurrentChainHeight(),
+      _knownCurrentHeight === undefined ? this.getCurrentChainHeight() : Promise.resolve(_knownCurrentHeight),
       tx.is_fluxnode_tx === 1 ? this.getFluxnodeTransaction(txid) : Promise.resolve(null),
     ]);
     const inputs = tx.is_coinbase === 1
@@ -431,22 +432,28 @@ export class InsightCompatibilityService {
     });
   }
 
-  async getTransactionsByBlock(blockHash: string): Promise<InsightTransactionServiceResult[]> {
+  async getTransactionsByBlock(blockHash: string, pageNum = 0): Promise<{
+    pagesTotal: number;
+    txs: InsightTransactionServiceResult[];
+  }> {
     const block = await this.getBlock(blockHash);
     if (block === null) {
-      return [];
+      return { pagesTotal: 0, txs: [] };
     }
 
+    const start = pageNum * TRANSACTIONS_PAGE_SIZE;
+    const pageTxids = block.txids.slice(start, start + TRANSACTIONS_PAGE_SIZE);
+    // Resolve the chain height once and reuse it across the page's
+    // transaction lookups instead of refetching it per transaction.
+    const currentHeight = pageTxids.length > 0 ? await this.getCurrentChainHeight() : 0;
     const transactions = await Promise.all(
-      block.txids.slice(0, MAX_BLOCK_TRANSACTION_LOOKUP).map((txid) => this.getTransaction(txid))
+      pageTxids.map((txid) => this.getTransaction(txid, currentHeight))
     );
 
-    return transactions.filter(isPresent);
-  }
-
-  async getTransactionsByAddress(address: string): Promise<InsightTransactionServiceResult[]> {
-    const result = await this.getAddressTransactions([address], { from: 0, to: 10, limit: 10 });
-    return result.items;
+    return {
+      pagesTotal: Math.ceil(block.txids.length / TRANSACTIONS_PAGE_SIZE),
+      txs: transactions.filter(isPresent),
+    };
   }
 
   async getAddressTransactions(

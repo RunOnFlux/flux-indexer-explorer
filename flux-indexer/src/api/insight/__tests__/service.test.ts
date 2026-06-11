@@ -757,9 +757,10 @@ describe('InsightCompatibilityService', () => {
     expect(params).toEqual({ addresses: ['alpha', 'beta'] });
   });
 
-  test('caps block transaction list lookups before fetching full tx details', async () => {
-    const { service } = createService();
+  test('pages block transaction lookups ten at a time with a shared chain height', async () => {
+    const { service, ch } = createService();
     const txids = Array.from({ length: 205 }, (_, index) => `${index}`.padStart(64, '0'));
+    ch.queryOne.mockResolvedValue({ chain_height: 300, current_height: 300 });
     jest.spyOn(service, 'getBlock').mockResolvedValue({
       block: { hash: 'a'.repeat(64), height: 1 } as any,
       txids,
@@ -775,12 +776,30 @@ describe('InsightCompatibilityService', () => {
         blockHash: 'a'.repeat(64),
       }));
 
-    const result = await service.getTransactionsByBlock('a'.repeat(64));
+    const firstPage = await service.getTransactionsByBlock('a'.repeat(64));
 
-    expect(result).toHaveLength(200);
-    expect(getTransaction).toHaveBeenCalledTimes(200);
-    expect(getTransaction).toHaveBeenNthCalledWith(1, txids[0]);
-    expect(getTransaction).toHaveBeenNthCalledWith(200, txids[199]);
+    expect(firstPage.pagesTotal).toBe(21);
+    expect(firstPage.txs).toHaveLength(10);
+    expect(getTransaction).toHaveBeenCalledTimes(10);
+    expect(getTransaction).toHaveBeenNthCalledWith(1, txids[0], 300);
+    expect(getTransaction).toHaveBeenNthCalledWith(10, txids[9], 300);
+
+    getTransaction.mockClear();
+
+    const lastPage = await service.getTransactionsByBlock('a'.repeat(64), 20);
+
+    expect(lastPage.pagesTotal).toBe(21);
+    expect(lastPage.txs).toHaveLength(5);
+    expect(getTransaction).toHaveBeenCalledTimes(5);
+    expect(getTransaction).toHaveBeenNthCalledWith(1, txids[200], 300);
+    expect(getTransaction).toHaveBeenNthCalledWith(5, txids[204], 300);
+
+    getTransaction.mockClear();
+
+    const beyondEnd = await service.getTransactionsByBlock('a'.repeat(64), 21);
+
+    expect(beyondEnd).toEqual({ pagesTotal: 21, txs: [] });
+    expect(getTransaction).not.toHaveBeenCalled();
   });
 
   test('broadcasts raw transaction and returns txid', async () => {
