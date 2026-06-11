@@ -1194,7 +1194,29 @@ describe('Insight core routes', () => {
         expect.objectContaining({ txid: '1'.repeat(64), amount: 1000, satoshis: 100000000000 }),
         expect.objectContaining({ txid: '3'.repeat(64), amount: 40000, satoshis: 4000000000000 }),
       ]);
-      expect(getAddressUtxos).toHaveBeenCalledWith(['addr1', 'addr2'], true);
+      expect(getAddressUtxos).toHaveBeenCalledWith(['addr1', 'addr2'], true, [
+        100000000000n,
+        1000000000000n,
+        1250000000000n,
+        2500000000000n,
+        4000000000000n,
+        10000000000000n,
+      ]);
+    });
+  });
+
+  test('GET /addrs utxo queries mempool while unspent stays confirmed-only', async () => {
+    const getAddressUtxos = jest.fn().mockResolvedValue([]);
+    const { app } = createApp({ getAddressUtxos });
+
+    await withTestServer(app, async (baseUrl) => {
+      const utxoResponse = await fetch(`${baseUrl}/insight-api/addrs/addr1,addr2/utxo`);
+      expect(utxoResponse.status).toBe(200);
+      expect(getAddressUtxos).toHaveBeenLastCalledWith(['addr1', 'addr2'], true);
+
+      const unspentResponse = await fetch(`${baseUrl}/insight-api/addrs/addr1,addr2/unspent`);
+      expect(unspentResponse.status).toBe(200);
+      expect(getAddressUtxos).toHaveBeenLastCalledWith(['addr1', 'addr2'], false);
     });
   });
 

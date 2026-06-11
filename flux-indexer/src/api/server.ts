@@ -16,6 +16,7 @@ import { logger } from '../utils/logger';
 import { extractTransactionFromBlock } from '../parsers/block-parser';
 import { createInsightCompatibilityRouter } from './insight/router';
 import { InsightCompatibilityService } from './insight/service';
+import type { MempoolAddressDeltas, MempoolCreatedUtxo } from './insight/service';
 
 export class ClickHouseAPIServer {
   private app: express.Application;
@@ -29,11 +30,11 @@ export class ClickHouseAPIServer {
   private statusCache: { data: any | null; timestamp: number } = { data: null, timestamp: 0 };
   private static readonly STATUS_CACHE_TTL = 30000; // 30s for status (doesn't need to be instant)
   private static readonly STATS_CACHE_TTL = 2000;   // 2s for dashboard stats (matches frontend polling)
-  private mempoolAddressCache: { data: Map<string, { balanceDelta: bigint; txCount: number }>; timestamp: number } = {
+  private mempoolAddressCache: { data: MempoolAddressDeltas; timestamp: number } = {
     data: new Map(),
     timestamp: 0,
   };
-  private mempoolAddressCacheInFlight: Promise<Map<string, { balanceDelta: bigint; txCount: number }>> | null = null;
+  private mempoolAddressCacheInFlight: Promise<MempoolAddressDeltas> | null = null;
   private static readonly MEMPOOL_ADDRESS_CACHE_TTL = 5000; // 5s (fast enough for UX, low enough RPC load)
 
   constructor(
@@ -138,7 +139,7 @@ export class ClickHouseAPIServer {
     return !!address && address !== 'UNKNOWN' && address !== 'SHIELDED_OR_NONSTANDARD';
   }
 
-  private async getMempoolAddressDeltas(): Promise<Map<string, { balanceDelta: bigint; txCount: number }>> {
+  private async getMempoolAddressDeltas(): Promise<MempoolAddressDeltas> {
     const now = Date.now();
     if ((now - this.mempoolAddressCache.timestamp) < ClickHouseAPIServer.MEMPOOL_ADDRESS_CACHE_TTL) {
       return this.mempoolAddressCache.data;
@@ -166,7 +167,7 @@ export class ClickHouseAPIServer {
     return this.mempoolAddressCacheInFlight;
   }
 
-  private async computeMempoolAddressDeltas(): Promise<Map<string, { balanceDelta: bigint; txCount: number }>> {
+  private async computeMempoolAddressDeltas(): Promise<MempoolAddressDeltas> {
     const mempoolTxidsResult = await this.rpc.getRawMempool(false);
     const mempoolTxids = Array.isArray(mempoolTxidsResult)
       ? mempoolTxidsResult
@@ -266,12 +267,15 @@ export class ClickHouseAPIServer {
       }
     }
 
-    // Aggregate per-address deltas and tx counts.
+    // Aggregate per-address deltas, tx counts, and outpoint-level activity.
     const balanceDeltaByAddress = new Map<string, bigint>();
     const txCountByAddress = new Map<string, number>();
+    const spentOutpointsByAddress = new Map<string, Set<string>>();
+    const createdUtxosByAddress = new Map<string, MempoolCreatedUtxo[]>();
 
     for (const tx of mempoolTxs) {
       const touchedAddresses = new Set<string>();
+      const txid = ClickHouseAPIServer.padFixedString64(tx.txid);
 
       for (const output of tx.vout || []) {
         const address = output.scriptPubKey?.addresses?.[0];
@@ -279,6 +283,18 @@ export class ClickHouseAPIServer {
         const valueSat = BigInt(Math.round(output.value * 100000000));
         balanceDeltaByAddress.set(address, (balanceDeltaByAddress.get(address) ?? BigInt(0)) + valueSat);
         touchedAddresses.add(address);
+
+        let createdUtxos = createdUtxosByAddress.get(address);
+        if (!createdUtxos) {
+          createdUtxos = [];
+          createdUtxosByAddress.set(address, createdUtxos);
+        }
+        createdUtxos.push({
+          txid,
+          vout: output.n,
+          value: valueSat,
+          scriptPubkey: output.scriptPubKey?.hex ?? '',
+        });
       }
 
       for (const input of tx.vin || []) {
@@ -293,6 +309,13 @@ export class ClickHouseAPIServer {
           (balanceDeltaByAddress.get(prevOut.address) ?? BigInt(0)) - prevOut.value
         );
         touchedAddresses.add(prevOut.address);
+
+        let spentOutpoints = spentOutpointsByAddress.get(prevOut.address);
+        if (!spentOutpoints) {
+          spentOutpoints = new Set();
+          spentOutpointsByAddress.set(prevOut.address, spentOutpoints);
+        }
+        spentOutpoints.add(key);
       }
 
       for (const addr of touchedAddresses) {
@@ -300,9 +323,14 @@ export class ClickHouseAPIServer {
       }
     }
 
-    const result = new Map<string, { balanceDelta: bigint; txCount: number }>();
+    const result: MempoolAddressDeltas = new Map();
     for (const [address, txCount] of txCountByAddress) {
-      result.set(address, { balanceDelta: balanceDeltaByAddress.get(address) ?? BigInt(0), txCount });
+      result.set(address, {
+        balanceDelta: balanceDeltaByAddress.get(address) ?? BigInt(0),
+        txCount,
+        spentOutpoints: spentOutpointsByAddress.get(address) ?? new Set(),
+        createdUtxos: createdUtxosByAddress.get(address) ?? [],
+      });
     }
 
     return result;

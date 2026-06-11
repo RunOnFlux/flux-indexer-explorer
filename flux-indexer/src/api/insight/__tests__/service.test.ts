@@ -888,6 +888,155 @@ describe('InsightCompatibilityService', () => {
     expect(ch.queryOne).toHaveBeenCalledWith(expect.stringContaining('FROM sync_state'));
   });
 
+  test('filters mempool-spent utxos and appends mempool-created utxos when querying mempool', async () => {
+    const { service, ch, getMempoolAddressDeltas } = createService();
+    const spentTxid = '1'.repeat(64);
+    const keptTxid = '2'.repeat(64);
+    const createdTxid = 'a'.repeat(64);
+    ch.queryOne.mockResolvedValue({ chain_height: 105, current_height: 105 });
+    ch.query.mockResolvedValue([
+      {
+        address: P2PKH_ADDRESS,
+        txid: spentTxid,
+        vout: 0,
+        script_pubkey: '',
+        script_type: 'pubkeyhash',
+        value: '100',
+        block_height: 100,
+      },
+      {
+        address: P2PKH_ADDRESS,
+        txid: keptTxid,
+        vout: 1,
+        script_pubkey: '',
+        script_type: 'pubkeyhash',
+        value: '200',
+        block_height: 105,
+      },
+    ]);
+    getMempoolAddressDeltas.mockResolvedValue(new Map([
+      [P2PKH_ADDRESS, {
+        balanceDelta: 0n,
+        txCount: 2,
+        spentOutpoints: new Set([`${spentTxid}:0`, `${createdTxid}:1`]),
+        createdUtxos: [
+          { txid: createdTxid, vout: 0, value: 300n, scriptPubkey: '51' },
+          // Re-spent within the mempool, so it must not be listed.
+          { txid: createdTxid, vout: 1, value: 400n, scriptPubkey: '52' },
+        ],
+      }],
+    ]));
+
+    const result = await service.getAddressUtxos([P2PKH_ADDRESS], true);
+
+    expect(result).toEqual([
+      expect.objectContaining({ txid: keptTxid, vout: 1, value: '200', confirmations: 1 }),
+      {
+        address: P2PKH_ADDRESS,
+        txid: createdTxid,
+        vout: 0,
+        script_pubkey: '51',
+        value: '300',
+        confirmations: 0,
+      },
+    ]);
+  });
+
+  test('returns confirmed-only utxos without touching the mempool provider when queryMempool is false', async () => {
+    const { service, ch, getMempoolAddressDeltas } = createService();
+    const spentTxid = '1'.repeat(64);
+    ch.queryOne.mockResolvedValue({ chain_height: 105, current_height: 105 });
+    ch.query.mockResolvedValue([
+      {
+        address: P2PKH_ADDRESS,
+        txid: spentTxid,
+        vout: 0,
+        script_pubkey: '',
+        script_type: 'pubkeyhash',
+        value: '100',
+        block_height: 100,
+      },
+    ]);
+    getMempoolAddressDeltas.mockResolvedValue(new Map([
+      [P2PKH_ADDRESS, {
+        balanceDelta: 0n,
+        txCount: 1,
+        spentOutpoints: new Set([`${spentTxid}:0`]),
+        createdUtxos: [{ txid: 'a'.repeat(64), vout: 0, value: 300n, scriptPubkey: '51' }],
+      }],
+    ]));
+
+    const result = await service.getAddressUtxos([P2PKH_ADDRESS], false);
+
+    expect(result).toEqual([
+      expect.objectContaining({ txid: spentTxid, vout: 0, value: '100', confirmations: 6 }),
+    ]);
+    expect(getMempoolAddressDeltas).not.toHaveBeenCalled();
+  });
+
+  test('pushes the collateral value filter into sql so capped addresses keep collateral utxos', async () => {
+    const { service, ch } = createService();
+    const collateral = 1000n * 100000000n;
+    const collateralTxid = 'c'.repeat(64);
+    ch.queryOne.mockResolvedValue({ chain_height: 200, current_height: 200 });
+    ch.query.mockImplementation(async (_sql: string, params?: Record<string, unknown>) => {
+      // Simulate an address whose 5000 newest utxos are all non-collateral:
+      // the old collateral row only comes back when the filter reaches SQL.
+      if (!Array.isArray(params?.values)) {
+        return [];
+      }
+      return [
+        {
+          address: P2PKH_ADDRESS,
+          txid: collateralTxid,
+          vout: 0,
+          script_pubkey: '',
+          script_type: 'pubkeyhash',
+          value: collateral.toString(),
+          block_height: 1,
+        },
+      ];
+    });
+
+    const result = await service.getAddressUtxos([P2PKH_ADDRESS], true, [collateral]);
+
+    const [sql, params] = ch.query.mock.calls[0];
+    expect(sql).toContain('AND value IN {values:Array(UInt64)}');
+    expect(sql).toContain('LIMIT {limit:UInt32}');
+    expect(params).toEqual({
+      addresses: [P2PKH_ADDRESS],
+      values: ['100000000000'],
+      limit: 5000,
+    });
+    expect(result).toEqual([
+      expect.objectContaining({ txid: collateralTxid, value: '100000000000', confirmations: 200 }),
+    ]);
+  });
+
+  test('applies the collateral value filter to mempool-created utxos', async () => {
+    const { service, ch, getMempoolAddressDeltas } = createService();
+    const collateral = 1000n * 100000000n;
+    ch.queryOne.mockResolvedValue({ chain_height: 200, current_height: 200 });
+    ch.query.mockResolvedValue([]);
+    getMempoolAddressDeltas.mockResolvedValue(new Map([
+      [P2PKH_ADDRESS, {
+        balanceDelta: 0n,
+        txCount: 1,
+        spentOutpoints: new Set<string>(),
+        createdUtxos: [
+          { txid: 'a'.repeat(64), vout: 0, value: collateral, scriptPubkey: '51' },
+          { txid: 'a'.repeat(64), vout: 1, value: 42n, scriptPubkey: '52' },
+        ],
+      }],
+    ]));
+
+    const result = await service.getAddressUtxos([P2PKH_ADDRESS], true, [collateral]);
+
+    expect(result).toEqual([
+      expect.objectContaining({ txid: 'a'.repeat(64), vout: 0, value: '100000000000', confirmations: 0 }),
+    ]);
+  });
+
   test('gets multi-address transactions with deduped capped addresses and full tx details in order', async () => {
     const { service, ch } = createService();
     const firstTxid = 'a'.repeat(64);

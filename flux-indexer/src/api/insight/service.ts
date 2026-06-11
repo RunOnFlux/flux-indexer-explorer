@@ -44,7 +44,27 @@ export type InsightRPC = Pick<
   getRawTransaction(txid: string, verbose?: boolean): Promise<unknown>;
 };
 
-export type MempoolAddressDeltas = Map<string, { balanceDelta: bigint; txCount: number }>;
+export interface MempoolCreatedUtxo {
+  // Padded to FixedString(64) so it matches utxos.txid rows verbatim.
+  txid: string;
+  vout: number;
+  value: bigint;
+  // Raw scriptPubKey hex from the daemon's decoded output; '' when unavailable.
+  scriptPubkey: string;
+}
+
+export interface MempoolAddressDelta {
+  balanceDelta: bigint;
+  txCount: number;
+  // 'txid:vout' keys (txid padded to FixedString(64)) of this address's
+  // outputs that a mempool transaction spends.
+  spentOutpoints?: ReadonlySet<string>;
+  // Outputs created for this address by mempool transactions, including ones
+  // re-spent within the mempool (those also appear in spentOutpoints).
+  createdUtxos?: readonly MempoolCreatedUtxo[];
+}
+
+export type MempoolAddressDeltas = Map<string, MempoolAddressDelta>;
 export type GetMempoolAddressDeltas = () => Promise<MempoolAddressDeltas>;
 
 export interface InsightBlockServiceResult {
@@ -411,40 +431,57 @@ export class InsightCompatibilityService {
     };
   }
 
-  async getAddressUtxos(_addresses: string[], _queryMempool: boolean): Promise<InsightUtxoRow[]> {
-    void _queryMempool;
-
+  async getAddressUtxos(
+    _addresses: string[],
+    _queryMempool: boolean,
+    _collateralValues?: ReadonlyArray<bigint | string>
+  ): Promise<InsightUtxoRow[]> {
     const addresses = [...new Set(_addresses.map((address) => address.trim()).filter(Boolean))]
       .slice(0, MAX_UTXO_ADDRESSES);
     if (addresses.length === 0) {
       return [];
     }
 
-    const [rows, currentHeight] = await Promise.all([
+    // Pushing the value filter into SQL keeps denomination-specific lookups
+    // (fluxnode collateral) immune to the MAX_UTXO_ROWS truncation below.
+    const valueFilter = normalizeUtxoValueFilter(_collateralValues);
+    const [rows, currentHeight, mempoolDeltas] = await Promise.all([
       this.ch.query<InsightUtxoQueryRow>(`
         SELECT address, txid, vout, script_pubkey, script_type, value, block_height
         FROM (
           SELECT address, txid, vout, script_pubkey, script_type, value, block_height, spent
           FROM utxos
           WHERE address IN {addresses:Array(String)}
+          ${valueFilter ? 'AND value IN {values:Array(UInt64)}' : ''}
           ORDER BY txid, vout, version DESC
           LIMIT 1 BY txid, vout
         )
         WHERE spent = 0
         ORDER BY block_height DESC, txid, vout
         LIMIT {limit:UInt32}
-      `, { addresses, limit: MAX_UTXO_ROWS }),
+      `, valueFilter
+        ? { addresses, values: [...valueFilter], limit: MAX_UTXO_ROWS }
+        : { addresses, limit: MAX_UTXO_ROWS }),
       this.getCurrentChainHeight(),
+      _queryMempool ? this.getMempoolAddressDeltas() : Promise.resolve(null),
     ]);
 
-    return rows.map((row) => {
-      const { script_type: scriptType, ...utxo } = row;
-      return {
-        ...utxo,
-        script_pubkey: normalizeScriptPubkey(row.script_pubkey, scriptType, row.address),
-        confirmations: calculateConfirmations(row.block_height, currentHeight),
-      };
-    });
+    const mempoolSpent = collectMempoolSpentOutpoints(mempoolDeltas, addresses);
+    const confirmed = rows
+      .filter((row) => !mempoolSpent.has(`${row.txid}:${row.vout}`))
+      .map((row) => {
+        const { script_type: scriptType, ...utxo } = row;
+        return {
+          ...utxo,
+          script_pubkey: normalizeScriptPubkey(row.script_pubkey, scriptType, row.address),
+          confirmations: calculateConfirmations(row.block_height, currentHeight),
+        };
+      });
+
+    return [
+      ...confirmed,
+      ...buildMempoolUtxoRows(mempoolDeltas, addresses, mempoolSpent, valueFilter),
+    ];
   }
 
   async getTransactionsByBlock(blockHash: string, pageNum = 0): Promise<{
@@ -1841,6 +1878,84 @@ function normalizeScriptPubkey(
   address: string | null | undefined
 ): string {
   return getScriptPubkey(storedScript ?? '', scriptType ?? '', address ?? '') ?? storedScript ?? '';
+}
+
+// Canonical decimal-zatoshi strings for the SQL value filter; null disables it.
+function normalizeUtxoValueFilter(
+  values: ReadonlyArray<bigint | string> | undefined
+): Set<string> | null {
+  if (!values || values.length === 0) {
+    return null;
+  }
+
+  const normalized = new Set<string>();
+  for (const value of values) {
+    try {
+      const parsed = typeof value === 'bigint' ? value : BigInt(value.trim());
+      if (parsed >= 0n) {
+        normalized.add(parsed.toString());
+      }
+    } catch {
+      // Skip unparseable entries instead of failing the whole lookup.
+    }
+  }
+
+  return normalized.size > 0 ? normalized : null;
+}
+
+function collectMempoolSpentOutpoints(
+  deltas: MempoolAddressDeltas | null,
+  addresses: string[]
+): Set<string> {
+  const spent = new Set<string>();
+  if (deltas === null) {
+    return spent;
+  }
+
+  for (const address of addresses) {
+    for (const outpoint of deltas.get(address)?.spentOutpoints ?? []) {
+      spent.add(outpoint);
+    }
+  }
+
+  return spent;
+}
+
+function buildMempoolUtxoRows(
+  deltas: MempoolAddressDeltas | null,
+  addresses: string[],
+  spentOutpoints: ReadonlySet<string>,
+  valueFilter: ReadonlySet<string> | null
+): InsightUtxoRow[] {
+  if (deltas === null) {
+    return [];
+  }
+
+  const rows: InsightUtxoRow[] = [];
+  for (const address of addresses) {
+    for (const utxo of deltas.get(address)?.createdUtxos ?? []) {
+      // Outputs re-spent inside the mempool are not spendable.
+      if (spentOutpoints.has(`${utxo.txid}:${utxo.vout}`)) {
+        continue;
+      }
+
+      const value = utxo.value.toString();
+      if (valueFilter !== null && !valueFilter.has(value)) {
+        continue;
+      }
+
+      rows.push({
+        address,
+        txid: utxo.txid,
+        vout: utxo.vout,
+        script_pubkey: normalizeScriptPubkey(utxo.scriptPubkey, null, address),
+        value,
+        confirmations: 0,
+      });
+    }
+  }
+
+  return rows;
 }
 
 function getRawTransactionHex(raw: unknown): string | null {

@@ -52,7 +52,11 @@ export interface InsightRouterService {
     noTxList: boolean,
     txRange?: { from: number; to: number }
   ): Promise<InsightAddressSummaryServiceResult>;
-  getAddressUtxos(addresses: string[], queryMempool: boolean): Promise<InsightUtxoRow[]>;
+  getAddressUtxos(
+    addresses: string[],
+    queryMempool: boolean,
+    collateralValues?: ReadonlyArray<bigint | string>
+  ): Promise<InsightUtxoRow[]>;
   getAddressTransactions?(addresses: string[], range: InsightRange): Promise<InsightAddressTransactionsResult>;
   getAddressBalanceSum?(addresses: string[]): Promise<InsightAddressBalanceSumResult>;
   sendRawTransaction(rawtx: string): Promise<string>;
@@ -87,6 +91,9 @@ const FLUXNODE_COLLATERAL_ZATOSHIS = new Set([
   40000n * 100000000n,
   100000n * 100000000n,
 ]);
+// Pushed into the service's SQL value filter so old collateral UTXOs survive
+// the row cap on busy addresses.
+const FLUXNODE_COLLATERAL_VALUES = [...FLUXNODE_COLLATERAL_ZATOSHIS];
 const MAX_FEE_TARGETS = 20;
 const MAX_FEE_TARGET_BLOCKS = 1008;
 const MAX_UINT32 = 4294967295;
@@ -449,13 +456,13 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
 
   router.get('/fluxnode/addrs/:addrs/utxo', asyncHandler(async (req, res) => {
     const addresses = parseAddressList(req.params.addrs);
-    const rows = await service.getAddressUtxos(addresses, true);
+    const rows = await service.getAddressUtxos(addresses, true, FLUXNODE_COLLATERAL_VALUES);
     res.json(rows.filter(isFluxNodeCollateralUtxo).map(formatUtxo));
   }));
 
   router.post('/fluxnode/addrs/utxo', asyncHandler(async (req, res) => {
     const addresses = parseAddressList(undefined, req.body);
-    const rows = await service.getAddressUtxos(addresses, true);
+    const rows = await service.getAddressUtxos(addresses, true, FLUXNODE_COLLATERAL_VALUES);
     res.json(rows.filter(isFluxNodeCollateralUtxo).map(formatUtxo));
   }));
 
