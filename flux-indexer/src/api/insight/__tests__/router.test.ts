@@ -180,6 +180,19 @@ describe('Insight server mount', () => {
     });
   });
 
+  test('GET /currency returns the legacy currency shape', async () => {
+    const app = createServerApp();
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/currency`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({
+        status: 200,
+        data: { rate: null, short: 'FLUX' },
+      });
+    });
+  });
 });
 
 describe('Insight core routes', () => {

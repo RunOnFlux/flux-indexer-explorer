@@ -703,6 +703,15 @@ describe('InsightCompatibilityService', () => {
     expect(rpc.sendRawTransaction).toHaveBeenCalledWith('01000000');
   });
 
+  test('returns legacy currency compatibility shape with null rate', () => {
+    const { service } = createService();
+
+    expect(service.getCurrency()).toEqual({
+      status: 200,
+      data: { rate: null, short: 'FLUX' },
+    });
+  });
+
   test('estimates multiple fee targets', async () => {
     const { service, rpc } = createService();
     rpc.estimateFee.mockImplementation(async (target: number) => target / 1000);

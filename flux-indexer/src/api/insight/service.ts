@@ -881,8 +881,8 @@ export class InsightCompatibilityService {
     }));
   }
 
-  getCurrency(): { status: 'ok'; data: null; timestamp: string } {
-    return { status: 'ok', data: null, timestamp: new Date().toISOString() };
+  getCurrency(): { status: number; data: { rate: null; short: 'FLUX' } } {
+    return { status: 200, data: { rate: null, short: 'FLUX' } };
   }
 
   getMarketsInfo(): { rate: null; currency: 'USD'; source: null; timestamp: string } {
