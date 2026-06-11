@@ -388,6 +388,37 @@ describe('Insight compatibility formatters', () => {
     });
   });
 
+  test('omits block fields and unresolved fees for mempool transactions', () => {
+    const result = formatTransaction({
+      tx: {
+        txid: 'mempool-tx',
+        version: 4,
+        locktime: 0,
+        block_height: -1,
+        timestamp: 1750000000,
+        input_total: '100',
+        output_total: '90',
+        fee: null,
+        size: 200,
+        is_coinbase: 0,
+        is_fluxnode_tx: 0,
+      },
+      blockHash: null,
+      confirmations: 0,
+      inputs: [],
+      outputs: [],
+    });
+
+    expect(result).not.toHaveProperty('blockheight');
+    expect(result).not.toHaveProperty('blocktime');
+    expect(result).not.toHaveProperty('fees');
+    expect(result.time).toBe(1750000000);
+    expect(result.valueIn).toBe(0.000001);
+    expect(result.confirmations).toBe(0);
+    // blockhash serializes away entirely for mempool transactions.
+    expect(JSON.parse(JSON.stringify(result))).not.toHaveProperty('blockhash');
+  });
+
   test('emits fluxnode metadata with legacy v1 field names', () => {
     const tx = {
       txid: 'fluxnode-tx',

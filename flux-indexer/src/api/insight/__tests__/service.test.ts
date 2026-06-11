@@ -3,6 +3,7 @@ jest.mock('../../../parsers/block-parser', () => ({
 }));
 
 import { extractTransactionFromBlock } from '../../../parsers/block-parser';
+import { RPCError } from '../../../types';
 import { encodeFluxAddress } from '../../../utils/script-utils';
 import { InsightCompatibilityService } from '../service';
 import { InsightValidationError } from '../utils';
@@ -458,6 +459,205 @@ describe('InsightCompatibilityService', () => {
 
     expect(result?.inputs).toEqual(inputs);
     expect(rpc.getRawTransaction).toHaveBeenCalledWith(txid, true);
+  });
+
+  test('serves mempool transactions from the daemon when ClickHouse has no row', async () => {
+    const { service, ch, rpc } = createService();
+    const txid = 'a'.repeat(64);
+    const confirmedParent = '1'.repeat(64);
+    const mempoolParent = '2'.repeat(64);
+
+    ch.queryOne.mockResolvedValue(null);
+    ch.query.mockImplementation(async (sql: string, params?: Record<string, unknown>) => {
+      if (sql.includes('(txid, vout) IN')) {
+        expect(params?.outpoints).toEqual([[confirmedParent, 0], [mempoolParent, 1]]);
+        return [
+          { txid: confirmedParent, vout: 0, address: 't1Confirmed', value: '150000000', script_type: 'pubkeyhash' },
+        ];
+      }
+
+      throw new Error(`Unexpected query: ${sql}`);
+    });
+    rpc.getRawTransaction.mockImplementation(async (requested: string) => {
+      if (requested === txid) {
+        return {
+          txid,
+          version: 4,
+          locktime: 0,
+          size: 250,
+          vin: [
+            { txid: confirmedParent, vout: 0, sequence: 4294967294, scriptSig: { hex: 'aa', asm: 'aa-asm' } },
+            { txid: mempoolParent, vout: 1, sequence: 4294967295, scriptSig: { hex: 'bb', asm: 'bb-asm' } },
+          ],
+          vout: [
+            {
+              value: 2.4,
+              n: 0,
+              scriptPubKey: { hex: '76a914ff', asm: 'OP_DUP', type: 'pubkeyhash', addresses: ['t1Recipient'] },
+            },
+          ],
+        };
+      }
+
+      if (requested === mempoolParent) {
+        return {
+          txid: mempoolParent,
+          vout: [
+            { value: 1, n: 1, scriptPubKey: { hex: '76a9', type: 'pubkeyhash', addresses: ['t1MempoolParent'] } },
+          ],
+        };
+      }
+
+      throw new Error(`Unexpected getRawTransaction: ${requested}`);
+    });
+
+    const result = await service.getTransaction(txid);
+
+    expect(rpc.getRawTransaction).toHaveBeenCalledWith(txid, true);
+    expect(result?.tx).toMatchObject({
+      txid,
+      version: 4,
+      block_height: -1,
+      input_total: '250000000',
+      output_total: '240000000',
+      fee: '10000000',
+      size: 250,
+      is_coinbase: 0,
+      is_valid: 1,
+    });
+    expect(typeof result?.tx.timestamp).toBe('number');
+    expect(result?.confirmations).toBe(0);
+    expect(result?.blockHash).toBeNull();
+    expect(result?.inputs).toEqual([
+      {
+        txid: confirmedParent,
+        vout: 0,
+        address: 't1Confirmed',
+        value: '150000000',
+        script_type: 'pubkeyhash',
+        sequence: 4294967294,
+        script_sig: { hex: 'aa', asm: 'aa-asm' },
+      },
+      {
+        txid: mempoolParent,
+        vout: 1,
+        address: 't1MempoolParent',
+        value: '100000000',
+        script_type: 'pubkeyhash',
+        sequence: 4294967295,
+        script_sig: { hex: 'bb', asm: 'bb-asm' },
+      },
+    ]);
+    expect(result?.outputs).toEqual([
+      {
+        vout: 0,
+        address: 't1Recipient',
+        value: '240000000',
+        script_pubkey: '76a914ff',
+        script_type: 'pubkeyhash',
+        spent: 0,
+        spent_txid: null,
+        spent_index: null,
+        spent_block_height: null,
+      },
+    ]);
+  });
+
+  test('omits the mempool fee when a parent outpoint cannot be resolved', async () => {
+    const { service, ch, rpc } = createService();
+    const txid = 'a'.repeat(64);
+    const unknownParent = '3'.repeat(64);
+
+    ch.queryOne.mockResolvedValue(null);
+    ch.query.mockResolvedValue([]);
+    rpc.getRawTransaction.mockImplementation(async (requested: string) => {
+      if (requested === txid) {
+        return {
+          txid,
+          version: 4,
+          locktime: 0,
+          size: 200,
+          vin: [{ txid: unknownParent, vout: 0, sequence: 4294967295 }],
+          vout: [
+            { value: 0.9, n: 0, scriptPubKey: { hex: '76a9', type: 'pubkeyhash', addresses: ['t1Out'] } },
+          ],
+        };
+      }
+
+      throw new RPCError('No information available about transaction', -5);
+    });
+
+    const result = await service.getTransaction(txid);
+
+    expect(result?.tx.fee).toBeNull();
+    expect(result?.inputs).toEqual([
+      {
+        txid: unknownParent,
+        vout: 0,
+        address: '',
+        value: '0',
+        script_type: undefined,
+        sequence: 4294967295,
+        script_sig: undefined,
+      },
+    ]);
+  });
+
+  test('returns null when the daemon does not know the transaction', async () => {
+    const { service, ch, rpc } = createService();
+
+    ch.queryOne.mockResolvedValue(null);
+    rpc.getRawTransaction.mockRejectedValue(
+      new RPCError('No information available about transaction', -5)
+    );
+
+    await expect(service.getTransaction('a'.repeat(64))).resolves.toBeNull();
+    expect(rpc.getRawTransaction).toHaveBeenCalledWith('a'.repeat(64), true);
+  });
+
+  test('rethrows daemon errors other than not-found for unindexed transactions', async () => {
+    const { service, ch, rpc } = createService();
+
+    ch.queryOne.mockResolvedValue(null);
+    rpc.getRawTransaction.mockRejectedValue(new RPCError('Work queue depth exceeded', 500));
+
+    await expect(service.getTransaction('a'.repeat(64)))
+      .rejects.toThrow('Work queue depth exceeded');
+  });
+
+  test('reports daemon block data when the daemon already sees the tx as mined', async () => {
+    const { service, ch, rpc } = createService();
+    const txid = 'a'.repeat(64);
+    const blockHash = 'b'.repeat(64);
+
+    ch.queryOne.mockResolvedValue(null);
+    rpc.getRawTransaction.mockResolvedValue({
+      txid,
+      version: 4,
+      locktime: 0,
+      size: 120,
+      confirmations: 3,
+      blockhash: blockHash,
+      height: 9000,
+      time: 1700000123,
+      blocktime: 1700000123,
+      vin: [{ coinbase: '0328e80b00', sequence: 4294967295 }],
+      vout: [
+        { value: 5, n: 0, scriptPubKey: { hex: '76a9', type: 'pubkeyhash', addresses: ['t1Miner'] } },
+      ],
+    });
+
+    const result = await service.getTransaction(txid);
+
+    expect(result?.tx).toMatchObject({
+      block_height: 9000,
+      timestamp: 1700000123,
+      is_coinbase: 1,
+      fee: null,
+    });
+    expect(result?.confirmations).toBe(3);
+    expect(result?.blockHash).toBe(blockHash);
+    expect(result?.coinbaseScript).toBe('0328e80b00');
   });
 
   test('reconstructs blank standard transaction output scripts', async () => {

@@ -106,6 +106,10 @@ type BlockLookup =
   | { kind: 'hash'; hash: string };
 
 const UINT32_MAX = 0xffffffff;
+const UINT16_MAX = 0xffff;
+// Bounds the per-request daemon fan-out when resolving unconfirmed parents
+// of a mempool transaction.
+const MAX_MEMPOOL_PARENT_LOOKUPS = 20;
 const DEFAULT_MEMPOOL_DELTA = { balanceDelta: 0n, txCount: 0 };
 const RECENT_BLOCK_LOOKBACK_BUFFER = 250;
 // Flux produces ~720 blocks per UTC day, so one default page covers a date
@@ -326,7 +330,10 @@ export class InsightCompatibilityService {
     `, { txid });
 
     if (!isValidVersionedRow(tx)) {
-      return null;
+      // Not indexed (or reorged out): serve mempool transactions from the
+      // daemon the way legacy Insight does, including ones just broadcast
+      // through this API's own /tx/send.
+      return this.getTransactionFromDaemon(txid);
     }
 
     const [outputs, clickHouseInputs, block, currentHeight, fluxnode] = await Promise.all([
@@ -1315,6 +1322,166 @@ export class InsightCompatibilityService {
     }
   }
 
+  private async getTransactionFromDaemon(txid: string): Promise<InsightTransactionServiceResult | null> {
+    let decoded: unknown;
+    try {
+      decoded = await this.rpc.getRawTransaction(txid, true);
+    } catch (error) {
+      if (isMissingTransactionRpcError(error)) {
+        return null;
+      }
+
+      throw error;
+    }
+
+    if (!isRecord(decoded) || !Array.isArray(decoded.vout)) {
+      return null;
+    }
+
+    const vin = Array.isArray(decoded.vin) ? decoded.vin : [];
+    const coinbaseScript = getDecodedCoinbaseScript(decoded);
+    const isCoinbase = coinbaseScript !== null;
+    const outputs = buildDecodedOutputs(decoded.vout);
+    const { inputs, allResolved } = isCoinbase
+      ? { inputs: [] as InsightInputRow[], allResolved: true }
+      : await this.resolveDecodedInputs(vin);
+
+    const outputTotal = outputs.reduce((sum, output) => sum + BigInt(output.value), 0n);
+    const inputTotal = inputs.reduce((sum, input) => sum + BigInt(input.value), 0n);
+    const fee = !isCoinbase && allResolved && inputTotal >= outputTotal
+      ? (inputTotal - outputTotal).toString()
+      : null;
+
+    const confirmations = parseConfirmations(decoded.confirmations);
+    const mined = confirmations > 0;
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const minedTimestamp = parseNonNegativeHeightValue(decoded.time)
+      ?? parseNonNegativeHeightValue(decoded.blocktime)
+      ?? nowSeconds;
+
+    return {
+      tx: {
+        txid,
+        version: parseNonNegativeHeightValue(decoded.version) ?? 0,
+        locktime: parseNonNegativeHeightValue(decoded.locktime) ?? 0,
+        // -1 keeps blockheight/blocktime out of the formatted mempool response.
+        block_height: (mined ? parseNonNegativeHeightValue(decoded.height) : null) ?? -1,
+        // Insight reports the received time for pure-mempool transactions.
+        timestamp: mined ? minedTimestamp : nowSeconds,
+        input_total: inputTotal.toString(),
+        output_total: outputTotal.toString(),
+        fee,
+        size: parseDecodedSize(decoded),
+        is_coinbase: isCoinbase ? 1 : 0,
+        is_fluxnode_tx: 0,
+        fluxnode_type: null,
+        is_valid: 1,
+      },
+      outputs,
+      inputs,
+      blockHash: mined && typeof decoded.blockhash === 'string' ? decoded.blockhash : null,
+      confirmations,
+      fluxnode: null,
+      coinbaseScript,
+    };
+  }
+
+  private async resolveDecodedInputs(vin: unknown[]): Promise<{
+    inputs: InsightInputRow[];
+    allResolved: boolean;
+  }> {
+    const parsed = vin.map(parseDecodedVinEntry);
+    const entries = parsed.filter(isPresent);
+    let allResolved = entries.length === parsed.length;
+
+    const sources = await this.resolveOutpointSources(entries);
+    const inputs = entries.map((entry) => {
+      const source = sources.get(outpointKey(entry.txid, entry.vout));
+      if (!source) {
+        allResolved = false;
+      }
+
+      return {
+        txid: entry.txid,
+        vout: entry.vout,
+        address: source?.address ?? '',
+        value: source?.value ?? '0',
+        script_type: source?.script_type,
+        sequence: entry.sequence,
+        script_sig: entry.scriptSig,
+      };
+    });
+
+    return { inputs, allResolved };
+  }
+
+  private async resolveOutpointSources(
+    entries: Array<{ txid: string; vout: number }>
+  ): Promise<Map<string, OutpointSource>> {
+    const sources = new Map<string, OutpointSource>();
+    const uniqueByKey = new Map<string, { txid: string; vout: number }>();
+    for (const entry of entries) {
+      uniqueByKey.set(outpointKey(entry.txid, entry.vout), entry);
+    }
+
+    if (uniqueByKey.size === 0) {
+      return sources;
+    }
+
+    // Confirmed parents resolve in one ClickHouse IN-list query.
+    const chCandidates = [...uniqueByKey.values()].filter((entry) => entry.vout <= UINT16_MAX);
+    if (chCandidates.length > 0) {
+      const rows = await this.ch.query<{
+        txid: string;
+        vout: number;
+        address: string;
+        value: string;
+        script_type?: string;
+      }>(`
+        SELECT txid, vout, address, toString(value) AS value, script_type
+        FROM (
+          SELECT txid, vout, address, value, script_type
+          FROM utxos
+          WHERE (txid, vout) IN {outpoints:Array(Tuple(FixedString(64), UInt16))}
+          ORDER BY txid, vout, version DESC
+          LIMIT 1 BY txid, vout
+        )
+      `, { outpoints: chCandidates.map((entry) => [entry.txid, entry.vout]) });
+
+      for (const row of rows) {
+        sources.set(outpointKey(row.txid, row.vout), {
+          address: row.address,
+          value: zatoshiString(row.value),
+          script_type: row.script_type,
+        });
+      }
+    }
+
+    // Unconfirmed parents are not in ClickHouse yet; decode them through the
+    // daemon with a bounded fan-out.
+    const missingTxids = [...new Set(
+      [...uniqueByKey.entries()]
+        .filter(([key]) => !sources.has(key))
+        .map(([, entry]) => entry.txid)
+    )].slice(0, MAX_MEMPOOL_PARENT_LOOKUPS);
+    const decodedParents = new Map(await Promise.all(missingTxids.map(async (parentTxid) => (
+      [parentTxid, await this.getDecodedTransaction(parentTxid)] as const
+    ))));
+
+    for (const [key, entry] of uniqueByKey) {
+      if (sources.has(key)) {
+        continue;
+      }
+
+      const output = getDecodedOutput(decodedParents.get(entry.txid), entry.vout);
+      if (output) {
+        sources.set(key, output);
+      }
+    }
+
+    return sources;
+  }
+
   private async getTransactionBlock(height: number): Promise<VersionedInsightBlockRow | null> {
     const block = await this.getLatestBlockByHeight(height);
     return isValidVersionedRow(block) ? block : null;
@@ -1762,6 +1929,119 @@ function getDecodedCoinbaseScript(decoded: Record<string, unknown> | null): stri
 
   const first = decoded.vin[0];
   return isRecord(first) && typeof first.coinbase === 'string' ? first.coinbase : null;
+}
+
+type OutpointSource = { address: string; value: string; script_type?: string };
+
+type DecodedVinEntry = {
+  txid: string;
+  vout: number;
+  sequence?: number;
+  scriptSig?: { hex: string; asm: string };
+};
+
+function parseDecodedVinEntry(vin: unknown): DecodedVinEntry | null {
+  if (!isRecord(vin) || typeof vin.txid !== 'string') {
+    return null;
+  }
+
+  const txid = normalizeHashOrNull(vin.txid);
+  const vout = parseVout(vin.vout);
+  if (txid === null || vout === null) {
+    return null;
+  }
+
+  return {
+    txid,
+    vout,
+    sequence: parseSequence(vin.sequence),
+    scriptSig: parseScriptSig(vin.scriptSig),
+  };
+}
+
+function buildDecodedOutputs(vout: unknown[]): InsightOutputRow[] {
+  return vout.flatMap((entry, index): InsightOutputRow[] => {
+    if (!isRecord(entry)) {
+      return [];
+    }
+
+    const scriptPubKey = isRecord(entry.scriptPubKey) ? entry.scriptPubKey : {};
+    const addresses = Array.isArray(scriptPubKey.addresses) ? scriptPubKey.addresses : [];
+
+    return [{
+      vout: parseVout(entry.n) ?? index,
+      address: typeof addresses[0] === 'string' ? addresses[0] : null,
+      value: (fluxValueToZatoshis(entry.value) ?? 0n).toString(),
+      script_pubkey: typeof scriptPubKey.hex === 'string' ? scriptPubKey.hex : '',
+      script_type: typeof scriptPubKey.type === 'string' ? scriptPubKey.type : '',
+      spent: 0,
+      spent_txid: null,
+      spent_index: null,
+      spent_block_height: null,
+    }];
+  });
+}
+
+function getDecodedOutput(
+  decoded: Record<string, unknown> | null | undefined,
+  vout: number
+): OutpointSource | null {
+  if (!decoded || !Array.isArray(decoded.vout)) {
+    return null;
+  }
+
+  const output = decoded.vout.find((entry) => isRecord(entry) && parseVout(entry.n) === vout);
+  if (!isRecord(output)) {
+    return null;
+  }
+
+  const value = fluxValueToZatoshis(output.value);
+  if (value === null) {
+    return null;
+  }
+
+  const scriptPubKey = isRecord(output.scriptPubKey) ? output.scriptPubKey : {};
+  const addresses = Array.isArray(scriptPubKey.addresses) ? scriptPubKey.addresses : [];
+
+  return {
+    address: typeof addresses[0] === 'string' ? addresses[0] : '',
+    value: value.toString(),
+    script_type: typeof scriptPubKey.type === 'string' ? scriptPubKey.type : undefined,
+  };
+}
+
+// Decoded transaction values are in FLUX, matching the daemon's JSON output.
+function fluxValueToZatoshis(value: unknown): bigint | null {
+  const parsed = parseFiniteNumber(value);
+  if (parsed === null || parsed < 0) {
+    return null;
+  }
+
+  return BigInt(Math.round(parsed * 100000000));
+}
+
+function parseConfirmations(value: unknown): number {
+  const parsed = parseFiniteNumber(value);
+  return parsed !== null && Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function parseDecodedSize(decoded: Record<string, unknown>): number {
+  const size = parseNonNegativeHeightValue(decoded.size);
+  if (size !== null && size > 0) {
+    return size;
+  }
+
+  return typeof decoded.hex === 'string' ? Math.floor(decoded.hex.length / 2) : 0;
+}
+
+// The daemon reports unknown transactions with JSON-RPC error code -5
+// (RPC_INVALID_ADDRESS_OR_KEY).
+function isMissingTransactionRpcError(error: unknown): boolean {
+  if (!isRecord(error)) {
+    return false;
+  }
+
+  return error.rpcCode === -5 || error.code === -5;
 }
 
 function vinOutpointKey(vin: unknown): string | null {

@@ -19,11 +19,15 @@ export interface InsightTxRow {
   txid: string;
   version: number;
   locktime: string | number;
+  // -1 marks mempool transactions synthesized from the daemon; the formatter
+  // omits blockheight/blocktime for them.
   block_height: number;
   timestamp: number;
   input_total: string | number;
   output_total: string | number;
-  fee: string | number;
+  // null when a mempool input could not be resolved, so fees are omitted
+  // instead of displaying a wrong number.
+  fee: string | number | null;
   size: number;
   is_coinbase: number;
   is_fluxnode_tx: number;

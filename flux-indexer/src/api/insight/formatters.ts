@@ -83,6 +83,7 @@ export function formatTransaction({
   coinbaseScript,
 }: FormatTransactionInput) {
   const isCoinbase = tx.is_coinbase === 1;
+  const isMined = tx.block_height >= 0;
 
   return {
     txid: tx.txid,
@@ -91,18 +92,20 @@ export function formatTransaction({
     vin: isCoinbase ? [formatCoinbaseInput(coinbaseScript)] : inputs.map(formatInput),
     vout: outputs.map(formatOutput),
     blockhash: blockHash ?? undefined,
-    blockheight: tx.block_height,
+    // Mempool transactions carry a -1 height sentinel; legacy Insight omits
+    // blockheight and blocktime until the transaction is mined.
+    ...(isMined ? { blockheight: tx.block_height } : {}),
     confirmations,
     time: tx.timestamp,
-    blocktime: tx.timestamp,
+    ...(isMined ? { blocktime: tx.timestamp } : {}),
     valueOut: zatoshisToFlux(tx.output_total),
     // Legacy Insight omits valueIn and fees on coinbase transactions. The
     // indexer stores the block's total collected fees on the coinbase row,
     // which would otherwise display as the coinbase tx's own fee.
-    ...(isCoinbase ? {} : {
-      valueIn: zatoshisToFlux(tx.input_total),
-      fees: zatoshisToFlux(tx.fee),
-    }),
+    ...(isCoinbase ? {} : { valueIn: zatoshisToFlux(tx.input_total) }),
+    // fee is null when a mempool input could not be resolved; omit fees
+    // rather than emit a wrong number.
+    ...(isCoinbase || tx.fee === null ? {} : { fees: zatoshisToFlux(tx.fee) }),
     size: tx.size,
     isCoinBase: isCoinbase,
     isFluxnodeTx: tx.is_fluxnode_tx === 1,
