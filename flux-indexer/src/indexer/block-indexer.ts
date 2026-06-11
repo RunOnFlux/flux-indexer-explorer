@@ -348,7 +348,9 @@ export class ClickHouseBlockIndexer {
       try {
         block = await this.rpc.getBlock(height, 2);
       } catch (rpcError: any) {
-        if (!(rpcError instanceof RPCError) || !rpcError.message.includes('500')) {
+        // Daemon-side RPC failures (e.g. blocks with FluxNode transactions the daemon
+        // cannot serialize at verbosity 2) fall back to decoding the raw block hex
+        if (!(rpcError instanceof RPCError)) {
           throw rpcError;
         }
 

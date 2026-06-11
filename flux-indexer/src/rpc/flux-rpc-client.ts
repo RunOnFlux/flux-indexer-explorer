@@ -16,6 +16,31 @@ import {
 } from '../types';
 import { logger } from '../utils/logger';
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Extract a JSON-RPC error envelope from a response body. Handles both single
+ * envelopes and batch (array) bodies, returning the first error found.
+ */
+function extractJsonRpcError(body: unknown): { code: number; message: string } | null {
+  const candidates = Array.isArray(body) ? body : [body];
+
+  for (const candidate of candidates) {
+    if (!isRecord(candidate) || !isRecord(candidate.error)) {
+      continue;
+    }
+
+    const { code, message } = candidate.error;
+    if (typeof code === 'number' && typeof message === 'string') {
+      return { code, message };
+    }
+  }
+
+  return null;
+}
+
 export class FluxRPCClient {
   private url: string;
   private auth: string | null = null;
@@ -47,6 +72,42 @@ export class FluxRPCClient {
     };
   }
 
+  /**
+   * The Flux daemon delivers JSON-RPC errors over non-2xx HTTP responses, so
+   * surface the daemon's error code/message when the body carries a JSON-RPC
+   * error envelope, and fall back to the HTTP status otherwise.
+   */
+  private async throwHttpError(
+    response: { status: number; statusText: string; json(): Promise<unknown> },
+    context?: Record<string, unknown>
+  ): Promise<never> {
+    let body: unknown = null;
+    try {
+      body = await response.json();
+    } catch {
+      // Body is not parseable JSON; fall through to the HTTP status error below.
+    }
+
+    const rpcError = extractJsonRpcError(body);
+    if (rpcError) {
+      throw new RPCError(rpcError.message, rpcError.code, context);
+    }
+
+    throw new RPCError(
+      `HTTP ${response.status}: ${response.statusText}`,
+      response.status,
+      context
+    );
+  }
+
+  /**
+   * Method-not-found can arrive as JSON-RPC code -32601 or, from some daemons,
+   * as a bare HTTP 404 without a JSON-RPC error body.
+   */
+  private static isMethodNotFoundError(error: unknown): boolean {
+    return error instanceof RPCError && (error.rpcCode === -32601 || error.rpcCode === 404);
+  }
+
   private async call<T = any>(method: string, params: any[] = []): Promise<T> {
     const request = this.buildRequest(method, params);
 
@@ -72,10 +133,7 @@ export class FluxRPCClient {
       clearTimeout(timeoutId);
 
       if (!response.ok) {
-        throw new RPCError(
-          `HTTP ${response.status}: ${response.statusText}`,
-          response.status
-        );
+        await this.throwHttpError(response, { method, params });
       }
 
       const data = await response.json() as RPCResponse<T>;
@@ -142,10 +200,9 @@ export class FluxRPCClient {
       clearTimeout(timeoutId);
 
       if (!response.ok) {
-        throw new RPCError(
-          `HTTP ${response.status}: ${response.statusText}`,
-          response.status
-        );
+        await this.throwHttpError(response, {
+          methods: requests.map((req) => req.method),
+        });
       }
 
       const data = await response.json();
@@ -367,7 +424,7 @@ export class FluxRPCClient {
     try {
       return await this.call('getinfo');
     } catch (error) {
-      if (!(error instanceof RPCError) || error.rpcCode !== -32601) {
+      if (!FluxRPCClient.isMethodNotFoundError(error)) {
         throw error;
       }
 
@@ -401,7 +458,7 @@ export class FluxRPCClient {
     try {
       return await this.call('viewdeterministiczelnodelist', []);
     } catch (error) {
-      if (!(error instanceof RPCError) || error.rpcCode !== -32601) {
+      if (!FluxRPCClient.isMethodNotFoundError(error)) {
         throw error;
       }
 
@@ -508,9 +565,10 @@ export class FluxRPCClient {
           }
 
           blocks.push(block);
-        } catch (error500: any) {
-          // If HTTP 500 (daemon can't process FluxNode transactions), fall back to verbosity 1
-          if (error500 instanceof RPCError && error500.message.includes('500')) {
+        } catch (verbosity2Error: any) {
+          // Daemon-side RPC failures (e.g. blocks with FluxNode transactions the daemon
+          // cannot serialize at verbosity 2) fall back to verbosity 1
+          if (verbosity2Error instanceof RPCError) {
             logger.debug('Falling back to verbosity 1 for block with FluxNode transactions', {
               height,
               hash
@@ -528,7 +586,7 @@ export class FluxRPCClient {
               throw fallbackError;
             }
           } else {
-            throw error500;
+            throw verbosity2Error;
           }
         }
       }
