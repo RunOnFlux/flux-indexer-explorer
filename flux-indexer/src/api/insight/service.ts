@@ -240,7 +240,9 @@ export class InsightCompatibilityService {
 
   private async listRecentBlocks(limit: number): Promise<VersionedInsightBlockRow[]> {
     const maxHeight = await this.getIndexedTipHeight();
-    const minHeight = Math.max(0, maxHeight - (limit + RECENT_BLOCK_LOOKBACK_BUFFER));
+    // Inclusive lower bound so the genesis block stays reachable when the
+    // lookback window extends to height zero.
+    const minHeight = Math.max(0, maxHeight - (limit + RECENT_BLOCK_LOOKBACK_BUFFER) + 1);
 
     return this.ch.query<VersionedInsightBlockRow>(`
         SELECT height, hash, prev_hash, merkle_root, timestamp, bits, nonce, version,
@@ -249,7 +251,7 @@ export class InsightCompatibilityService {
           SELECT height, hash, prev_hash, merkle_root, timestamp, bits, nonce, version,
                  size, tx_count, producer, producer_reward, difficulty, chainwork, is_valid
           FROM blocks
-          WHERE height <= {maxHeight:UInt32} AND height > {minHeight:UInt32}
+          WHERE height <= {maxHeight:UInt32} AND height >= {minHeight:UInt32}
           ORDER BY height DESC, _version DESC
           LIMIT 1 BY height
         )

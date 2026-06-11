@@ -230,8 +230,8 @@ describe('InsightCompatibilityService', () => {
     expect(sql).not.toContain('timestamp >=');
     expect(sql).not.toContain('timestamp <=');
     expect(sql).toContain('height <= {maxHeight:UInt32}');
-    expect(sql).toContain('height > {minHeight:UInt32}');
-    expect(params).toEqual({ limit: 2, maxHeight: 1000, minHeight: 748 });
+    expect(sql).toContain('height >= {minHeight:UInt32}');
+    expect(params).toEqual({ limit: 2, maxHeight: 1000, minHeight: 749 });
     expect(ch.queryOne).toHaveBeenCalledWith(expect.stringContaining('FROM sync_state'));
   });
 
@@ -250,7 +250,19 @@ describe('InsightCompatibilityService', () => {
     });
 
     const [, params] = ch.query.mock.calls[0];
-    expect(params).toEqual({ limit: 2, maxHeight: 500, minHeight: 248 });
+    expect(params).toEqual({ limit: 2, maxHeight: 500, minHeight: 249 });
+  });
+
+  test('includes the genesis block when the recent window reaches height zero', async () => {
+    const { service, ch } = createService();
+    ch.queryOne.mockResolvedValue({ chain_height: 100, current_height: 100 });
+    ch.query.mockResolvedValue([]);
+
+    await service.listBlocks({ limit: '2' });
+
+    const [sql, params] = ch.query.mock.calls[0];
+    expect(sql).toContain('height >= {minHeight:UInt32}');
+    expect(params).toMatchObject({ maxHeight: 100, minHeight: 0 });
   });
 
   test('lists blocks with parsed blockDate metadata when date filtered', async () => {
