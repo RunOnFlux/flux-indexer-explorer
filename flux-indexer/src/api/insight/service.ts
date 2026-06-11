@@ -5,11 +5,14 @@ import { getScriptPubkey } from '../../utils/script-utils';
 import type {
   InsightAddressSummaryRow,
   InsightBlockRow,
+  InsightFluxnodeTransactionRow,
   InsightInputRow,
   InsightOutputRow,
   InsightTxRow,
   InsightUtxoRow,
 } from './types';
+
+export type { InsightFluxnodeTransactionRow } from './types';
 import {
   InsightValidationError,
   isValidHash,
@@ -94,18 +97,6 @@ type PoolStatisticRow = {
   blocks_found: number;
   percent_total: number;
 };
-
-export interface InsightFluxnodeTransactionRow {
-  type: number;
-  collateral_hash: string;
-  collateral_index: number;
-  ip_address: string;
-  public_key: string;
-  signature: string;
-  p2sh_address: string;
-  benchmark_tier: string;
-  extra_data?: string;
-}
 
 type BlockLookup =
   | { kind: 'height'; height: number }

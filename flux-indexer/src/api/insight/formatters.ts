@@ -1,6 +1,7 @@
 import type {
   InsightAddressSummaryRow,
   InsightBlockRow,
+  InsightFluxnodeTransactionRow,
   InsightInputRow,
   InsightOutputRow,
   InsightTxRow,
@@ -21,6 +22,7 @@ export interface FormatTransactionInput {
   confirmations: number;
   inputs: InsightInputRow[];
   outputs: InsightOutputRow[];
+  fluxnode?: InsightFluxnodeTransactionRow | null;
 }
 
 export interface FormatAddressSummaryInput {
@@ -76,6 +78,7 @@ export function formatTransaction({
   confirmations,
   inputs,
   outputs,
+  fluxnode,
 }: FormatTransactionInput) {
   return {
     txid: tx.txid,
@@ -95,6 +98,7 @@ export function formatTransaction({
     isCoinBase: tx.is_coinbase === 1,
     isFluxnodeTx: tx.is_fluxnode_tx === 1,
     fluxnodeType: tx.fluxnode_type ?? null,
+    ...(fluxnode ? { fluxnode: formatFluxnode(fluxnode) } : {}),
   };
 }
 
@@ -173,6 +177,25 @@ function formatInput(input: InsightInputRow, index: number) {
     valueSat: zatoshisToSafeNumber(input.value),
     value: zatoshisToFlux(input.value),
     scriptType: input.script_type,
+  };
+}
+
+// Field names mirror the /api/v1 transaction response so legacy consumers
+// find familiar FluxNode metadata keys.
+function formatFluxnode(row: InsightFluxnodeTransactionRow) {
+  const collateralHash = row.collateral_hash?.trim() || '';
+
+  return {
+    nType: typeof row.type === 'number' ? row.type : null,
+    ...(collateralHash ? {
+      collateralOutputHash: collateralHash,
+      collateralOutputIndex: Number(row.collateral_index ?? 0),
+    } : {}),
+    benchmarkTier: row.benchmark_tier?.trim() || null,
+    ip: row.ip_address?.trim() || null,
+    fluxnodePubKey: row.public_key?.trim() || null,
+    sig: row.signature?.trim() || null,
+    p2shAddress: row.p2sh_address?.trim() || null,
   };
 }
 

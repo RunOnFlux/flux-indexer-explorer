@@ -51,6 +51,18 @@ export interface InsightOutputRow {
   spent_block_height?: number | null;
 }
 
+export interface InsightFluxnodeTransactionRow {
+  type: number;
+  collateral_hash: string;
+  collateral_index: number;
+  ip_address: string;
+  public_key: string;
+  signature: string;
+  p2sh_address: string;
+  benchmark_tier: string;
+  extra_data?: string;
+}
+
 export interface InsightAddressSummaryRow {
   balance: string | number;
   received_total: string | number;

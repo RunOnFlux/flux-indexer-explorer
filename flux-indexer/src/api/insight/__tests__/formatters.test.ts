@@ -327,6 +327,108 @@ describe('Insight compatibility formatters', () => {
     expect(result.vin).toEqual([{ coinbase: '', sequence: 0xffffffff, n: 0 }]);
   });
 
+  test('emits fluxnode metadata with legacy v1 field names', () => {
+    const tx = {
+      txid: 'fluxnode-tx',
+      version: 5,
+      locktime: 0,
+      block_height: 20,
+      timestamp: 2000,
+      input_total: '0',
+      output_total: '0',
+      fee: '0',
+      size: 300,
+      is_coinbase: 0,
+      is_fluxnode_tx: 1,
+      fluxnode_type: 6,
+    };
+
+    const result = formatTransaction({
+      tx,
+      blockHash: 'block',
+      confirmations: 6,
+      inputs: [],
+      outputs: [],
+      fluxnode: {
+        type: 6,
+        collateral_hash: 'c'.repeat(64),
+        collateral_index: 3,
+        ip_address: '1.2.3.4:16125',
+        public_key: '04abcd',
+        signature: 'sig==',
+        p2sh_address: 't3P2SH',
+        benchmark_tier: 'CUMULUS',
+      },
+    });
+
+    expect(result.isFluxnodeTx).toBe(true);
+    expect(result.fluxnode).toEqual({
+      nType: 6,
+      collateralOutputHash: 'c'.repeat(64),
+      collateralOutputIndex: 3,
+      benchmarkTier: 'CUMULUS',
+      ip: '1.2.3.4:16125',
+      fluxnodePubKey: '04abcd',
+      sig: 'sig==',
+      p2shAddress: 't3P2SH',
+    });
+
+    const withoutRow = formatTransaction({
+      tx,
+      blockHash: 'block',
+      confirmations: 6,
+      inputs: [],
+      outputs: [],
+      fluxnode: null,
+    });
+
+    expect(withoutRow).not.toHaveProperty('fluxnode');
+  });
+
+  test('omits empty fluxnode collateral and normalizes blank fields to null', () => {
+    const result = formatTransaction({
+      tx: {
+        txid: 'fluxnode-tx',
+        version: 5,
+        locktime: 0,
+        block_height: 20,
+        timestamp: 2000,
+        input_total: '0',
+        output_total: '0',
+        fee: '0',
+        size: 300,
+        is_coinbase: 0,
+        is_fluxnode_tx: 1,
+        fluxnode_type: 1,
+      },
+      blockHash: 'block',
+      confirmations: 6,
+      inputs: [],
+      outputs: [],
+      fluxnode: {
+        type: 1,
+        collateral_hash: '   ',
+        collateral_index: 0,
+        ip_address: '',
+        public_key: '',
+        signature: '',
+        p2sh_address: '',
+        benchmark_tier: '',
+      },
+    });
+
+    expect(result.fluxnode).toEqual({
+      nType: 1,
+      benchmarkTier: null,
+      ip: null,
+      fluxnodePubKey: null,
+      sig: null,
+      p2shAddress: null,
+    });
+    expect(result.fluxnode).not.toHaveProperty('collateralOutputHash');
+    expect(result.fluxnode).not.toHaveProperty('collateralOutputIndex');
+  });
+
   test('filters sentinel transaction output addresses', () => {
     const result = formatTransaction({
       tx: {
