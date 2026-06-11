@@ -36,6 +36,10 @@ export interface InsightInputRow {
   address: string;
   value: string | number;
   script_type?: string;
+  // Derived by the service layer from the daemon's decoded vin; not raw
+  // utxos table columns.
+  sequence?: number;
+  script_sig?: { hex: string; asm: string };
 }
 
 export interface InsightOutputRow {

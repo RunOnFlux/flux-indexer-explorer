@@ -23,6 +23,7 @@ export interface FormatTransactionInput {
   inputs: InsightInputRow[];
   outputs: InsightOutputRow[];
   fluxnode?: InsightFluxnodeTransactionRow | null;
+  coinbaseScript?: string | null;
 }
 
 export interface FormatAddressSummaryInput {
@@ -79,12 +80,15 @@ export function formatTransaction({
   inputs,
   outputs,
   fluxnode,
+  coinbaseScript,
 }: FormatTransactionInput) {
+  const isCoinbase = tx.is_coinbase === 1;
+
   return {
     txid: tx.txid,
     version: tx.version,
     locktime: toSafeInteger(tx.locktime, 'locktime'),
-    vin: tx.is_coinbase === 1 ? [formatCoinbaseInput()] : inputs.map(formatInput),
+    vin: isCoinbase ? [formatCoinbaseInput(coinbaseScript)] : inputs.map(formatInput),
     vout: outputs.map(formatOutput),
     blockhash: blockHash ?? undefined,
     blockheight: tx.block_height,
@@ -92,10 +96,15 @@ export function formatTransaction({
     time: tx.timestamp,
     blocktime: tx.timestamp,
     valueOut: zatoshisToFlux(tx.output_total),
-    valueIn: zatoshisToFlux(tx.input_total),
-    fees: zatoshisToFlux(tx.fee),
+    // Legacy Insight omits valueIn and fees on coinbase transactions. The
+    // indexer stores the block's total collected fees on the coinbase row,
+    // which would otherwise display as the coinbase tx's own fee.
+    ...(isCoinbase ? {} : {
+      valueIn: zatoshisToFlux(tx.input_total),
+      fees: zatoshisToFlux(tx.fee),
+    }),
     size: tx.size,
-    isCoinBase: tx.is_coinbase === 1,
+    isCoinBase: isCoinbase,
     isFluxnodeTx: tx.is_fluxnode_tx === 1,
     fluxnodeType: tx.fluxnode_type ?? null,
     ...(fluxnode ? { fluxnode: formatFluxnode(fluxnode) } : {}),
@@ -167,11 +176,11 @@ function formatInput(input: InsightInputRow, index: number) {
   return {
     txid: input.txid,
     vout: input.vout,
-    sequence: 0xffffffff,
+    sequence: input.sequence ?? 0xffffffff,
     n: index,
     scriptSig: {
-      hex: '',
-      asm: '',
+      hex: input.script_sig?.hex ?? '',
+      asm: input.script_sig?.asm ?? '',
     },
     addr: input.address,
     valueSat: zatoshisToSafeNumber(input.value),
@@ -199,9 +208,9 @@ function formatFluxnode(row: InsightFluxnodeTransactionRow) {
   };
 }
 
-function formatCoinbaseInput() {
+function formatCoinbaseInput(coinbaseScript?: string | null) {
   return {
-    coinbase: '',
+    coinbase: coinbaseScript ?? '',
     sequence: 0xffffffff,
     n: 0,
   };

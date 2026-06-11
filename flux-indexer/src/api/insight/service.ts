@@ -61,6 +61,9 @@ export interface InsightTransactionServiceResult {
   blockHash?: string | null;
   confirmations: number;
   fluxnode?: InsightFluxnodeTransactionRow | null;
+  // Real coinbase script hex recovered from the daemon's decoded vin; null
+  // when the transaction is not coinbase or the daemon is unavailable.
+  coinbaseScript?: string | null;
 }
 
 export interface InsightAddressSummaryServiceResult {
@@ -333,9 +336,16 @@ export class InsightCompatibilityService {
       _knownCurrentHeight === undefined ? this.getCurrentChainHeight() : Promise.resolve(_knownCurrentHeight),
       tx.is_fluxnode_tx === 1 ? this.getFluxnodeTransaction(txid) : Promise.resolve(null),
     ]);
+    // Fetch the decoded transaction once to recover vin ordering, scriptSig
+    // and sequence values, and the real coinbase script, none of which the
+    // ClickHouse tables store. Skipped for transparent-input-free txs where
+    // there is no vin to decorate.
+    const decoded = tx.is_coinbase === 1 || clickHouseInputs.length > 0
+      ? await this.getDecodedTransaction(txid)
+      : null;
     const inputs = tx.is_coinbase === 1
       ? clickHouseInputs
-      : await this.orderInputsByDecodedVin(txid, clickHouseInputs);
+      : decorateInputsWithDecodedVin(clickHouseInputs, decoded);
 
     return {
       tx,
@@ -344,6 +354,7 @@ export class InsightCompatibilityService {
       blockHash: block?.hash ?? null,
       confirmations: block ? calculateConfirmations(tx.block_height, currentHeight) : 0,
       fluxnode,
+      coinbaseScript: tx.is_coinbase === 1 ? getDecodedCoinbaseScript(decoded) : null,
     };
   }
 
@@ -1293,31 +1304,15 @@ export class InsightCompatibilityService {
     `, { txid });
   }
 
-  private async orderInputsByDecodedVin(txid: string, inputs: InsightInputRow[]): Promise<InsightInputRow[]> {
-    if (inputs.length < 2) {
-      return inputs;
-    }
-
-    let decoded: unknown;
+  private async getDecodedTransaction(txid: string): Promise<Record<string, unknown> | null> {
     try {
-      decoded = await this.rpc.getRawTransaction(txid, true);
+      const decoded = await this.rpc.getRawTransaction(txid, true);
+      return isRecord(decoded) ? decoded : null;
     } catch {
-      return inputs;
+      // Degrade gracefully: inputs keep their ClickHouse order and the
+      // formatter falls back to stub scriptSig/sequence values.
+      return null;
     }
-
-    const vinOrder = getDecodedVinOrder(decoded);
-    if (vinOrder.size === 0) {
-      return inputs;
-    }
-
-    return inputs
-      .map((input, index) => ({
-        input,
-        index,
-        order: vinOrder.get(outpointKey(input.txid, input.vout)) ?? Number.MAX_SAFE_INTEGER,
-      }))
-      .sort((a, b) => a.order - b.order || a.index - b.index)
-      .map(({ input }) => input);
   }
 
   private async getTransactionBlock(height: number): Promise<VersionedInsightBlockRow | null> {
@@ -1693,20 +1688,80 @@ function getRawTransactionHex(raw: unknown): string | null {
   return null;
 }
 
-function getDecodedVinOrder(decoded: unknown): Map<string, number> {
-  if (!isRecord(decoded) || !Array.isArray(decoded.vin)) {
+type DecodedVinDetail = {
+  order: number;
+  sequence?: number;
+  scriptSig?: { hex: string; asm: string };
+};
+
+function decorateInputsWithDecodedVin(
+  inputs: InsightInputRow[],
+  decoded: Record<string, unknown> | null
+): InsightInputRow[] {
+  const vinDetails = getDecodedVinDetails(decoded);
+  if (vinDetails.size === 0) {
+    return inputs;
+  }
+
+  return inputs
+    .map((input, index) => {
+      const detail = vinDetails.get(outpointKey(input.txid, input.vout));
+      return {
+        input: detail
+          ? { ...input, sequence: detail.sequence, script_sig: detail.scriptSig }
+          : input,
+        index,
+        order: detail?.order ?? Number.MAX_SAFE_INTEGER,
+      };
+    })
+    .sort((a, b) => a.order - b.order || a.index - b.index)
+    .map(({ input }) => input);
+}
+
+function getDecodedVinDetails(decoded: Record<string, unknown> | null): Map<string, DecodedVinDetail> {
+  if (decoded === null || !Array.isArray(decoded.vin)) {
     return new Map();
   }
 
-  const order = new Map<string, number>();
+  const details = new Map<string, DecodedVinDetail>();
   decoded.vin.forEach((vin, index) => {
     const key = vinOutpointKey(vin);
-    if (key && !order.has(key)) {
-      order.set(key, index);
+    if (key && !details.has(key)) {
+      details.set(key, {
+        order: index,
+        sequence: isRecord(vin) ? parseSequence(vin.sequence) : undefined,
+        scriptSig: isRecord(vin) ? parseScriptSig(vin.scriptSig) : undefined,
+      });
     }
   });
 
-  return order;
+  return details;
+}
+
+function parseSequence(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+function parseScriptSig(value: unknown): { hex: string; asm: string } | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  return {
+    hex: typeof value.hex === 'string' ? value.hex : '',
+    asm: typeof value.asm === 'string' ? value.asm : '',
+  };
+}
+
+function getDecodedCoinbaseScript(decoded: Record<string, unknown> | null): string | null {
+  if (decoded === null || !Array.isArray(decoded.vin)) {
+    return null;
+  }
+
+  const first = decoded.vin[0];
+  return isRecord(first) && typeof first.coinbase === 'string' ? first.coinbase : null;
 }
 
 function vinOutpointKey(vin: unknown): string | null {

@@ -385,6 +385,64 @@ describe('InsightCompatibilityService', () => {
     expect(rpc.getRawTransaction).toHaveBeenCalledWith(txid, true);
   });
 
+  test('decorates inputs with decoded scriptSig and sequence even for single-input txs', async () => {
+    const { service, ch, rpc } = createService();
+    const txid = 'a'.repeat(64);
+    const prev = '1'.repeat(64);
+    const inputs = [
+      { txid: prev, vout: 0, address: 'first', value: '100', script_type: 'pubkeyhash' },
+    ];
+
+    mockTransactionLookup(ch, txid, inputs);
+    rpc.getRawTransaction.mockResolvedValue({
+      txid,
+      vin: [
+        { txid: prev, vout: 0, sequence: 0, scriptSig: { hex: '47abcd', asm: '47abcd[ALL]' } },
+      ],
+    });
+
+    const result = await service.getTransaction(txid);
+
+    expect(rpc.getRawTransaction).toHaveBeenCalledWith(txid, true);
+    expect(result?.inputs).toEqual([
+      {
+        ...inputs[0],
+        sequence: 0,
+        script_sig: { hex: '47abcd', asm: '47abcd[ALL]' },
+      },
+    ]);
+    expect(result?.coinbaseScript).toBeNull();
+  });
+
+  test('captures the real coinbase script from the decoded transaction', async () => {
+    const { service, ch, rpc } = createService();
+    const txid = 'a'.repeat(64);
+
+    mockTransactionLookup(ch, txid, [], { is_coinbase: 1 });
+    rpc.getRawTransaction.mockResolvedValue({
+      txid,
+      vin: [{ coinbase: '0341e21f0102', sequence: 4294967295 }],
+    });
+
+    const result = await service.getTransaction(txid);
+
+    expect(rpc.getRawTransaction).toHaveBeenCalledWith(txid, true);
+    expect(result?.coinbaseScript).toBe('0341e21f0102');
+    expect(result?.inputs).toEqual([]);
+  });
+
+  test('falls back to a null coinbase script when the decoded lookup fails', async () => {
+    const { service, ch, rpc } = createService();
+    const txid = 'a'.repeat(64);
+
+    mockTransactionLookup(ch, txid, [], { is_coinbase: 1 });
+    rpc.getRawTransaction.mockRejectedValue(new Error('RPC unavailable'));
+
+    const result = await service.getTransaction(txid);
+
+    expect(result?.coinbaseScript).toBeNull();
+  });
+
   test('keeps ClickHouse input order when decoded RPC lookup fails', async () => {
     const { service, ch, rpc } = createService();
     const txid = 'a'.repeat(64);
@@ -1209,7 +1267,8 @@ describe('InsightCompatibilityService', () => {
 function mockTransactionLookup(
   ch: ReturnType<typeof createService>['ch'],
   txid: string,
-  inputs: Array<{ txid: string; vout: number; address: string; value: string; script_type: string }>
+  inputs: Array<{ txid: string; vout: number; address: string; value: string; script_type: string }>,
+  txOverrides: Record<string, unknown> = {}
 ) {
   ch.queryOne.mockImplementation(async (sql: string, params?: Record<string, unknown>) => {
     if (sql.includes('FROM transactions')) {
@@ -1226,6 +1285,7 @@ function mockTransactionLookup(
         is_coinbase: 0,
         is_fluxnode_tx: 0,
         is_valid: 1,
+        ...txOverrides,
       };
     }
 

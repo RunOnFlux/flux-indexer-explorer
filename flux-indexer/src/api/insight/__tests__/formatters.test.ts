@@ -304,20 +304,24 @@ describe('Insight compatibility formatters', () => {
   });
 
   test('formats coinbase transactions with synthetic coinbase vin', () => {
+    const tx = {
+      txid: 'coinbase',
+      version: 1,
+      locktime: 0,
+      block_height: 21,
+      timestamp: 2100,
+      input_total: '0',
+      output_total: '5000000000',
+      // The indexer stores the block's total collected fees on the coinbase
+      // row; it must never display as the coinbase tx's own fee.
+      fee: '1000000',
+      size: 100,
+      is_coinbase: 1,
+      is_fluxnode_tx: 0,
+    };
+
     const result = formatTransaction({
-      tx: {
-        txid: 'coinbase',
-        version: 1,
-        locktime: 0,
-        block_height: 21,
-        timestamp: 2100,
-        input_total: '0',
-        output_total: '5000000000',
-        fee: '0',
-        size: 100,
-        is_coinbase: 1,
-        is_fluxnode_tx: 0,
-      },
+      tx,
       blockHash: 'block',
       confirmations: 7,
       inputs: [{ txid: 'ignored', vout: 0, address: 'ignored', value: '1', script_type: 'pubkeyhash' }],
@@ -325,6 +329,63 @@ describe('Insight compatibility formatters', () => {
     });
 
     expect(result.vin).toEqual([{ coinbase: '', sequence: 0xffffffff, n: 0 }]);
+    expect(result).not.toHaveProperty('fees');
+    expect(result).not.toHaveProperty('valueIn');
+    expect(result.isCoinBase).toBe(true);
+
+    const withScript = formatTransaction({
+      tx,
+      blockHash: 'block',
+      confirmations: 7,
+      inputs: [],
+      outputs: [],
+      coinbaseScript: '0341e21f00',
+    });
+
+    expect(withScript.vin).toEqual([{ coinbase: '0341e21f00', sequence: 0xffffffff, n: 0 }]);
+  });
+
+  test('emits decoded scriptSig and sequence on transaction inputs', () => {
+    const result = formatTransaction({
+      tx: {
+        txid: 'txid',
+        version: 1,
+        locktime: 0,
+        block_height: 20,
+        timestamp: 2000,
+        input_total: '300000000',
+        output_total: '299000000',
+        fee: '1000000',
+        size: 225,
+        is_coinbase: 0,
+        is_fluxnode_tx: 0,
+      },
+      blockHash: 'block',
+      confirmations: 6,
+      inputs: [
+        {
+          txid: 'prev',
+          vout: 1,
+          address: 'from',
+          value: '200000000',
+          script_type: 'pubkeyhash',
+          sequence: 0,
+          script_sig: { hex: '47abcd', asm: '47abcd[ALL]' },
+        },
+        { txid: 'prev2', vout: 0, address: 'from2', value: '100000000', script_type: 'pubkeyhash' },
+      ],
+      outputs: [],
+    });
+
+    expect(result.vin[0]).toMatchObject({
+      sequence: 0,
+      scriptSig: { hex: '47abcd', asm: '47abcd[ALL]' },
+    });
+    // Inputs without decoded vin data fall back to the legacy stub values.
+    expect(result.vin[1]).toMatchObject({
+      sequence: 0xffffffff,
+      scriptSig: { hex: '', asm: '' },
+    });
   });
 
   test('emits fluxnode metadata with legacy v1 field names', () => {
