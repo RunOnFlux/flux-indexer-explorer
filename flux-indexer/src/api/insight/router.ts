@@ -108,8 +108,10 @@ const ADDRESS_TX_WINDOW = 1000;
 
 export function createInsightCompatibilityRouter(service: InsightRouterService): Router {
   const router = express.Router();
-  router.use(express.urlencoded({ extended: false, limit: '2mb' }));
-  router.use(express.json({ limit: '2mb' }));
+  // fluxd accepts transactions up to MAX_TX_SIZE_AFTER_SAPLING = 2,000,000
+  // bytes, which arrive here as ~4MB of hex; 5mb leaves envelope headroom.
+  router.use(express.urlencoded({ extended: false, limit: '5mb' }));
+  router.use(express.json({ limit: '5mb' }));
 
   router.get('/block/:blockHash', asyncHandler(async (req, res) => {
     const result = await service.getBlock(req.params.blockHash);

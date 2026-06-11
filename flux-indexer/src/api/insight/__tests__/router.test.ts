@@ -125,6 +125,25 @@ describe('Insight server mount', () => {
     });
   });
 
+  test('POST /tx/send broadcasts a maximum consensus-size rawtx (4MB hex)', async () => {
+    // fluxd's MAX_TX_SIZE_AFTER_SAPLING is 2,000,000 bytes = 4,000,000 hex chars.
+    const rawtx = 'ab'.repeat(2000000);
+    const sendRawTransaction = jest.fn().mockResolvedValue('max-size-txid');
+    const app = createServerApp({ sendRawTransaction });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/tx/send`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ rawtx }),
+      });
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({ txid: 'max-size-txid' });
+      expect(sendRawTransaction).toHaveBeenCalledWith(rawtx);
+    });
+  });
+
   test('POST /tx/send returns Insight 413 for JSON bodies above the router limit', async () => {
     const sendRawTransaction = jest.fn();
     const app = createServerApp({ sendRawTransaction });
@@ -133,7 +152,7 @@ describe('Insight server mount', () => {
       const response = await fetch(`${baseUrl}/insight-api/tx/send`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ rawtx: 'ab'.repeat(1200000) }),
+        body: JSON.stringify({ rawtx: 'ab'.repeat(2700000) }),
       });
 
       expect(response.status).toBe(413);
