@@ -16,6 +16,7 @@ import type {
 import type { InsightUtxoRow } from './types';
 import {
   type InsightRange,
+  InsightValidationError,
   parseAddressList,
   parseRange,
   sendBadRequest,
@@ -127,9 +128,8 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
     try {
       result = await service.listBlocks(toRecord(req.query));
     } catch (error) {
-      const message = errorMessage(error, 'Invalid blocks query');
-      if (isBlockDateValidationError(message)) {
-        sendBadRequest(res, message);
+      if (error instanceof InsightValidationError) {
+        sendBadRequest(res, error.message);
         return;
       }
 
@@ -495,9 +495,8 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
     try {
       res.json(await service.getPools(firstString(req.query.date) ?? firstString(req.query.blockDate)));
     } catch (error) {
-      const message = errorMessage(error, 'Invalid pool statistics query');
-      if (isBlockDateValidationError(message)) {
-        sendBadRequest(res, message);
+      if (error instanceof InsightValidationError) {
+        sendBadRequest(res, error.message);
         return;
       }
 
@@ -575,6 +574,13 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
   router.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
     if (res.headersSent) {
       next(err);
+      return;
+    }
+
+    // Request validation failures (e.g. out-of-range from/to or malformed
+    // address bodies) are client errors, not internal failures.
+    if (err instanceof InsightValidationError) {
+      sendBadRequest(res, err.message);
       return;
     }
 
@@ -814,10 +820,6 @@ function errorCode(error: unknown): number | null {
   }
 
   return typeof error.code === 'number' && Number.isFinite(error.code) ? error.code : null;
-}
-
-function isBlockDateValidationError(message: string): boolean {
-  return message.includes('Invalid blockDate');
 }
 
 function isNoTxList(value: unknown): boolean {

@@ -2,6 +2,7 @@ import express from 'express';
 import { RPCError } from '../../../types';
 import { ClickHouseAPIServer } from '../../server';
 import { createInsightCompatibilityRouter, type InsightRouterService } from '../router';
+import { InsightValidationError } from '../utils';
 import { readJson, withTestServer } from './http-test-utils';
 
 type MockInsightRouterService = {
@@ -263,7 +264,7 @@ describe('Insight core routes', () => {
 
   test('GET /blocks returns bad request when query parsing fails', async () => {
     const { app } = createApp({
-      listBlocks: jest.fn().mockRejectedValue(new Error('Invalid blockDate (expected YYYY-MM-DD)')),
+      listBlocks: jest.fn().mockRejectedValue(new InsightValidationError('Invalid blockDate (expected YYYY-MM-DD)')),
     });
 
     await withTestServer(app, async (baseUrl) => {
@@ -273,6 +274,25 @@ describe('Insight core routes', () => {
       await expect(readJson(response)).resolves.toEqual({
         message: 'Invalid blockDate (expected YYYY-MM-DD)',
         code: 1,
+      });
+    });
+  });
+
+  test('GET /blocks treats non-validation errors mentioning blockDate as server errors', async () => {
+    const { app } = createApp({
+      listBlocks: jest.fn().mockRejectedValue(new Error('Invalid blockDate (expected YYYY-MM-DD)')),
+    });
+    const errorHandler: express.ErrorRequestHandler = (error, _req, res, _next) => {
+      res.status(500).json({ error: error.message });
+    };
+    app.use(errorHandler);
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/blocks?blockDate=invalid`);
+
+      expect(response.status).toBe(500);
+      await expect(readJson(response)).resolves.toEqual({
+        error: 'Invalid blockDate (expected YYYY-MM-DD)',
       });
     });
   });
@@ -534,6 +554,103 @@ describe('Insight core routes', () => {
         ['addr1', 'addr2'],
         { from: 1, to: 3, limit: 2 }
       );
+    });
+  });
+
+  test('GET /addrs/:addrs/txs rejects from beyond the UInt32 limit', async () => {
+    const { app, service } = createApp({
+      getAddressTransactions: jest.fn().mockResolvedValue({ totalItems: 0, items: [] }),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/addrs/addr1/txs?from=4294967296`);
+
+      expect(response.status).toBe(400);
+      await expect(readJson(response)).resolves.toEqual({
+        message: 'Invalid from (must be an integer between 0 and 4294967295)',
+        code: 1,
+      });
+      expect(service.getAddressTransactions).not.toHaveBeenCalled();
+    });
+  });
+
+  test('POST /addrs/txs rejects to beyond the UInt32 limit', async () => {
+    const { app, service } = createApp({
+      getAddressTransactions: jest.fn().mockResolvedValue({ totalItems: 0, items: [] }),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/addrs/txs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ addrs: 'addr1', from: 0, to: 9007199254740991 }),
+      });
+
+      expect(response.status).toBe(400);
+      await expect(readJson(response)).resolves.toEqual({
+        message: 'Invalid to (must be an integer between 0 and 4294967295)',
+        code: 1,
+      });
+      expect(service.getAddressTransactions).not.toHaveBeenCalled();
+    });
+  });
+
+  test('POST /addrs/txs queries every address from a JSON array body', async () => {
+    const { app, service } = createApp({
+      getAddressTransactions: jest.fn().mockResolvedValue({ totalItems: 0, items: [] }),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/addrs/txs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ addrs: ['addr1', 'addr2'] }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(service.getAddressTransactions).toHaveBeenCalledWith(
+        ['addr1', 'addr2'],
+        { from: 0, to: 10, limit: 10 }
+      );
+    });
+  });
+
+  test('POST /addrs/utxo queries every address from a JSON array body', async () => {
+    const { app, service } = createApp({
+      getAddressUtxos: jest.fn().mockResolvedValue([]),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/addrs/utxo`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ addrs: ['addr1', 'addr2'] }),
+      });
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual([]);
+      expect(service.getAddressUtxos).toHaveBeenCalledWith(['addr1', 'addr2'], true);
+    });
+  });
+
+  test('POST /addrs/utxo rejects array bodies with non-string entries', async () => {
+    const { app, service } = createApp({
+      getAddressUtxos: jest.fn().mockResolvedValue([]),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/addrs/utxo`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ addrs: ['addr1', 5] }),
+      });
+
+      expect(response.status).toBe(400);
+      await expect(readJson(response)).resolves.toEqual({
+        message: 'Invalid address list (expected an array of address strings)',
+        code: 1,
+      });
+      expect(service.getAddressUtxos).not.toHaveBeenCalled();
     });
   });
 

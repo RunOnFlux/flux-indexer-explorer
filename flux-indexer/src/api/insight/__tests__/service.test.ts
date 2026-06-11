@@ -1054,6 +1054,8 @@ describe('InsightCompatibilityService', () => {
     };
 
     await expect(insight.getPools('not-a-date')).rejects.toThrow('Invalid blockDate');
+    await expect(insight.getPools('1950-01-01')).rejects.toThrow('Invalid blockDate');
+    await expect(insight.getPools('9999-01-01')).rejects.toThrow('Invalid blockDate');
     expect(ch.query).not.toHaveBeenCalled();
   });
 

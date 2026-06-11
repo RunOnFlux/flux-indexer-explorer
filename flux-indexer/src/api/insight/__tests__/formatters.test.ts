@@ -7,6 +7,7 @@ import {
 } from '../formatters';
 import {
   createNotFound,
+  InsightValidationError,
   normalizeHash,
   parseAddressList,
   parseBlockDate,
@@ -36,6 +37,18 @@ describe('Insight compatibility utilities', () => {
     expect(parseAddressList(undefined, 'x,y')).toEqual(['x', 'y']);
   });
 
+  test('parses every address from array bodies', () => {
+    expect(parseAddressList(undefined, { addrs: ['t1A', 't1B'] })).toEqual(['t1A', 't1B']);
+    expect(parseAddressList(undefined, { addresses: ['t1A'] })).toEqual(['t1A']);
+    expect(parseAddressList(undefined, ['t1A', 't1B', 't1C'])).toEqual(['t1A', 't1B', 't1C']);
+    expect(parseAddressList(undefined, { addrs: [] })).toEqual([]);
+  });
+
+  test('rejects address array bodies with non-string entries', () => {
+    expect(() => parseAddressList(undefined, { addrs: ['t1A', 5] })).toThrow(InsightValidationError);
+    expect(() => parseAddressList(undefined, [{ addr: 't1A' }])).toThrow(/array of address strings/);
+  });
+
   test('parses Insight from/to range with bounded defaults', () => {
     expect(parseRange({ from: '5', to: '9' })).toEqual({ from: 5, to: 9, limit: 4 });
     expect(parseRange({})).toEqual({ from: 0, to: 10, limit: 10 });
@@ -47,16 +60,20 @@ describe('Insight compatibility utilities', () => {
     expect(parseLimit('0', 10, 50)).toBe(10);
   });
 
-  test('guards Insight ranges near the safe integer limit', () => {
-    const result = parseRange({ from: String(Number.MAX_SAFE_INTEGER) });
-
-    expect(Number.isSafeInteger(result.from)).toBe(true);
-    expect(Number.isSafeInteger(result.to)).toBe(true);
-    expect(result).toEqual({
-      from: Number.MAX_SAFE_INTEGER - 50,
-      to: Number.MAX_SAFE_INTEGER - 40,
+  test('accepts Insight ranges up to the UInt32 limit', () => {
+    expect(parseRange({ from: '4294967295' })).toEqual({
+      from: 4294967295,
+      to: 4294967305,
       limit: 10,
     });
+  });
+
+  test('rejects Insight ranges beyond the UInt32 limit', () => {
+    expect(() => parseRange({ from: '4294967296' })).toThrow(InsightValidationError);
+    expect(() => parseRange({ from: '4294967296' })).toThrow(/Invalid from/);
+    expect(() => parseRange({ to: '4294967296' })).toThrow(/Invalid to/);
+    expect(() => parseRange({ from: String(Number.MAX_SAFE_INTEGER) })).toThrow(InsightValidationError);
+    expect(() => parseRange({ from: '99999999999999999999' })).toThrow(InsightValidationError);
   });
 
   test('parses blockDate as UTC day bounds', () => {
@@ -67,6 +84,24 @@ describe('Insight compatibility utilities', () => {
       next: '2026-06-11',
       prev: '2026-06-09',
     });
+  });
+
+  test('rejects malformed blockDate values with typed validation errors', () => {
+    expect(() => parseBlockDate('not-a-date')).toThrow(InsightValidationError);
+    expect(() => parseBlockDate('not-a-date')).toThrow(/expected YYYY-MM-DD/);
+    expect(() => parseBlockDate('2026-02-30')).toThrow(InsightValidationError);
+    expect(() => parseBlockDate('2026-02-30')).toThrow(/real UTC date/);
+  });
+
+  test('rejects blockDate values outside the UInt32 timestamp range', () => {
+    expect(() => parseBlockDate('1950-01-01')).toThrow(InsightValidationError);
+    expect(() => parseBlockDate('9999-01-01')).toThrow(InsightValidationError);
+    expect(() => parseBlockDate('2106-02-07')).toThrow(/Invalid blockDate/);
+    expect(parseBlockDate('2106-02-06')).toMatchObject({
+      start: 4294857600,
+      end: 4294943999,
+    });
+    expect(parseBlockDate('1970-01-01')).toMatchObject({ start: 0, end: 86399 });
   });
 
   test('normalizes hashes and rejects invalid hash input', () => {

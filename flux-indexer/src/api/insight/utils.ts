@@ -3,9 +3,16 @@ import type { Response } from 'express';
 const ZATOSHIS_PER_FLUX = 100000000n;
 const DEFAULT_RANGE_LIMIT = 10;
 const MAX_RANGE_LIMIT = 50;
-const MAX_RANGE_FROM = Number.MAX_SAFE_INTEGER - MAX_RANGE_LIMIT;
+const MAX_UINT32 = 4294967295;
 const HASH_REGEX = /^[0-9a-fA-F]{1,64}$/;
 const DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+
+export class InsightValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InsightValidationError';
+  }
+}
 
 export interface InsightRange {
   from: number;
@@ -45,7 +52,7 @@ export function zatoshisToFluxString(value: bigint | string | number): string {
 }
 
 export function parseAddressList(pathAddresses?: unknown, bodyAddresses?: unknown): string[] {
-  const rawAddresses = coerceStringParam(pathAddresses) ?? coerceAddressBody(bodyAddresses);
+  const rawAddresses = coerceAddressParam(pathAddresses) ?? coerceAddressBody(bodyAddresses);
 
   if (!rawAddresses) {
     return [];
@@ -58,9 +65,9 @@ export function parseAddressList(pathAddresses?: unknown, bodyAddresses?: unknow
 }
 
 export function parseRange(query: Record<string, unknown>): InsightRange {
-  const from = Math.min(parseNonNegativeInt(query.from, 0), MAX_RANGE_FROM);
+  const from = parseBoundedRangeValue(query.from, 0, 'from');
   const defaultTo = from + DEFAULT_RANGE_LIMIT;
-  const requestedTo = parseNonNegativeInt(query.to, defaultTo);
+  const requestedTo = parseBoundedRangeValue(query.to, defaultTo, 'to');
   const validTo = requestedTo <= from ? defaultTo : requestedTo;
   const to = Math.min(validTo, from + MAX_RANGE_LIMIT);
 
@@ -107,21 +114,26 @@ export function parseBlockDate(blockDate?: unknown, now = new Date()): InsightBl
   const current = coerceStringParam(blockDate)?.trim() || formatUtcDate(now);
 
   if (!DATE_REGEX.test(current)) {
-    throw new Error('Invalid blockDate (expected YYYY-MM-DD)');
+    throw new InsightValidationError('Invalid blockDate (expected YYYY-MM-DD)');
   }
 
   const startDate = new Date(`${current}T00:00:00.000Z`);
   if (Number.isNaN(startDate.getTime()) || formatUtcDate(startDate) !== current) {
-    throw new Error('Invalid blockDate (expected a real UTC date)');
+    throw new InsightValidationError('Invalid blockDate (expected a real UTC date)');
   }
 
   const nextDate = addUtcDays(startDate, 1);
   const prevDate = addUtcDays(startDate, -1);
   const start = Math.floor(startDate.getTime() / 1000);
+  const end = start + 86400 - 1;
+
+  if (start < 0 || end > MAX_UINT32) {
+    throw new InsightValidationError('Invalid blockDate (must be between 1970-01-01 and 2106-02-06)');
+  }
 
   return {
     start,
-    end: start + 86400 - 1,
+    end,
     current,
     next: formatUtcDate(nextDate),
     prev: formatUtcDate(prevDate),
@@ -209,12 +221,28 @@ export function toSafeInteger(value: string | number, name: string): number {
 
 function coerceAddressBody(bodyAddresses: unknown): string | undefined {
   if (isRecord(bodyAddresses)) {
-    return coerceStringParam(bodyAddresses.addrs)
-      ?? coerceStringParam(bodyAddresses.addresses)
-      ?? coerceStringParam(bodyAddresses.address);
+    return coerceAddressParam(bodyAddresses.addrs)
+      ?? coerceAddressParam(bodyAddresses.addresses)
+      ?? coerceAddressParam(bodyAddresses.address);
   }
 
-  return coerceStringParam(bodyAddresses);
+  return coerceAddressParam(bodyAddresses);
+}
+
+function coerceAddressParam(raw: unknown): string | undefined {
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) {
+      return undefined;
+    }
+
+    if (!raw.every((entry) => typeof entry === 'string')) {
+      throw new InsightValidationError('Invalid address list (expected an array of address strings)');
+    }
+
+    return raw.join(',');
+  }
+
+  return coerceStringParam(raw);
 }
 
 function coerceStringParam(raw: unknown): string | undefined {
@@ -231,6 +259,21 @@ function coerceStringParam(raw: unknown): string | undefined {
   }
 
   return typeof raw === 'string' ? raw : String(raw);
+}
+
+function parseBoundedRangeValue(raw: unknown, defaultValue: number, name: string): number {
+  const value = coerceStringParam(raw)?.trim();
+
+  if (!value || !/^\d+$/.test(value)) {
+    return defaultValue;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed > MAX_UINT32) {
+    throw new InsightValidationError(`Invalid ${name} (must be an integer between 0 and ${MAX_UINT32})`);
+  }
+
+  return parsed;
 }
 
 function parseNonNegativeInt(raw: unknown, defaultValue: number): number {
