@@ -583,7 +583,79 @@ describe('Insight core routes', () => {
         addrStr: 'addr',
         transactions: [],
       });
-      expect(service.getAddressSummary).toHaveBeenCalledWith('addr', true);
+      expect(service.getAddressSummary).toHaveBeenCalledWith('addr', true, { from: 0, to: 1000 });
+    });
+  });
+
+  test('GET /addr/:addr forwards the requested from/to window', async () => {
+    const { app, service } = createApp({
+      getAddressSummary: jest.fn().mockResolvedValue({
+        summary: { balance: '0', received_total: '0', sent_total: '0', tx_count: 0 },
+        mempool: { balanceDelta: 0n, txCount: 0 },
+        transactions: ['1'.repeat(64)],
+      }),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/addr/addr?from=5&to=15`);
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toMatchObject({
+        addrStr: 'addr',
+        transactions: ['1'.repeat(64)],
+      });
+      expect(service.getAddressSummary).toHaveBeenCalledWith('addr', false, { from: 5, to: 15 });
+    });
+  });
+
+  test('GET /addr/:addr rejects inverted from/to windows', async () => {
+    const { app, service } = createApp({
+      getAddressSummary: jest.fn(),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/addr/addr?from=10&to=5`);
+
+      expect(response.status).toBe(400);
+      await expect(readJson(response)).resolves.toEqual({
+        message: 'Invalid from/to range (from must be less than to)',
+        code: 1,
+      });
+      expect(service.getAddressSummary).not.toHaveBeenCalled();
+    });
+  });
+
+  test('GET /addr/:addr rejects windows spanning more than 1000 items', async () => {
+    const { app, service } = createApp({
+      getAddressSummary: jest.fn(),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/addr/addr?from=0&to=1001`);
+
+      expect(response.status).toBe(400);
+      await expect(readJson(response)).resolves.toEqual({
+        message: 'Invalid from/to range (must span 1000 items or fewer)',
+        code: 1,
+      });
+      expect(service.getAddressSummary).not.toHaveBeenCalled();
+    });
+  });
+
+  test('GET /addr/:addr rejects from beyond the UInt32 limit', async () => {
+    const { app, service } = createApp({
+      getAddressSummary: jest.fn(),
+    });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/addr/addr?from=4294967296&to=4294967297`);
+
+      expect(response.status).toBe(400);
+      await expect(readJson(response)).resolves.toEqual({
+        message: 'Invalid from (must be an integer between 0 and 4294967295)',
+        code: 1,
+      });
+      expect(service.getAddressSummary).not.toHaveBeenCalled();
     });
   });
 

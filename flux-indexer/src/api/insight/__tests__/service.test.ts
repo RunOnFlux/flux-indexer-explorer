@@ -504,6 +504,11 @@ describe('InsightCompatibilityService', () => {
       mempool,
     });
 
+    const [txidSql, txidParams] = ch.query.mock.calls[0];
+    expect(txidSql).toContain('LIMIT {limit:UInt32}');
+    expect(txidSql).toContain('OFFSET {offset:UInt32}');
+    expect(txidParams).toEqual({ address: 'taddr', limit: 1000, offset: 0 });
+
     ch.query.mockClear();
 
     await expect(service.getAddressSummary('taddr', true)).resolves.toEqual({
@@ -512,6 +517,26 @@ describe('InsightCompatibilityService', () => {
       mempool,
     });
     expect(ch.query).not.toHaveBeenCalled();
+  });
+
+  test('windows address summary transaction ids with from/to', async () => {
+    const { service, ch, getMempoolAddressDeltas } = createService();
+    const summary = {
+      balance: '250000000',
+      received_total: '500000000',
+      sent_total: '250000000',
+      tx_count: '5000',
+    };
+
+    ch.queryOne.mockResolvedValue(summary);
+    ch.query.mockResolvedValue([{ txid: '3'.repeat(64) }]);
+    getMempoolAddressDeltas.mockResolvedValue(new Map());
+
+    const result = await service.getAddressSummary('taddr', false, { from: 1200, to: 1202 });
+
+    expect(result.transactions).toEqual(['3'.repeat(64)]);
+    const [, txidParams] = ch.query.mock.calls[0];
+    expect(txidParams).toEqual({ address: 'taddr', limit: 2, offset: 1200 });
   });
 
   test('caps address utxo inputs and applies row limit', async () => {

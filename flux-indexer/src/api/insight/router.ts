@@ -47,7 +47,11 @@ export interface InsightRouterService {
   getTransaction(txid: string): Promise<InsightTransactionServiceResult | null>;
   getRawTransaction(txid: string): Promise<string | null>;
   getTransactionsByBlock?(blockHash: string, pageNum: number): Promise<InsightBlockTransactionsResult>;
-  getAddressSummary(address: string, noTxList: boolean): Promise<InsightAddressSummaryServiceResult>;
+  getAddressSummary(
+    address: string,
+    noTxList: boolean,
+    txRange?: { from: number; to: number }
+  ): Promise<InsightAddressSummaryServiceResult>;
   getAddressUtxos(addresses: string[], queryMempool: boolean): Promise<InsightUtxoRow[]>;
   getAddressTransactions?(addresses: string[], range: InsightRange): Promise<InsightAddressTransactionsResult>;
   getAddressBalanceSum?(addresses: string[]): Promise<InsightAddressBalanceSumResult>;
@@ -90,6 +94,8 @@ const MAX_UINT32 = 4294967295;
 const TXS_PAGE_SIZE = 10;
 // Keeps pageNum * TXS_PAGE_SIZE within the UInt32 offsets ClickHouse accepts.
 const MAX_TXS_PAGE_NUM = Math.floor(MAX_UINT32 / TXS_PAGE_SIZE) - 1;
+// Legacy Insight /addr/:addr windows the txid list with from/to (default 0-1000).
+const ADDRESS_TX_WINDOW = 1000;
 
 export function createInsightCompatibilityRouter(service: InsightRouterService): Router {
   const router = express.Router();
@@ -257,7 +263,8 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
   }));
 
   router.get('/addr/:addr', asyncHandler(async (req, res) => {
-    const result = await service.getAddressSummary(req.params.addr, isNoTxList(req.query.noTxList));
+    const txRange = parseAddressTxRange(toRecord(req.query));
+    const result = await service.getAddressSummary(req.params.addr, isNoTxList(req.query.noTxList), txRange);
     res.json(formatAddressSummary({
       address: req.params.addr,
       summary: result.summary,
@@ -697,6 +704,34 @@ function parseNonNegativeSafeInteger(raw: string): number | null {
 
   const parsed = Number(trimmed);
   return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function parseAddressTxRange(query: Record<string, unknown>): { from: number; to: number } {
+  const from = parseAddressTxBound(query.from, 0, 'from');
+  const to = parseAddressTxBound(query.to, ADDRESS_TX_WINDOW, 'to');
+  if (from >= to) {
+    throw new InsightValidationError('Invalid from/to range (from must be less than to)');
+  }
+
+  if (to - from > ADDRESS_TX_WINDOW) {
+    throw new InsightValidationError(`Invalid from/to range (must span ${ADDRESS_TX_WINDOW} items or fewer)`);
+  }
+
+  return { from, to };
+}
+
+function parseAddressTxBound(raw: unknown, defaultValue: number, name: string): number {
+  const value = firstString(raw)?.trim();
+  if (!value || !/^\d+$/.test(value)) {
+    return defaultValue;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed > MAX_UINT32) {
+    throw new InsightValidationError(`Invalid ${name} (must be an integer between 0 and ${MAX_UINT32})`);
+  }
+
+  return parsed;
 }
 
 function parsePageNum(raw: unknown): number | null {

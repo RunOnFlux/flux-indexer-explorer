@@ -122,6 +122,8 @@ const MAX_UTXO_ROWS = 5000;
 // Legacy Insight pages /txs results ten transactions at a time.
 const TRANSACTIONS_PAGE_SIZE = 10;
 const MAX_ADDRESS_TX_LIMIT = 50;
+// Legacy Insight /addr/:addr windows the txid list with from/to (default 0-1000).
+const ADDRESS_TXID_WINDOW = 1000;
 const DEFAULT_STATISTIC_DAYS = 365;
 const MAX_STATISTIC_DAYS = 730;
 const SATOSHIS_PER_FLUX = 100000000n;
@@ -373,7 +375,11 @@ export class InsightCompatibilityService {
     return this.getRawTransactionFromIndexedBlock(txid);
   }
 
-  async getAddressSummary(_address: string, _noTxList: boolean): Promise<InsightAddressSummaryServiceResult> {
+  async getAddressSummary(
+    _address: string,
+    _noTxList: boolean,
+    _txRange?: { from: number; to: number }
+  ): Promise<InsightAddressSummaryServiceResult> {
     const [summary, mempoolDeltas, transactions] = await Promise.all([
       this.ch.queryOne<InsightAddressSummaryRow>(`
         SELECT
@@ -386,7 +392,7 @@ export class InsightCompatibilityService {
         GROUP BY address
       `, { address: _address }),
       this.getMempoolAddressDeltas(),
-      _noTxList ? Promise.resolve([]) : this.getAddressTransactionIds(_address),
+      _noTxList ? Promise.resolve([]) : this.getAddressTransactionIds(_address, _txRange),
     ]);
 
     return {
@@ -1345,7 +1351,16 @@ export class InsightCompatibilityService {
     `, { txid });
   }
 
-  private async getAddressTransactionIds(address: string): Promise<string[]> {
+  private async getAddressTransactionIds(
+    address: string,
+    range?: { from: number; to: number }
+  ): Promise<string[]> {
+    const offset = Math.min(normalizeNonNegativeSafeInteger(range?.from ?? 0, 0), UINT32_MAX);
+    const requestedTo = normalizeNonNegativeSafeInteger(
+      range?.to ?? offset + ADDRESS_TXID_WINDOW,
+      offset + ADDRESS_TXID_WINDOW
+    );
+    const limit = Math.min(Math.max(0, requestedTo - offset), ADDRESS_TXID_WINDOW);
     const rows = await this.ch.query<{ txid: string }>(`
       SELECT txid
       FROM (
@@ -1357,8 +1372,9 @@ export class InsightCompatibilityService {
       )
       WHERE is_valid = 1
       ORDER BY block_height DESC, tx_index ASC, txid ASC
-      LIMIT 1000
-    `, { address });
+      LIMIT {limit:UInt32}
+      OFFSET {offset:UInt32}
+    `, { address, limit, offset });
 
     return rows.map((row) => row.txid);
   }
