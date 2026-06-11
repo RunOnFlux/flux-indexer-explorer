@@ -84,6 +84,7 @@ const MAX_FEE_TARGET_BLOCKS = 1008;
 export function createInsightCompatibilityRouter(service: InsightRouterService): Router {
   const router = express.Router();
   router.use(express.urlencoded({ extended: false, limit: '2mb' }));
+  router.use(express.json({ limit: '2mb' }));
 
   router.get('/block/:blockHash', asyncHandler(async (req, res) => {
     const result = await service.getBlock(req.params.blockHash);
@@ -571,6 +572,24 @@ export function createInsightCompatibilityRouter(service: InsightRouterService):
     sendNotFound(res, req.originalUrl);
   });
 
+  router.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+
+    // Client errors (e.g. body-parser PayloadTooLargeError 413 or JSON
+    // SyntaxError 400) keep the legacy Insight error shape instead of
+    // falling through to the generic app-level 500 handler.
+    const status = clientErrorStatus(err);
+    if (status === null) {
+      next(err);
+      return;
+    }
+
+    res.status(status).json({ message: errorMessage(err, 'Bad request'), code: 1 });
+  });
+
   return router;
 }
 
@@ -770,6 +789,19 @@ function isMessageVerificationInputError(error: unknown): boolean {
 
   const code = errorCode(error);
   return code === -32602 || code === -5;
+}
+
+function clientErrorStatus(error: unknown): number | null {
+  if (!isRecord(error)) {
+    return null;
+  }
+
+  const raw = error.status ?? error.statusCode;
+  if (typeof raw !== 'number' || !Number.isInteger(raw)) {
+    return null;
+  }
+
+  return raw >= 400 && raw < 500 ? raw : null;
 }
 
 function errorCode(error: unknown): number | null {

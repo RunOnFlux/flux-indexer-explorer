@@ -43,13 +43,13 @@ function createApp(serviceOverrides: Partial<MockInsightRouterService> & Record<
 }
 
 describe('Insight server mount', () => {
-  function createServerApp() {
+  function createServerApp(rpcOverrides: Record<string, jest.Mock> = {}) {
     const ch = {
       query: jest.fn(),
       queryOne: jest.fn(),
       queryCount: jest.fn(),
     } as unknown as ConstructorParameters<typeof ClickHouseAPIServer>[0];
-    const rpc = {} as unknown as ConstructorParameters<typeof ClickHouseAPIServer>[1];
+    const rpc = rpcOverrides as unknown as ConstructorParameters<typeof ClickHouseAPIServer>[1];
     const syncEngine = {} as unknown as ConstructorParameters<typeof ClickHouseAPIServer>[2];
     const server = new ClickHouseAPIServer(ch, rpc, syncEngine, 0);
     return server.getApp();
@@ -106,6 +106,80 @@ describe('Insight server mount', () => {
       await expect(readJson(apiResponse)).resolves.toEqual({ error: 'Not found' });
     });
   });
+
+  test('POST /tx/send broadcasts JSON rawtx larger than 100KB', async () => {
+    const rawtx = 'ab'.repeat(75000);
+    const sendRawTransaction = jest.fn().mockResolvedValue('large-json-txid');
+    const app = createServerApp({ sendRawTransaction });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/tx/send`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ rawtx }),
+      });
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toEqual({ txid: 'large-json-txid' });
+      expect(sendRawTransaction).toHaveBeenCalledWith(rawtx);
+    });
+  });
+
+  test('POST /tx/send returns Insight 413 for JSON bodies above the router limit', async () => {
+    const sendRawTransaction = jest.fn();
+    const app = createServerApp({ sendRawTransaction });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/tx/send`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ rawtx: 'ab'.repeat(1200000) }),
+      });
+
+      expect(response.status).toBe(413);
+      await expect(readJson(response)).resolves.toEqual({
+        message: 'request entity too large',
+        code: 1,
+      });
+      expect(sendRawTransaction).not.toHaveBeenCalled();
+    });
+  });
+
+  test('POST /tx/send returns Insight 400 for malformed JSON bodies', async () => {
+    const sendRawTransaction = jest.fn();
+    const app = createServerApp({ sendRawTransaction });
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/insight-api/tx/send`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{"rawtx":',
+      });
+
+      expect(response.status).toBe(400);
+      await expect(readJson(response)).resolves.toEqual({
+        message: expect.any(String),
+        code: 1,
+      });
+      expect(sendRawTransaction).not.toHaveBeenCalled();
+    });
+  });
+
+  test('API error handler honors body-parser client error statuses', async () => {
+    const app = createServerApp();
+
+    await withTestServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/transactions/batch`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{"txids":',
+      });
+
+      expect(response.status).toBe(400);
+      await expect(readJson(response)).resolves.toEqual({ error: expect.any(String) });
+    });
+  });
+
 });
 
 describe('Insight core routes', () => {

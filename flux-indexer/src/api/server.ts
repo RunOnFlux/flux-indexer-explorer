@@ -311,7 +311,18 @@ export class ClickHouseAPIServer {
   private setupMiddleware(): void {
     this.app.use(compression({ threshold: 1024, level: 6 }));
     this.app.use(cors());
-    this.app.use(express.json());
+
+    // The Insight compatibility router registers its own body parsers with
+    // legacy-compatible limits, so skip the default JSON parser for it.
+    const jsonParser = express.json();
+    this.app.use((req, res, next) => {
+      if (req.path.startsWith('/insight-api')) {
+        next();
+        return;
+      }
+
+      jsonParser(req, res, next);
+    });
 
     this.app.use((req, res, next) => {
       logger.debug(`${req.method} ${req.path}`, { query: req.query });
@@ -396,7 +407,12 @@ export class ClickHouseAPIServer {
   private setupErrorHandling(): void {
     this.app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
       logger.error('API error', { error: err.message, path: req.path });
-      res.status(500).json({ error: err.message || 'Internal server error' });
+      const rawStatus = (err as { status?: unknown }).status
+        ?? (err as { statusCode?: unknown }).statusCode;
+      const status = typeof rawStatus === 'number' && Number.isInteger(rawStatus) && rawStatus >= 400 && rawStatus <= 599
+        ? rawStatus
+        : 500;
+      res.status(status).json({ error: err.message || 'Internal server error' });
     });
   }
 
